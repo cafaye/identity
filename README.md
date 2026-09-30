@@ -146,14 +146,69 @@ service quietly listening on the wrong port.
 | `GET /v1/accounts/:id/api-keys` | `200 [{id, name, scopes, …}]` | The account's credentials, newest first, **revoked ones included**. `[]` and not `null`. **Owner only.** |
 | `DELETE /v1/accounts/:id/api-keys/:keyId` | `204` | Revoke a credential. The row is kept. `409 conflict` if already revoked, `404` for an id that is not there or not in this account. **Owner only.** |
 | `POST /v1/introspections` | `200 {active, …}` or `200 {"active":false}` | What a presented token may do, and for which account. Needed because the token is opaque. |
+| `GET /v1/accounts/:id/admin/audit-log` | `200 {entries, next?}` | The account's admin audit trail, newest first, **append-only**. Bounded: `limit` defaults to 25 and is refused above 100; `before` is an opaque cursor. **Admin, `audit_log:read`, scoped api key only.** |
+| `DELETE /v1/accounts/:id/admin/invitations/:invitationId` | `204` | Revoke one pending invitation. The row is kept with `revoked_at`, and the address is freed to be invited again. `409 conflict` if already accepted or revoked, `404` for an id not in this account. **Admin, `account_invitations:write`, scoped api key only.** |
+| `POST /v1/accounts/:id/admin/invitation-revocations` | `200 {requested, revoked}` | Revoke up to 50 pending invitations in one transaction, **one** audit record for the lot. `confirm: true` and a non-empty array are both required. **Owner, `account_invitations:write`, scoped api key only.** |
 | anything else on `/v1` | `404 not_found` | A problem document, not chi's default plain text. |
+
+### The admin surface, and why it is a separate thing
+
+Three operations, and the privilege boundary is one sentence:
+
+> An account admin may revoke pending invitations to their own account and read
+> that account's admin audit log — authority over other people's pending access,
+> and nothing else.
+
+It is a sentence rather than a paragraph because a role checked in thirty places
+is a role that will be checked in twenty-nine of them. So the sentence is not
+documentation of a boundary, it is the boundary, and the code says exactly it:
+three rows in `accountRouteScopes`, two scopes, and a new row without a new scope
+fails a test.
+
+**A browser session cannot reach any of it, and a machine credential is the point
+rather than a limitation.** Every action is recorded against the api key's **row
+id**, so a token is something an audit record can name and a session is not. This
+is the mirror image of the session-only surfaces above, and the two together mean
+no route in this service is reachable by both kinds of credential unless somebody
+wrote that down deliberately.
+
+**Every action is recorded in the same transaction as the mutation.** A revocation
+that commits and an audit row that does not is a revocation nobody can account
+for, so `admin.Service` has no method that mutates without recording: the mutation
+is a callback run inside the transaction that writes the record. Both failure
+directions are tested against a real database with a trigger that raises.
+
+**The record cannot be edited, including by the admin whose action is in it.**
+`GET` is the only method mounted on that path, the store has no update or delete,
+and — the one that settles it — **the table refuses `UPDATE` and `DELETE`** in the
+database. A guarantee written in Go does not bind a `psql` session or a future
+packet. The table also has **no foreign key to `accounts`**, so the admin surface
+cannot delete its own audit log by deleting the account.
+
+**Bulk and single do not share a shape**, because a bulk operation is where an
+off-by-one becomes an outage:
+
+| | single | bulk |
+|---|---|---|
+| confirmation | none — the URL names the one row | **`confirm: true`, in the body** |
+| minimum | admin | **owner** |
+| response | `204` | `{requested, revoked}`, and they differ |
+
+The reasoning, the rejected alternatives and the two OIDC-shaped consequences
+(the anonymous column is `403` here rather than `401`, and the authorization
+matrix has no positive cell for a token-only surface) are in
+[DECISIONS.md D2–D5](DECISIONS.md).
 
 Every non-2xx is `application/problem+json` per core's error envelope, including
 `404` and `405`. The `trace_id` in the body always matches the `X-Trace-Id`
 response header, and internal failures are logged with that id rather than
 described to the caller.
 
-### **The table above is bigger than the OpenAPI document, and that is a known gap**
+### **Ten rows of the table above are still bigger than the OpenAPI document, and that is a known gap**
+
+The three admin rows added by this packet are **documented** — they are in
+`openapi/v1.yaml` under the `admin` tag, with operationIds, request and response
+schemas, and `info.version` is 1.4.0 because of them. `knownDrift` did not grow.
 
 The ten rows marked *"Not in `openapi/v1.yaml`"* are served, gated, in the
 authorization matrix and — for seven of them — carry a declared scope, and they
@@ -174,6 +229,12 @@ or not anybody remembers the file.
 What this means for a caller, plainly: **a client generated from this service's
 documents has no method for any of those twelve operations.** They work; they are
 just not in the menu. That is the gap, and it is the reason the check exists.
+
+**Adding a route and not growing `knownDrift` is a normal operation here**, and
+the admin surface is the worked example: three new operations, three documented
+operations, a list that stayed at twelve. A packet that finds itself tempted to
+bump that count is being told the truth by the tripwire — the answer is to
+document the route, never to name it.
 
 The `/v1` routes exist only when `DATABASE_URL` is set. Without it they are
 absent, so a missing database is a clear `404` rather than a pile of `500`s.
@@ -694,6 +755,9 @@ internal/users/        accounts and the email-uniqueness rules
 internal/sessions/     session tokens, hashing and revocation
 internal/oidc/         the OIDC provider: storage adapter, registrations, the key
 internal/accounts/     the tenancy use cases: accounts, memberships, invitations
+internal/admin/        the admin surface: invitation revocation, and the audit trail
+                       that records it. The two are one package because no method
+                       here mutates without recording — see DECISIONS.md D3
 internal/apikeys/      scoped API tokens: the wire format, the scopes, the claims
 internal/oauth/        the social-login client side: state, token cipher, registry
 internal/outbox/       transactional event envelope, SKIP LOCKED claim, publisher

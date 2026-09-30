@@ -28,8 +28,17 @@ info:
   # where it used to answer 204. A client that only ever presents session tokens
   # cannot tell, and a client that had started pasting a `cafaye_` token into its
   # logout call was being told a revocation had happened when none had.
-  version: 1.3.0
-  summary: Authentication, sessions, multi-factor authentication, accounts, tenancy, scoped API tokens and OIDC registrations.
+  #
+  # 1.4.0 is the admin surface: three new operations, all under a new `admin` tag,
+  # none of them changing an existing operation. It is additive for a second
+  # reason as well, which is worth stating because a client reading only the
+  # version would not see it: **the admin surface is token-only**, so `security`
+  # on these three operations lists `bearerToken` and NOT `sessionCookie`. That is
+  # a new kind of route in this document rather than a new route, and a client
+  # generating from it will get three methods that take no session where every
+  # other account route takes either.
+  version: 1.4.0
+  summary: Authentication, sessions, multi-factor authentication, accounts, tenancy, scoped API tokens, the admin surface and OIDC registrations.
   description: |
     `identity` is the cafaye platform's security boundary: it is what every other
     service asks to identify a caller.
@@ -187,6 +196,25 @@ tags:
       every request from the owner's **current** membership, so removing somebody
       from an account stops their tokens immediately, and a re-invitation does not
       bring them back.
+  - name: admin
+    description: |
+      The admin surface: revoking pending invitations, and the immutable audit
+      trail recording that somebody did.
+
+      **Reachable by a scoped API token only — never by a browser session.** A
+      session is a browser credential, and an admin surface a session cookie opens
+      is an admin surface one CSRF away from being somebody else's. A token is the
+      right credential here for a second reason as well: every action on this
+      surface is recorded against the **api key's row id**, so a machine
+      credential is something an audit record can name and a session is not.
+
+      The privilege boundary, in one sentence: *an account admin may revoke pending
+      invitations to their own account and read that account's admin audit log —
+      authority over other people's pending access, and nothing else.*
+
+      A bulk revocation requires a `confirm` field and a named array, and a single
+      revocation requires neither. The difference is in the request shape, not in a
+      dialog, because a dialog is not something an API client has.
   - name: probes
     description: Liveness and readiness. Consumed by orchestrators, not by clients.
 
@@ -1418,6 +1446,329 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /v1/accounts/{account_id}/admin/audit-log:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    get:
+      tags: [admin]
+      operationId: listAccountAuditLog
+      summary: Read an account's admin audit trail
+      description: |
+        Every admin action taken on this account, newest first, and **append-only**:
+        there is no operation in this API that edits or removes a record, and the
+        table itself refuses `UPDATE` and `DELETE` at the database.
+
+        ### Why the record cannot be edited, including by whoever performed it
+
+        Three independent reasons, in the order a reviewer asks about them:
+
+        1. **No route mutates it.** `GET` is the only method mounted on this path,
+           and a test walks the router to hold that — a check inside the handler
+           would pass even with a `DELETE` registered beside it.
+        2. **No service method updates or deletes it.** The store has `Append` and
+           `List` and nothing else.
+        3. **The database refuses it**, with a `BEFORE UPDATE OR DELETE` trigger.
+           This is the one that actually settles it: the first two only describe
+           this codebase, and a repair script, an operator with `psql`, or a future
+           packet all bypass Go entirely.
+
+        For the same reason the table carries **no foreign key to `accounts`**. A
+        cascade is a `DELETE`, so a cascading account deletion would be blocked —
+        and more to the point, allowing it would mean the shortest route from "an
+        admin did something questionable" to "there is no record of it" is one
+        request to `DELETE /v1/accounts/{account_id}`. The rows become unreachable
+        through the API and are retained for an operator reading the table directly.
+
+        ### An audit record names a credential, never a credential
+
+        `actor_user_id` and `actor_key_id` are **row ids**. There is no field in
+        the response that could hold a token, and that is structural rather than a
+        convention — the api key's digest is a field on the struct a handler holds,
+        and an audit log is exactly where a careless `fmt.Sprintf("%+v", …)` of it
+        would end up. A test walks the types that reach this table and fails if any
+        grows a field that could hold a value.
+
+        ### The page is bounded, and the bound is refused rather than clamped
+
+        `limit` defaults to 25 and is refused above 100. A request for more is a
+        **422, not a silent truncation**: a client that asked for 500 rows and
+        quietly received 100 has been told a lie about how much of the trail it has
+        read, and an operator building an export would produce a short one without
+        knowing.
+
+        `before` is an **opaque cursor**, returned as `next`. It is not an offset
+        and not a bare timestamp: it carries the row's `(occurred_at, id)` pair
+        encoded together, because a timestamp-only cursor silently drops every row
+        sharing the boundary instant — and this service's clock is a timestamp, not
+        a sequence, so two actions in the same second is the normal case. An
+        offset would be wrong the moment a row is appended between two requests,
+        which here is the normal case too: somebody is performing admin actions
+        while somebody else pages through the record of them.
+
+        A cursor this build did not issue is a **422 naming `before`**, not a
+        silent return to the first page — on a trail, "your token was wrong" and
+        "the records are missing" are very different conclusions.
+      security:
+        - bearerToken: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Rows to return. Defaults to 25; refused above 100. `0` means the
+            default, so a generated client that sends its zero value still works.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 100
+            default: 25
+        - name: before
+          in: query
+          required: false
+          description: |
+            The opaque `next` cursor from the previous page. Empty means the
+            newest page.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: One page of the account's admin audit trail, newest first.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditLogPage'
+              example:
+                entries:
+                  - id: ab000000-0000-0000-0000-0000000000d1
+                    action: invitation.revoked
+                    actor_user_id: ab000000-0000-0000-0000-0000000000u1
+                    actor_key_id: ab000000-0000-0000-0000-0000000000a1
+                    target: 4f2c0000-0000-4000-8000-00000000abcd
+                    affected: 1
+                    trace_id: 3f2b1a44-9c8e-4d1a-9f77-2b0c5e6a1d90
+                    occurred_at: '2026-09-30T12:00:00Z'
+                next: MiIyMDI2LTA5LTMwVDEyOjAwOjAwWiI2MTk3ZjItMTFlNi0zMWFhLTExYjhhMjM2ZmU2YzFlZA
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            Not an admin of this account, or the token does not carry
+            `audit_log:read`, or **a browser session was presented** — the admin
+            surface is token-only.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/accounts/{account_id}/admin/invitations/{invitation_id}:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+      - name: invitation_id
+        in: path
+        required: true
+        description: |
+          The pending invitation's row id. A malformed one, one in another account,
+          one that never existed and one already redeemed are each answered the way
+          their cause requires, but a caller **cannot tell "no such invitation" from
+          "an invitation in an account you are not in"** — that would be a probe for
+          which invitation ids exist.
+        schema:
+          type: string
+          format: uuid
+    delete:
+      tags: [admin]
+      operationId: revokeAccountInvitation
+      summary: Revoke one pending invitation
+      description: |
+        Withdraws one pending invitation. The token stops redeeming it immediately,
+        and an audit record is written **in the same database transaction** as the
+        revocation — either both exist or neither does.
+
+        **Admin of the account, with `account_invitations:write`.**
+
+        ### No confirmation field, and that is the design
+
+        The URL names the one thing being changed, so the request is
+        self-describing: there is nothing in it that could be misread as "and
+        everything else". The bulk route requires `confirm: true` and a named
+        array; this one requires neither, and adding a `confirm` field here would
+        mean a client that forgot to send it gets a 422 on a safe, idempotent,
+        single-row operation.
+
+        ### Revoking is not deleting
+
+        The row is kept with `revoked_at` set, which is what lets
+        "was this revoked, or was it always broken?" be answered — the same support
+        question that keeps revoked api keys and OIDC clients rather than deleting
+        them. It also **frees the address to be invited again**, which is the point
+        of the operation: an admin who sent an invitation to the wrong list revokes
+        it and sends another, in two requests.
+
+        A **409** means the invitation is not in a revocable state — already
+        accepted (a membership already exists, and the question is where it came
+        from) or already revoked. A **404** is every other case, including an id
+        belonging to another account.
+      security:
+        - bearerToken: []
+      responses:
+        '204':
+          description: |
+            The invitation no longer redeems, and an audit record naming the
+            credential that did it exists in the same transaction.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            Not an admin of this account, the token does not carry
+            `account_invitations:write`, or a browser session was presented.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The invitation was already accepted or already revoked.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/accounts/{account_id}/admin/invitation-revocations:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    post:
+      tags: [admin]
+      operationId: revokeAccountInvitations
+      summary: Revoke many pending invitations at once
+      description: |
+        Withdraws up to 50 pending invitations in one transaction, and writes **one**
+        audit record for the whole batch.
+
+        ### This is a different shape from the single route, on purpose
+
+        A bulk operation is where an off-by-one becomes an outage, so it does not
+        look like the single one:
+
+        | | single | bulk |
+        | --- | --- | --- |
+        | request | `DELETE …/invitations/{id}` | `POST …/invitation-revocations` with a body |
+        | confirmation | none needed — the URL names the one row | **`confirm: true` is required** |
+        | minimum role | admin | **owner** |
+
+        The `confirm` field is in the **body**, not a query parameter, so that the
+        request that performs the operation and the request that describes it are
+        the same bytes — a `?confirm=true` is one link-builder's accident away from
+        being sent without an operator reading it, and the array is exactly the thing
+        that must not be sent by accident. Absent, `false`, and the wrong JSON type
+        are all the same 422: a client that got a different answer for `false` than
+        for absent would have learned which one it sent.
+
+        **An unknown field is a 422**, so a client that misspells `confirm` as
+        `confirm_all` is told, rather than proceeding on the assumption it was
+        confirmed.
+
+        ### Why owner and not admin
+
+        Revoking one invitation is a decision about a person. Revoking every
+        pending one is a decision about the account, it is the operation a
+        departing employee's automation might fire on a schedule, and an owner is
+        the whole of the argument. There are only two roles above `member`, and the
+        smaller one already has the single-revocation route.
+
+        ### The bound is refused, not clamped
+
+        More than 50 ids is a **422**, not a truncation. A request naming a thousand
+        invitations that revoked the first fifty and reported nothing would be the
+        outage this route exists to make harder.
+
+        ### `requested` and `revoked` are both returned, and they differ
+
+        Ids that were already revoked, or that belong to another account, change no
+        rows, so `revoked` is frequently smaller than `requested`. Both numbers are
+        in the response because a client that cannot tell "you asked for four and
+        four went" from "you asked for four and two went" would report a completed
+        task over an incident.
+
+        **The count in the audit record is the number the database reported**, not
+        the length of the request — a request naming six ids where two were already
+        revoked records six, because six is the truth.
+      security:
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkInvitationRevocation'
+            examples:
+              confirmed:
+                summary: The shape a bulk revocation must have
+                value:
+                  invitation_ids:
+                    - 4f2c0000-0000-4000-8000-00000000abcd
+                    - 4f2c0000-0000-4000-8000-00000000abce
+                  confirm: true
+              missingConfirmation:
+                summary: Refused — 422 naming `confirm`
+                value:
+                  invitation_ids:
+                    - 4f2c0000-0000-4000-8000-00000000abcd
+      responses:
+        '200':
+          description: |
+            The batch ran. `revoked` may be smaller than `requested`; both are
+            reported rather than reconciled.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BulkRevocationResult'
+              example:
+                requested: 2
+                revoked: 2
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            Not an **owner** of this account, the token does not carry
+            `account_invitations:write`, or a browser session was presented.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /v1/introspections:
     post:
       tags: [api-keys]
@@ -1812,6 +2163,164 @@ components:
                 recognised as a cafaye credential by its first seven characters,
                 which turns "somebody has to work out which of these strings is
                 working" into a grep.
+
+    BulkInvitationRevocation:
+      type: object
+      description: |
+        **Both fields are required, and neither is optional.** `confirm` is the
+        whole of the difference between this route and the single-revocation route,
+        and an array with no confirmation is exactly the request that revokes every
+        pending invitation by accident.
+
+        An unknown field is a 422, so a client misspelling `confirm` is told rather
+        than proceeding.
+      required: [invitation_ids, confirm]
+      additionalProperties: false
+      properties:
+        invitation_ids:
+          type: array
+          minItems: 1
+          maxItems: 50
+          description: |
+            The pending invitations to revoke, as row ids. **At most 50** — a larger
+            request is a 422 rather than a truncation, because a request naming a
+            thousand invitations that silently revoked the first fifty is the outage
+            this route exists to make harder.
+
+            Ids that are already revoked, already accepted, or belong to another
+            account are not an error: they change no rows and are not counted in
+            `revoked`. That is why the response reports both counts.
+          items:
+            type: string
+            format: uuid
+        confirm:
+          type: boolean
+          const: true
+          description: |
+            Must be `true`. `false` is the same answer as absent — a 422 naming
+            `confirm` — so a client cannot learn from the response which value it
+            sent.
+          example: true
+
+    BulkRevocationResult:
+      type: object
+      description: |
+        `requested` is what the request named and `revoked` is what the database
+        changed, and they are frequently different. Both are reported rather than
+        reconciled, because a client that cannot tell "you asked for four and four
+        went" from "you asked for four and two went" would report a completed task
+        over an incident.
+      required: [requested, revoked]
+      properties:
+        requested:
+          type: integer
+          minimum: 1
+          maximum: 50
+          description: How many invitation ids the request named, after de-duplication.
+        revoked:
+          type: integer
+          minimum: 0
+          maximum: 50
+          description: |
+            How many pending invitations the database actually changed. **This is
+            also the number in the audit record** — the one the mutation reported,
+            not the length of the request.
+
+    AuditLogPage:
+      type: object
+      description: |
+        One bounded page of the account's admin audit trail, newest first.
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          description: |
+            Present and empty when there is nothing, rather than omitted: "no
+            entries" and "the server left the field out" are different answers and
+            a client that has to tell them apart will eventually get it wrong.
+          items:
+            $ref: '#/components/schemas/AuditLogEntry'
+        next:
+          type: string
+          description: |
+            The opaque cursor for the following page, **absent on the last page**.
+
+            It encodes the last row's `(occurred_at, id)` pair together and is
+            passed back verbatim in `before`. It is not an offset, and it is not a
+            bare timestamp: a timestamp-only cursor drops every record sharing the
+            boundary instant, and this service's clock is a timestamp rather than a
+            sequence, so two admin actions in the same second is the normal case.
+          example: MiIyMDI2LTA5LTMwVDEyOjAwOjAwWiI2MTk3ZjItMTFlNi0zMWFhLTExYjhhMjM2ZmU2YzFlZA
+
+    AuditLogEntry:
+      type: object
+      description: |
+        One admin action.
+
+        **There is no field here that could hold a credential, and that is
+        structural rather than a convention.** `actor_user_id` and `actor_key_id`
+        are row ids. The api key's digest is a field on the struct a handler holds,
+        and an audit log is exactly where a careless `fmt.Sprintf("%+v", …)` of it
+        would end up — so a test walks the types that reach this table and fails if
+        any of them grows a field that could hold a value.
+
+        An operator copies this response into an incident ticket, and a response
+        shape with a `token` field is one somebody will eventually populate.
+      required: [id, action, actor_user_id, actor_key_id, target, affected, trace_id, occurred_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The record's own id.
+        action:
+          type: string
+          enum: [invitation.revoked, invitations.revoked]
+          description: |
+            What was done, from a closed set validated in Go rather than by a
+            schema CHECK — a closed vocabulary is a code fact, and putting it in
+            the schema would make adding an action a migration.
+
+            The two names are distinct because the two are different events: one
+            invitation revoked is a decision about a person, and a hundred at once
+            is a decision about the account. Collapsing them would lose the answer
+            an operator is asking for — "was that one, or was that all of them".
+        actor_user_id:
+          type: string
+          format: uuid
+          description: The human the acting token was minted for.
+        actor_key_id:
+          type: string
+          format: uuid
+          description: |
+            **Which** token acted — the row's id, never its value. "Somebody in the
+            account" is not an answer an incident review can use, and this is the id
+            an operator revokes by.
+        target:
+          type: string
+          maxLength: 64
+          description: |
+            A short label for what was acted on: an invitation id for the single
+            route, `invitation-revocations` for the bulk one. A label and not a
+            list, so one record stays one record however large the request was.
+        affected:
+          type: integer
+          minimum: 0
+          description: |
+            How many rows the action changed — the number the mutation reported, not
+            the length of the request. `0` on the bulk route means every named
+            invitation was already in a non-revocable state, and the response's
+            `revoked` count says so too.
+        trace_id:
+          type: string
+          description: |
+            The request's trace id, which is also the `X-Trace-Id` response header
+            and the `trace_id` in the problem document if the action failed. This
+            joins an audit record to a log line without either carrying a timestamp
+            comparison. Never a credential.
+        occurred_at:
+          type: string
+          format: date-time
+          description: When the action happened, from the service's clock.
 
     MintAPIKeyRequest:
       type: object

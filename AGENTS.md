@@ -288,3 +288,95 @@ the toolchain pin matches `go.mod`, and that no secret is written down.
    because `accounts.Slugify` truncates at 63 characters and two long names that
    share a prefix become one slug.
 6. `bin/prime`, `go vet ./...`, `gofmt -l .`, `go test -race ./...`.
+
+**A new route gets rows in BOTH documents and both walks, and the second one is
+the one that bites.** A route is not finished when it is documented and gated: it
+is finished when `servedRoutes` and `mountedAccountRoutes` both *see* it, and
+those two are `options` struct literals listing a double per conditional surface.
+A field left out of either is invisible, and the consequence is that the check
+goes green by not checking — which happened here once, to
+`TestEveryServedRouteIsDocumentedOrNamed` itself, while three undocumented
+operations were mounted. `internal/httpapi/router_walk_test.go` holds it:
+`TestEveryConditionalSurfaceIsVisibleToTheWalk` lists every surface field whose
+absence can make a registrar skip its routes, and
+`TestTheDriftWalkSeesTheAdminSurface` / `TestTheMatrixWalkSeesTheAdminSurface`
+assert the walks actually find the routes rather than that a field was set.
+**Treat a struct literal that configures a check as a completeness obligation**,
+because nothing about it looks like one.
+
+## The admin surface
+
+Three routes, one sentence, and the reasoning is in
+[DECISIONS.md](DECISIONS.md) D2–D5. What belongs in this file is the rule a
+future packet could break without noticing.
+
+**The privilege boundary is one sentence, and the code says exactly it.** An
+account admin may revoke pending invitations to their own account and read that
+account's admin audit log — authority over other people's pending access, and
+nothing else. It is a sentence rather than a paragraph because a role checked in
+thirty places is a role that will be checked in twenty-nine of them. The three
+rows in `accountRouteScopes` ARE the boundary: there is no fourth without a new
+scope in `internal/apikeys`, which is a file whose whole argument is that a token
+is granted exactly what it names.
+
+**No admin route is reachable with a user session, and the refusal is per route.**
+`requireAdminToken` runs OUTSIDE `requireAccountRole`, which is what makes it a
+property of the surface rather than of the handlers. A session is refused with
+403 — the caller is authenticated, so 401 would send a client hunting a login
+problem that does not exist. A token is not merely permitted here, it is the
+*point*: every action is recorded against the api key's **row id**, so a token is
+something an audit record can name and a session is not. This is the mirror of
+`sessionCredentialOnly`, and the two together mean no route is reachable by both
+kinds of credential unless somebody wrote that down deliberately.
+
+**A mutation and its audit record are in one transaction, and there is no way to
+express the first without the second.** `admin.Service` has no exported method
+that mutates without recording: `Audited` takes the mutation as a callback and
+runs it inside the transaction that writes the record. Adding an admin action
+that skips it needs a new exported method, which is a review-visible change. The
+proofs are negative and both directions matter — a failing audit write rolls the
+mutation back, and a failing mutation leaves no record — because a service that
+rolled back everything would pass a happy-path test perfectly.
+
+**The audit record's immutability is in the DATABASE.** `GET` is the only method
+mounted on the path, the store has `Append` and `List` and nothing else, and the
+table refuses `UPDATE` and `DELETE` with a trigger. The third is the one that
+settles it: the first two only describe *this codebase*, and a repair script, a
+`psql` session or a future packet all bypass Go. The table also has **no foreign
+key to `accounts`**, deliberately — a cascade is a `DELETE`, and the shortest
+route from "an admin did something questionable" to "there is no record of it"
+must not be one request.
+
+**A bulk operation does not get the single operation's shape.** The bulk
+revocation needs `confirm: true` **in the body**, a named array, and an owner
+where the single one needs none of those and an admin. `confirm` is in the body
+rather than the query string so that the request which performs the operation and
+the one describing it are the same bytes. Both `requested` and `revoked` come
+back, because `revoked` is frequently smaller and a client that cannot tell the
+two cases apart reports a completed task over an incident.
+
+**A bound that is refused beats a bound that is clamped.** Over the ceiling is a
+422, never a silent truncation: a client that asked for 500 rows and received 100
+has been told a lie about how much trail it has read. The audit trail's page
+cursor is **opaque and carries `(occurred_at, id)` together** — a timestamp-only
+cursor silently drops records sharing the boundary instant, which the service's
+own clock makes the normal case, and which this repository's test found.
+
+**An audit record names a credential; it never carries one.** `Actor` has the
+api key's row id and the owner's user id, and there is no field in `internal/admin`
+that a token could be written into.
+`TestNothingOnThisSurfaceCanRecordAToken` reflects over the types that reach the
+table, because `apikeys.Key` has a `TokenDigest` field a handler holds and an
+audit log is exactly where a `%+v` of it ends up. A test asserting "we did not log
+a token" is unfalsifiable; that one is not.
+
+**The authorization matrix has a real hole on this surface and it is named, not
+papered over.** Its six columns are six *sessions*, so on a token-only surface
+every column is a 403 and the matrix carries no positive cell for these three
+routes. The rows are in the matrix anyway so `TestEveryRouteIsInTheMatrix` still
+demands them, and the token/session axis is covered by
+`TestNoAdminRouteIsReachableWithASessionAlone`,
+`TestAnAdminTokenHoldingNeitherScopeIsRefused` and `TestTheBulkRouteIsOwnerOnly`.
+The anonymous column is `403` here rather than `401` on every other row, because
+`requireAdminToken` runs first — which is also why `expectedStatus` consults a
+row's `expect` override BEFORE its authentication check.

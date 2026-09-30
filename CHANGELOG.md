@@ -8,6 +8,115 @@ All notable changes to identity are recorded here. The format follows
 
 ### Added
 
+- **The admin surface** — three operations, and the privilege boundary is one
+  sentence: *an account admin may revoke pending invitations to their own account
+  and read that account's admin audit log, and nothing else.*
+
+  | route | minimum | scope |
+  |---|---|---|
+  | `GET /v1/accounts/:id/admin/audit-log` | admin | `audit_log:read` |
+  | `DELETE /v1/accounts/:id/admin/invitations/:invitationId` | admin | `account_invitations:write` |
+  | `POST /v1/accounts/:id/admin/invitation-revocations` | **owner** | `account_invitations:write` |
+
+  - **Reachable by a scoped api key only. A browser session is refused, per
+    route.** A session is a browser credential and an admin surface a session
+    cookie opens is one CSRF away from being somebody else's — and a token is the
+    *right* credential here, because every action is recorded against the api
+    key's row id, so an audit record can name the credential that acted.
+  - **Every action is recorded in the same transaction as the mutation.**
+    `admin.Service` exposes no method that mutates without recording: the mutation
+    is a callback run inside the transaction that writes the record, so a
+    revocation that commits and an audit row that does not is unrepresentable.
+    Both failure directions are tested against real Postgres with a trigger that
+    raises.
+  - **The record cannot be edited, including by the admin whose action is in
+    it.** `GET` is the only method on that path, the store has no update or
+    delete, and **the table refuses `UPDATE` and `DELETE`** in the database — a
+    guarantee written in Go does not bind a `psql` session or a future packet.
+    The table has **no foreign key to `accounts`**, so the admin surface cannot
+    delete its own audit log by deleting the account.
+  - **Bulk and single do not share a request shape**, because a bulk operation is
+    where an off-by-one becomes an outage: the bulk route needs `confirm: true` in
+    the body, an array of at most 50, and an **owner**; the single route needs none
+    of those. Both counts (`requested` and `revoked`) come back, and they differ.
+  - **Every list is bounded and the bound is refused rather than clamped.** The
+    trail defaults to 25 rows, refuses `limit` above 100, and pages with an opaque
+    cursor carrying `(occurred_at, id)` together — a timestamp-only cursor drops
+    records sharing the boundary instant, and the service's clock is a timestamp
+    rather than a sequence.
+  - **No route in this service may record or log a credential.** The audit entry
+    carries `actor_user_id` and `actor_key_id` — row ids — and
+    `TestNothingOnThisSurfaceCanRecordAToken` reflects over the types that reach
+    the table and fails if any grows a field that could hold a value.
+
+  `openapi/v1.yaml` is at **1.4.0** with all three operations, unique
+  operationIds, and full request and response schemas. **`knownDrift` did not
+  grow** — it is still twelve, still pinned — because the answer to "I added a
+  route" is to document it. [D2](DECISIONS.md)–[D5](DECISIONS.md) record the
+  boundary, the audit decision, the token-only ruling and the bulk/single split.
+
+- **`account_audit_log` (00012) and `account_invitation_revocation` (00013).**
+  The audit table carries **no foreign key to `accounts` on purpose**: a cascade
+  is a `DELETE`, and this table does not delete, so allowing it would make the
+  shortest route from "an admin did something questionable" to "there is no record
+  of it" be one request to `DELETE /v1/accounts/:id`. Revoking an invitation now
+  sets `revoked_at` rather than deleting the row, which answers "was this
+  revoked, or was it always broken?" and **frees the address to be invited again**
+  — the entire reason the operation exists. 00013 is the schema half of what
+  00007's comment anticipated: *"Deleting a user with pending invitations is
+  therefore refused by the database until they are revoked, which is a later
+  packet."*
+
+- **Two new scopes**, `audit_log:read` and `account_invitations:write`, and
+  **deliberately no scope named `admin`.** The vocabulary's own comment rules that
+  name out, because a category name is where a wildcard grows back. Reading the
+  trail is not `accounts:read` — a record of authority being used over time is a
+  different sensitivity from the account's current shape — and revoking is not
+  `accounts:write`, which creates things the account wants.
+
+### Fixed
+
+- **The document-versus-router tripwire was blind to a whole surface.**
+  `servedRoutes` in `internal/httpapi/openapi_drift_test.go` builds an `options`
+  struct literal so every conditional surface takes its "configured" path, and the
+  new `admin` field was not in it — so `registerAdminRoutes` returned early and
+  the walk read a **smaller service than the one that runs**.
+  `TestEveryServedRouteIsDocumentedOrNamed` — the reverse-direction check holding
+  this repository's twelve findings — **passed green while three undocumented
+  operations were mounted**. `TestEveryRouteIsInTheMatrix` was blinded the same
+  way at the same time.
+
+  The check went green **by not checking**, which is the one outcome AGENTS.md
+  names as the failure mode the file exists to prevent, and it happened to the
+  check written to catch precisely that.
+  `internal/httpapi/router_walk_test.go` now holds the property:
+  `TestTheDriftWalkSeesTheAdminSurface` and `TestTheMatrixWalkSeesTheAdminSurface`
+  assert the walks **find** the routes, and
+  `TestEveryConditionalSurfaceIsVisibleToTheWalk` keeps a list of every surface
+  field whose absence can make a registrar skip its routes. The general lesson is
+  in [D1](DECISIONS.md): **a struct literal used to configure a check is a
+  completeness obligation, and nothing about it looks like one.**
+
+### Changed
+
+- **`expectedStatus` in the authorization matrix now consults a row's `expect`
+  override before its authentication check.** It had them the other way round, on
+  the stated grounds that "authentication is the one decision no endpoint
+  overrides" — which is true where the credential is resolved first, and false on
+  the admin surface, where the credential *kind* is resolved first by
+  `requireAdminToken` outside `requireAccountRole`. A request with no credential
+  there is answered `403`, and the three new matrix rows were silently being
+  asserted `401` for a service that does not give that. The one pre-existing row
+  with an override that relies on the old order now states its anonymous answer
+  itself.
+
+- `internal/platform/dbtest` clones `account_audit_log` **and re-creates its
+  append-only trigger** in each test's private schema. `LIKE` does not copy
+  triggers, so without it a test would run against a table the production one can
+  never `UPDATE`.
+
+### Added (from packet identity-09, in this release)
+
 - **The document-versus-router tripwire**, the last one owed in the fleet.
   `internal/httpapi/openapi_drift_test.go` holds `openapi/v1.yaml` and
   `openid/openid.yaml` to the router in **both directions**, comparing sets of
