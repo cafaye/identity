@@ -327,6 +327,18 @@ func (p *Provider) discovery(ctx context.Context) *oidc.DiscoveryConfiguration {
 	doc.DeviceAuthorizationEndpoint = ""
 	doc.CheckSessionIframe = ""
 
+	// …and the two that go with them. These are the fields the FIRST live run of
+	// the provider caught and the object-level test did not: blanking an endpoint
+	// leaves its `*_auth_methods_supported` sibling behind, and a document
+	// advertising how to authenticate to an introspection endpoint this service
+	// does not have is a document describing a machine. TestDiscoveryOmitsWhatThis
+	// ServiceDoesNotServe now asserts the whole set rather than the endpoints
+	// alone.
+	doc.IntrospectionEndpointAuthMethodsSupported = nil
+	doc.IntrospectionEndpointAuthSigningAlgValuesSupported = nil
+	doc.RevocationEndpointAuthMethodsSupported = nil
+	doc.RevocationEndpointAuthSigningAlgValuesSupported = nil
+
 	// Authorization code and nothing else: no implicit flow, and no JWT profile
 	// grant despite the library advertising it unconditionally.
 	doc.ResponseTypesSupported = []string{string(oidc.ResponseTypeCode)}
