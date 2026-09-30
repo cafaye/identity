@@ -63,6 +63,29 @@ exposes:
     # available here.
     - identity.user.created
 
+    # The OIDC registrations. Emitted by POST /v1/accounts/{account_id}/oidc-clients
+    # and DELETE on the same, each in the same transaction as the write it
+    # describes — and the revocation transaction also bulk-revokes every access
+    # token issued against the registration, because a JWT is verifiable by
+    # anybody holding the published key set until its `exp` arrives and revoking
+    # the registration is not by itself enough.
+    #
+    # The subject is the OIDC client's ROW id, not the account and not the
+    # `client_id` string. A consumer that has to stop trusting a credential
+    # correlates on the credential; a consumer watching an account's registrations
+    # correlates on the account. Both questions are real and this event answers
+    # the first, per core's "the entity the event is about, not the actor".
+    #
+    # CORE'S CATALOG HAS NO ROWS FOR EITHER TYPE YET. `caf contract lint` passes
+    # — it checks the schema and the service-prefix rule, and both hold — but
+    # core's tests/test_specs.py asserts a catalog row and a publisher entry agree
+    # in BOTH directions, so core needs a row per type before that suite is green
+    # against this manifest. That is a core change and this packet does not touch
+    # another repository. It is the same reconciliation the two constants below
+    # record, in the direction core has to move.
+    - identity.oidc_client.created
+    - identity.oidc_client.revoked
+
     # Not yet emitted, and deliberately absent rather than declared and unimplemented:
     #   user.email_verified   the email-verification packet
     #   account.created       the accounts and tenancy packet
@@ -75,6 +98,10 @@ exposes:
     #   session.revoked       a later packet; DELETE /v1/session does not emit it yet
     #   identity.api_key.created  the scoped API tokens packet
     #   identity.api_key.revoked  the scoped API tokens packet
+    #
+    # Also absent, and the omission is deliberate rather than pending: the OIDC
+    # packet lands in THIS file's `events` list above rather than in this comment,
+    # because the code emits them.
     #
     # core asserts that a catalog row and a publisher entry are the same fact
     # stated twice, so declaring one of these before the code emits it would fail
