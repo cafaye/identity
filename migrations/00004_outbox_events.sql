@@ -42,8 +42,15 @@ CREATE TABLE outbox_events (
     source      text        NOT NULL,
     subject     text,
     occurred_at timestamptz NOT NULL,
-    payload     jsonb       NOT NULL,
-    envelope    jsonb       NOT NULL,
+
+    -- `json`, not `jsonb`. This is the document that goes on the wire, and jsonb
+    -- does not preserve the text it was given: it reorders object keys and
+    -- reflows whitespace, so the envelope a consumer receives would differ
+    -- byte-for-byte from the one this service validated and committed. Nothing
+    -- here queries *inside* the payload, which is the usual reason to reach for
+    -- jsonb, so there is no operator to give up.
+    payload     json        NOT NULL,
+    envelope    json        NOT NULL,
 
     published_at timestamptz,
     attempts     integer     NOT NULL DEFAULT 0,

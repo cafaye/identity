@@ -24,6 +24,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -115,4 +116,106 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(ctx, `TRUNCATE TABLE outbox_events, sessions, users CASCADE`); err != nil {
 		t.Fatalf("truncating: %v", err)
 	}
+}
+
+// Schema returns a pool whose search_path is a private schema containing a fresh
+// copy of the three tables. Nothing any other test does can be seen by, or
+// interfere with, a test using this pool.
+//
+// It exists for the tests that need an *empty* database rather than a private
+// corner of a shared one — the outbox claim tests, which assert on which rows a
+// SELECT returns, cannot do that while a backlog from another package is in the
+// table. A unique email gives isolation for row *identity*; it cannot give
+// isolation for a query's result set.
+//
+// The tables are cloned with LIKE ... INCLUDING ALL, which copies columns,
+// defaults, CHECK constraints and indexes from whatever the migrations currently
+// define — so a schema change is picked up with no edit here. Foreign keys are
+// the one thing LIKE does not copy (they point at the original table), so the one
+// this schema has is declared explicitly below. Re-read the migrations when
+// adding a table or a constraint; this list has to stay in step with them.
+func Schema(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+
+	base := dsn(t)
+
+	var noise [6]byte
+	if _, err := rand.Read(noise[:]); err != nil {
+		t.Fatalf("generating a schema name: %v", err)
+	}
+	schema := "test_" + hex.EncodeToString(noise[:])
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	admin, err := db.Open(ctx, base, db.DefaultOptions())
+	if err != nil {
+		t.Fatalf("opening an admin pool against %s: %v", EnvVar, err)
+	}
+	// Registered first so that it runs *last*: cleanups are LIFO, and the DROP
+	// SCHEMA below still needs this pool to be open.
+	t.Cleanup(admin.Close)
+	if err := admin.Ping(ctx); err != nil {
+		t.Fatalf("%s is set but not reachable (%v). Is the server up, and are the migrations applied?", EnvVar, err)
+	}
+
+	stmts := []string{
+		`CREATE SCHEMA ` + schema,
+		`CREATE TABLE ` + schema + `.users (LIKE public.users INCLUDING ALL)`,
+		`CREATE TABLE ` + schema + `.sessions (LIKE public.sessions INCLUDING ALL)`,
+		`CREATE TABLE ` + schema + `.outbox_events (LIKE public.outbox_events INCLUDING ALL)`,
+		`ALTER TABLE ` + schema + `.sessions ADD CONSTRAINT sessions_user_id_fkey
+			FOREIGN KEY (user_id) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
+	}
+	for _, stmt := range stmts {
+		if _, err := admin.Exec(ctx, stmt); err != nil {
+			t.Fatalf("preparing the %s schema: %v\n%s", schema, err, stmt)
+		}
+	}
+	t.Cleanup(func() {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer dropCancel()
+		if _, err := admin.Exec(dropCtx, `DROP SCHEMA IF EXISTS `+schema+` CASCADE`); err != nil {
+			t.Logf("dropping the %s schema: %v", schema, err)
+		}
+	})
+
+	// search_path is a plain GUC, so pgx passes it as a connection runtime
+	// parameter. Every unqualified name in the test's SQL then resolves inside the
+	// private schema.
+	pool, err := db.Open(ctx, withSearchPath(base, schema), db.DefaultOptions())
+	if err != nil {
+		t.Fatalf("opening a pool scoped to %s: %v", schema, err)
+	}
+	t.Cleanup(pool.Close)
+
+	return pool
+}
+
+// dsn returns the configured DSN, skipping the test when it is unset.
+func dsn(t *testing.T) string {
+	t.Helper()
+
+	value := os.Getenv(EnvVar)
+	if value == "" {
+		t.Skipf("%s is not set; skipping the integration test", EnvVar)
+	}
+	return value
+}
+
+// withSearchPath appends search_path to the DSN, preserving whatever query
+// parameters it already carries.
+func withSearchPath(dsnValue, schema string) string {
+	parsed, err := url.Parse(dsnValue)
+	if err != nil {
+		// Pool already validated this DSN, so a parse failure here would be a
+		// bug in this helper rather than bad configuration.
+		panic("dbtest: parsing " + EnvVar + ": " + err.Error())
+	}
+
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+
+	return parsed.String()
 }
