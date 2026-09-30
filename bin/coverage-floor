@@ -357,6 +357,22 @@ fi
 measured="$(awk -v c="${covered:-0}" -v t="$statements" \
   'BEGIN { printf "%.1f", 100 * c / t }')"
 
+# THE COMPARISON IS EXACT, AND THAT IS NOT PEDANTRY.
+#
+# The printed number is rounded to one decimal — a percentage is a report, not an
+# input — but comparing the ROUNDED number would let a floor be passed by
+# rounding: 699 of 999 statements is 69.97%, prints as "70.0", and a floor of 70
+# would be satisfied. That is the whole floor, given away in the last character of
+# a display format, and it was found by a red proof rather than by reading: the
+# 69.9% case built here came out green the first time because the fixture had 999
+# statements instead of 1000.
+#
+# So the test is `covered * 100 < floor * total` in integers. No float, no
+# rounding, no locale, and no dependence on how many digits anybody prints.
+# Go's own tool rounds the same way and kit's step compares the rounded value, so
+# this is stricter than the tool it replaces — deliberately, because the tool's
+# job is to report and this one's job is to refuse.
+
 # ---------------------------------------------------------------------------
 # PRINT THE THREE FACTS TOGETHER, THEN COMPARE
 #
@@ -379,9 +395,10 @@ done < "$records"
 echo "floor ${floor}%  (coverage-fail-under, restated here so the measured number, the" \
      "excluded set and the floor are read together rather than one at a time)"
 
-if [ "$(awk -v a="$measured" -v b="$floor" 'BEGIN { print (a + 0 < b + 0) ? 1 : 0 }')" != 0 ]; then
-  echo "::error::coverage ${measured}% is below the ${floor}% floor, measured over every" \
-       "statement NOT excluded above." >&2
+if [ "$(awk -v c="${covered:-0}" -v t="$statements" -v b="$floor" \
+        'BEGIN { print (c * 100 < b * t) ? 1 : 0 }')" != 0 ]; then
+  echo "::error::coverage ${measured}% (${covered}/${statements} statements) is below" \
+       "the ${floor}% floor, measured over every statement NOT excluded above." >&2
   exit 1
 fi
 echo "coverage ${measured}% at or above the ${floor}% floor"

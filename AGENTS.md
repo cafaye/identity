@@ -357,7 +357,7 @@ bin/coverage-floor /tmp/cov.out
 
 **Never lower the floor to make it pass, and never add a test to generated code
 to raise it.** `internal/platform/ci/coverage_exclusions_test.go` drives
-`bin/coverage-floor` through twenty-one deliberately broken declarations and
+`bin/coverage-floor` through twenty-two deliberately broken declarations and
 profiles — including 69.9%, which is red, and 70.1%, which is green — so the floor
 is known to bite rather than assumed to.
 

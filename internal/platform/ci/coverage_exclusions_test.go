@@ -695,7 +695,24 @@ func TestTheCoverageFilterCanFail(t *testing.T) {
 			name:    "69.9% is red: the floor is still 70 with the exclusion in place",
 			decl:    entry,
 			profile: justBelow,
-			want:    "coverage 69.9% is below the 70% floor",
+			want:    "coverage 69.9%",
+		},
+		{
+			// The rounding case, and the reason this row exists rather than a
+			// comment. 699 of 999 is 69.97%: it PRINTS as "70.0", and a floor
+			// compared against the printed number is satisfied by a module below
+			// it. The comparison is exact integer arithmetic
+			// (`covered * 100 < floor * total`) precisely so that the display
+			// format cannot give the floor away.
+			//
+			// Found by this very proof rather than by reading: the first version of
+			// the 69.9% fixture had 999 statements instead of 1000, printed
+			// "70.0", and went GREEN. A proof that found a bug in the thing it
+			// was proving is the whole reason to run one.
+			name:    "69.97% is red even though it PRINTS as 70.0",
+			decl:    entry,
+			profile: oneStatementPerBlockProfile(699, 999),
+			want:    "(699/999 statements) is below",
 		},
 	}
 

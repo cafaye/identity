@@ -32,7 +32,7 @@ All notable changes to identity are recorded here. The format follows
     -func` has no way to leave a path out of `total:`, so the exclusion has to filter
     the profile — and a filter written in YAML is a regular expression nothing but CI
     executes. The script is driven by
-    `TestTheCoverageFilterCanFail` through twenty-one deliberately broken
+    `TestTheCoverageFilterCanFail` through twenty-two deliberately broken
     declarations and profiles, and
     `TestTheCoverageStepRunsTheCheckedInFilter` fails if the workflow stops calling
     it, so the tested filter and the enforcing one cannot drift apart.

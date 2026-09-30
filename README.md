@@ -1051,9 +1051,14 @@ what. **No percentage is written into `ci.yml`**, which is why the one that used
 be there is gone rather than updated.
 
 **The floor is still the floor.** `TestTheCoverageFilterCanFail` runs the real
-script over twenty-one broken declarations and profiles, and includes a module at
+script over twenty-two broken declarations and profiles, and includes a module at
 **69.9%** (red) and one at **70.1%** (green), with the exclusion in place and
-unchanged. An exclusion that made coverage unrestrictable would fail that test.
+unchanged. It also includes **699 of 999 statements — 69.97%, which prints as
+"70.0"** — and that one is red, because the comparison is
+`covered * 100 < floor * total` in integers rather than against the printed number.
+Go's own tool rounds the same way and kit's step compares the rounded value, so this
+is stricter than the tool it replaces: that tool's job is to report and this one's is
+to refuse. An exclusion that made coverage unrestrictable would fail that test.
 
 **Where the mechanism lives, and the disagreement it leaves.** It lives here, not
 in kit — identity's *enforcing* coverage step is its own, in `gate`, because kit's
