@@ -115,6 +115,20 @@ func New(checks []Check, opts ...Option) http.Handler {
 		opt(&o)
 	}
 
+	// Outermost first: the trace id must exist before anything can log or report
+	// one, and recovery must sit inside it so the panic handler can quote the id.
+	return traceMiddleware(recoverPanics(o.logger, newMux(checks, o)))
+}
+
+// newMux is the router, without the two middlewares, so that a test which has to
+// enumerate the routes can walk the tree this assembles rather than a second
+// assembly of the same routes written out in a test.
+//
+// The alternative is a test that calls registerRoutes itself, and that is a
+// second list of what a deployed process mounts — the exact thing the tripwire in
+// openapi_drift_test.go exists to refuse. This is the whole of the change: the
+// wiring below is the wiring that was inline, and New is the only caller.
+func newMux(checks []Check, o options) *chi.Mux {
 	r := chi.NewRouter()
 	r.NotFound(notFound)
 	r.MethodNotAllowed(methodNotAllowed)
@@ -126,10 +140,7 @@ func New(checks []Check, opts ...Option) http.Handler {
 	// to answer a probe for its own metadata.
 	o.registerOIDCWellKnownRoutes(r)
 	o.registerRoutes(r)
-
-	// Outermost first: the trace id must exist before anything can log or report
-	// one, and recovery must sit inside it so the panic handler can quote the id.
-	return traceMiddleware(recoverPanics(o.logger, r))
+	return r
 }
 
 // HealthResponse is the /healthz body. Liveness answers whether this process
