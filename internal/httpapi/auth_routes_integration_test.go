@@ -31,7 +31,24 @@ func newTestServer(t *testing.T) (http.Handler, *pgxpool.Pool, *clock.Fake) {
 	pool := dbtest.Schema(t)
 	clk := clock.NewFake(time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC))
 
-	svc := auth.NewService(
+	return New(nil, WithAuth(authServiceFor(pool, clk)), WithTenancy(realTenancy(pool, clk))), pool, clk
+}
+
+// authServiceFor is the production auth wiring over a pool, with the cheap
+// argon2id parameters a test wants. It is one function so that the test server
+// and the authorization matrix cannot build different services.
+func authServiceFor(pool *pgxpool.Pool, clk clock.Clock) *auth.Service {
+	return authServiceWithSessionTTL(pool, clk, 24*time.Hour)
+}
+
+// authServiceWithSessionTTL is authServiceFor with the session lifetime spelled
+// out, for the tests that move the clock further than a day.
+//
+// It is a separate function rather than a parameter on authServiceFor because
+// almost no test should be thinking about session lifetime, and a defaulted
+// parameter on the common path invites exactly that.
+func authServiceWithSessionTTL(pool *pgxpool.Pool, clk clock.Clock, sessionTTL time.Duration) *auth.Service {
+	return auth.NewService(
 		db.TxRunner{Pool: pool},
 		db.Direct{Pool: pool},
 		users.NewStore(pool),
@@ -42,10 +59,8 @@ func newTestServer(t *testing.T) (http.Handler, *pgxpool.Pool, *clock.Fake) {
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),
 		clk,
-		24*time.Hour,
+		sessionTTL,
 	)
-
-	return New(nil, WithAuth(svc), WithTenancy(realTenancy(pool, clk))), pool, clk
 }
 
 const validPassword = "correct horse battery staple"
