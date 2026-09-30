@@ -8,6 +8,79 @@ All notable changes to identity are recorded here. The format follows
 
 ### Added
 
+- **The Go client**, generated from `openapi/v1.yaml` and committed. `client/` is a
+  hand-written wrapper over a committed oapi-codegen v2.8.0 transport, and it is the
+  third of the fleet's clients after `cafaye-ts` and `cafaye-py` — generated for Go,
+  hand-written for Python, and the asymmetry is a ruling with a reason recorded in
+  [DECISIONS.md](DECISIONS.md) D6 rather than an accident to be tidied up.
+
+  - **`client/generated/api.gen.go` is committed, 20 operations, and regeneration is
+    a gate.** The generator is pinned in `client/generate.go` with
+    `go run <module>@v2.8.0`, which keeps the GENERATOR out of `go.mod` entirely, and
+    `TestTheCommittedGeneratedFileIsWhatThePinnedGeneratorProduces` runs the real
+    generator over the real document into a temporary directory and compares. The
+    temporary directory is the point: a regenerate-in-place `git diff` leaves the tree
+    modified, so the next run passes and the failure is visible exactly once.
+
+  - **The generated code is excluded from lint, by exactly one anchored path.**
+    `.golangci.yml` exempts `^client/generated/api\.gen\.go$` and nothing else, and
+    `TestTheLintExclusionIsOneFileAndNotAPrefix` walks every `.go` file in the tree
+    and fails if the pattern matches one of them. `govet` is deliberately **not**
+    excluded, because `go vet ./client/` passes on the generated file — a check that
+    reports on correctness rather than style has no business being exempted.
+
+  - **The credential reaches no string a human reads, and the rule is structural.**
+    Every string the client builds goes through `Redactor.String`, redaction is all or
+    nothing, and the credential lives inside **closures** rather than in struct
+    fields: `fmt` prints an exported field by value under `%#v`, and that verb does not
+    consult `String()`, so a `token string` field is a leak no method can intercept.
+    `TestTheClientNeverPrintsACredential` runs a full request cycle — including a 422
+    that echoes the caller's own token back in the body and three of its headers — and
+    sweeps `%v`, `%+v`, `%#v`, `%s`, `%q`, every reflected field and the serialised
+    form.
+
+    **The generated types have no redacting `String()` and oapi-codegen does not emit
+    one**, which the brief asks to check for and which is measured rather than assumed:
+    `fmt.Sprintf("%v", IssuedAPIKey{...})` prints the plaintext of a scoped credential
+    this service stores only a SHA-256 of. Go will not let one package define a method
+    on another's type, so the answer is `client.SafeToLog(v)` and
+    `(*Client).SafeToLog(v)`, the latter strictly stronger because it knows the
+    client's own credential.
+
+  - **An unknown problem code is a typed error.** `*UnknownProblemError` carries the
+    code, the status and the trace id, so `errors.As(err, &ProblemError)` works for
+    every code including the four identity already documents that core's reserved list
+    does not have. `ProblemError` is an interface rather than a base struct because
+    `errors.As` matches on assignability and embedding does not create one — a
+    hierarchy of structs would make the single catch work only for codes this build
+    does not know, which is exactly backwards. 202 is a typed error too: a 202 from
+    `POST /v1/session` carries a challenge and **no session**, so returning a `Session`
+    with an empty token would be the credential-shaped non-credential the document
+    warns about.
+
+  - **Base URLs resolve in a documented order and there is no default.** Explicit, then
+    `$CAFAYE_IDENTITY_BASE_URL`, then `$CAFAYE_BASE_URL`, then **throw**. The document's
+    own `servers:` entry is deliberately not used as a default: it would send a
+    self-hoster's traffic to somebody else's deployment and it would *succeed*, so
+    nothing would look wrong until somebody read a log.
+
+  - **Two auth models, classified by identity's own prefix rule.** A `cafaye_` value
+    goes in the `Authorization` header and **not** in a cookie; a session goes in
+    both, because identity prefers the header when both are present and that is what
+    lets one credential work against identity and against the other five services.
+    Tested from the server's side, against a live `httptest.Server`, rather than from
+    the helper's return value.
+
+  - **This costs three modules and a coverage number, and both are recorded.**
+    `github.com/oapi-codegen/runtime` is a real runtime dependency of the generated
+    code — MD6 said the Go client would need none, and that is corrected in
+    [DECISIONS.md](DECISIONS.md) D6 with the measurement. `./cmd/identity` does not
+    reach it, and
+    `TestTheServiceBinaryDoesNotReachTheGeneratedClient` holds that. Adding 10,334
+    lines of generated code at 0% coverage takes the module from 74.7% to 45.9%
+    against a 70% floor; **this packet did not move the floor**, and the options are
+    written down in D2 for whoever owns it.
+
 - **The admin surface** — three operations, and the privilege boundary is one
   sentence: *an account admin may revoke pending invitations to their own account
   and read that account's admin audit log, and nothing else.*

@@ -24,8 +24,15 @@ internal/httpapi/      the router, the probes, the /v1 surface and the OIDC rout
 internal/oidc/         the OpenID Connect provider: storage, registrations, the key
 internal/platform/db/  the pgx pool, and the readiness ping
 migrations/            goose SQL files
+client/                THE GO CLIENT: a generated transport and the hand-written wrapper
 bin/prime              the gate: go mod download && go build ./... && go test ./...
 ```
+
+`client/` is deliberately NOT under `internal/`, and that is the only reason it is
+where it is: `internal/` is by definition unimportable, and a client no consumer can
+import is not a client. It is not reachable from `./cmd/identity` either, which is
+what keeps the service's binary free of the client's dependencies — see
+[DECISIONS.md](DECISIONS.md) D6 and `TestTheServiceBinaryDoesNotReachTheGeneratedClient`.
 
 `cmd/` + `internal/` is the layout from `refs/goreleaser`. `main` owns nothing
 but process lifetime; the pieces it does own — the socket, the drain, the signal
@@ -215,6 +222,56 @@ the other side** — and this repository had one: an `apikeys.Store` sweep for
 does not perform. It was deleted rather than left, because an unwired method is an
 invitation to wire it without reading why it was not wired, and the honest state
 for "we decided not to do this" is a paragraph in the README and no code.
+
+**The generated client is committed, and regeneration is a gate rather than a
+suggestion.** `client/generated/api.gen.go` is oapi-codegen v2.8.0's output and it is
+in the tree, because **a generated file that is not committed cannot be reviewed, and
+a diff nobody reads is a change nobody notices.** The generator's version is pinned in
+`client/generate.go`, so the file is reproducible without being built in CI.
+
+Two consequences, both of which are load-bearing:
+
+- **`TestTheCommittedGeneratedFileIsWhatThePinnedGeneratorProduces` runs the real
+  generator, over the real document, into a temporary directory, and compares.** It
+  is a TEMP directory rather than a regenerate-in-place `git diff` because the second
+  destroys the evidence: a regenerate-in-place failure leaves the tree modified, so
+  the next run passes and the failure is visible exactly once.
+- **The generated file is excluded from lint, narrowly and with the exclusion under
+  test.** `.golangci.yml` exempts `^client/generated/api\.gen\.go$` and nothing else,
+  because the file is not hand-written code and holding it to hand-written standards
+  measures the generator rather than this repository.
+  `TestTheLintExclusionIsOneFileAndNotAPrefix` walks every `.go` file in the tree and
+  fails if the pattern matches one of them — a broad exclusion is how a real file
+  stops being linted, and the comment in that config is not a control.
+
+**The client is inside this module so that it is gated.** It is not a separate module
+because a nested module is excluded from `./...`, and `bin/prime` runs `go build
+./... && go test ./...` — a client in its own module would be built by nothing and
+tested by nothing, which is the failure mode this repository treats as a false claim.
+The cost of that choice is recorded in [DECISIONS.md](DECISIONS.md) D6: three extra
+modules in `go.mod` and a coverage number that moves.
+
+**A credential must reach no string a human reads, and that is structural.** The
+client holds the token for its whole life and `err.Error()` is the single most likely
+thing in a process to end up in a log. So the rule is not care: every string the
+client builds out of anything a caller or a service supplied goes through
+`Redactor.String`, redaction is **all or nothing**, and the credential lives inside
+**closures** rather than in struct fields — because `fmt` prints an exported field by
+value under `%#v` and that verb does not consult `String()`, so a `token string` field
+is a leak no method can intercept. `TestTheClientNeverPrintsACredential` drives a real
+request against an `httptest.Server` that echoes the credential back in its body and
+three of its headers, then sweeps `%v`, `%+v`, `%#v`, `%s`, `%q`, the reflected
+fields and the serialised form.
+
+**An unknown problem code is a typed error, never a silent one.** Every non-2xx from
+this service is `application/problem+json`, and `code` is the contract while `status`
+is advisory. A code this build has never seen produces `*UnknownProblemError`, carrying
+the code, the status and the trace id — so `errors.As(err, &ProblemError)` works
+against every code including ones identity has not documented yet, which it already has
+four of. `ProblemError` is an INTERFACE and not a base struct for a concrete reason
+recorded in `client/errors.go`: `errors.As` matches on assignability, and embedding
+does not create one, so a hierarchy of structs would make the single catch work only
+for the codes this build does not know — exactly backwards.
 
 **Comments say why.** Explain the decision and the constraint, not the
 mechanism. A comment restating the line below it is noise.
