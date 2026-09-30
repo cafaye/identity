@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cafaye/identity/internal/accounts"
 	"github.com/cafaye/identity/internal/platform/id"
 )
 
@@ -75,7 +74,7 @@ func TestMemberInvitedEnvelope(t *testing.T) {
 	accountID, inviterID, _ := tenancyTestIDs()
 	invitationID := id.MustNew()
 
-	e, err := NewMemberInvited(now, accountID, invitationID, "invitee@example.com", accounts.RoleMember, inviterID)
+	e, err := NewMemberInvited(now, accountID, invitationID, "invitee@example.com", "member", inviterID)
 	if err != nil {
 		t.Fatalf("NewMemberInvited: %v", err)
 	}
@@ -114,7 +113,7 @@ func TestMemberAcceptedEnvelope(t *testing.T) {
 	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 	accountID, userID, _ := tenancyTestIDs()
 
-	e, err := NewMemberAccepted(now, accountID, userID, accounts.RoleAdmin)
+	e, err := NewMemberAccepted(now, accountID, userID, "admin")
 	if err != nil {
 		t.Fatalf("NewMemberAccepted: %v", err)
 	}
@@ -145,7 +144,7 @@ func TestMemberRoleChangedCarriesBothRoles(t *testing.T) {
 	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 	accountID, userID, _ := tenancyTestIDs()
 
-	e, err := NewMemberRoleChanged(now, accountID, userID, accounts.RoleMember, accounts.RoleAdmin)
+	e, err := NewMemberRoleChanged(now, accountID, userID, "member", "admin")
 	if err != nil {
 		t.Fatalf("NewMemberRoleChanged: %v", err)
 	}
@@ -177,7 +176,7 @@ func TestMemberRemovedEnvelope(t *testing.T) {
 	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 	accountID, userID, _ := tenancyTestIDs()
 
-	e, err := NewMemberRemoved(now, accountID, userID, accounts.RoleOwner)
+	e, err := NewMemberRemoved(now, accountID, userID, "owner")
 	if err != nil {
 		t.Fatalf("NewMemberRemoved: %v", err)
 	}

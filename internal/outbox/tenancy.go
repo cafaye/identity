@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cafaye/identity/internal/accounts"
 	"github.com/cafaye/identity/internal/platform/id"
 )
 
@@ -24,6 +23,17 @@ import (
 // The time is the moment of the state change, taken from the injected clock for
 // the same reason NewUserCreated takes it: the event and the row it describes
 // have to agree, and only one of the two is under test control.
+//
+// ROLES ARE STRINGS HERE, NOT accounts.Role.
+//
+// This package is transport: it knows the envelope and the payload schemas and
+// nothing about the domain those payloads describe. Taking accounts.Role would
+// make outbox import accounts, and accounts import outbox to append its events —
+// a cycle that exists only because a role happens to be a string on the wire.
+// The caller writes string(role), which is what goes into the JSON anyway, and
+// the two packages stay independent: outbox is reusable by a service with no
+// accounts in it, and accounts can change its role type without touching a
+// published event's shape.
 
 // The event types this service publishes for tenancy.
 //
@@ -100,7 +110,7 @@ func NewAccountCreated(now time.Time, accountID id.UUID, name, slug string, pers
 // carries no token, and that is the important omission — the raw invitation
 // token exists once, in the 201 response, and no event on the platform carries a
 // usable credential.
-func NewMemberInvited(now time.Time, accountID, invitationID id.UUID, email string, role accounts.Role, inviterID id.UUID) (Envelope, error) {
+func NewMemberInvited(now time.Time, accountID, invitationID id.UUID, email, role string, inviterID id.UUID) (Envelope, error) {
 	return newTenancyEvent(now, EventMemberInvited, accountID, struct {
 		AccountID    string `json:"account_id"`
 		InvitationID string `json:"invitation_id"`
@@ -111,7 +121,7 @@ func NewMemberInvited(now time.Time, accountID, invitationID id.UUID, email stri
 		AccountID:    accountID.String(),
 		InvitationID: invitationID.String(),
 		Email:        email,
-		Role:         string(role),
+		Role:         role,
 		InvitedByID:  inviterID.String(),
 	})
 }
@@ -122,7 +132,7 @@ func NewMemberInvited(now time.Time, accountID, invitationID id.UUID, email stri
 // event without a membership announces somebody joined who did not, and a
 // membership without the event leaves a consumer's member list permanently one
 // short with no way to notice.
-func NewMemberAccepted(now time.Time, accountID, userID id.UUID, role accounts.Role) (Envelope, error) {
+func NewMemberAccepted(now time.Time, accountID, userID id.UUID, role string) (Envelope, error) {
 	return newTenancyEvent(now, EventMemberAccepted, accountID, struct {
 		AccountID string `json:"account_id"`
 		UserID    string `json:"user_id"`
@@ -130,7 +140,7 @@ func NewMemberAccepted(now time.Time, accountID, userID id.UUID, role accounts.R
 	}{
 		AccountID: accountID.String(),
 		UserID:    userID.String(),
-		Role:      string(role),
+		Role:      role,
 	})
 }
 
@@ -142,7 +152,7 @@ func NewMemberAccepted(now time.Time, accountID, userID id.UUID, role accounts.R
 // and the new role is what it needs to grant. A consumer that only receives the
 // new role has to remember the old one, and a consumer that forgot is the bug
 // this is here to prevent.
-func NewMemberRoleChanged(now time.Time, accountID, userID id.UUID, previous, current accounts.Role) (Envelope, error) {
+func NewMemberRoleChanged(now time.Time, accountID, userID id.UUID, previous, current string) (Envelope, error) {
 	return newTenancyEvent(now, EventMemberRoleChanged, accountID, struct {
 		AccountID    string `json:"account_id"`
 		UserID       string `json:"user_id"`
@@ -151,8 +161,8 @@ func NewMemberRoleChanged(now time.Time, accountID, userID id.UUID, previous, cu
 	}{
 		AccountID:    accountID.String(),
 		UserID:       userID.String(),
-		PreviousRole: string(previous),
-		Role:         string(current),
+		PreviousRole: previous,
+		Role:         current,
 	})
 }
 
@@ -161,7 +171,7 @@ func NewMemberRoleChanged(now time.Time, accountID, userID id.UUID, previous, cu
 // The role they held travels with it. "user X was removed from account Y" tells
 // a downstream service very little; "user X, who was an owner, is no longer an
 // owner of account Y" tells it whether to re-check its own authorization cache.
-func NewMemberRemoved(now time.Time, accountID, userID id.UUID, role accounts.Role) (Envelope, error) {
+func NewMemberRemoved(now time.Time, accountID, userID id.UUID, role string) (Envelope, error) {
 	return newTenancyEvent(now, EventMemberRemoved, accountID, struct {
 		AccountID string `json:"account_id"`
 		UserID    string `json:"user_id"`
@@ -169,7 +179,7 @@ func NewMemberRemoved(now time.Time, accountID, userID id.UUID, role accounts.Ro
 	}{
 		AccountID: accountID.String(),
 		UserID:    userID.String(),
-		Role:      string(role),
+		Role:      role,
 	})
 }
 

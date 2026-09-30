@@ -32,17 +32,11 @@ func newStore(t *testing.T) (*Store, db.Querier) {
 }
 
 // insertUser writes a user row directly, because most of these tests care about
-// memberships rather than about how a user comes to exist.
+// memberships rather than about how a user comes to exist. The implementation is
+// in service_test.go, next to the other fixture helpers.
 func insertUser(t *testing.T, q db.Querier) id.UUID {
 	t.Helper()
-
-	uid := id.MustNew()
-	if _, err := q.Exec(t.Context(),
-		`INSERT INTO users (id, email, password_digest) VALUES ($1, $2, $3)`,
-		uid, dbtest.UniqueEmail(t), "argon2id$stub"); err != nil {
-		t.Fatalf("inserting a user: %v", err)
-	}
-	return uid
+	return addUserWithEmail(t, q, dbtest.UniqueEmail(t))
 }
 
 func insertAccount(t *testing.T, q db.Querier, name string) Account {
