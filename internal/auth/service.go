@@ -1,0 +1,394 @@
+// Package auth is the identity use cases: register, log in, log out, and resolve
+// a token to the user it belongs to.
+//
+// It sits between the HTTP layer and the three aggregates that own the data
+// (users, sessions, outbox) because the interesting part of authentication is
+// not any one of them — it is the ordering, and the transactions. Checking the
+// lock before the password, counting a failure even though the login is refused,
+// and writing a session and its clearing of the failure counter together are all
+// properties of the use case, not of a handler and not of a table.
+//
+// Nothing here knows about HTTP. The handlers translate the errors below into the
+// cafaye error envelope (core: docs/openapi-conventions.md).
+package auth
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/netip"
+	"time"
+
+	"github.com/cafaye/identity/internal/outbox"
+	"github.com/cafaye/identity/internal/platform/clock"
+	"github.com/cafaye/identity/internal/platform/db"
+	"github.com/cafaye/identity/internal/platform/id"
+	"github.com/cafaye/identity/internal/sessions"
+	"github.com/cafaye/identity/internal/users"
+)
+
+// Errors the HTTP layer maps onto status codes.
+//
+// The two credential errors are the important ones. They are distinct values so
+// that the code says what happened, but ErrInvalidCredentials is deliberately the
+// *same* value for "no such account" and "wrong password", and its message is
+// deliberately identical in both cases. Anything that distinguishes them — a
+// different status, a different detail string, a different response time — is an
+// account-enumeration oracle.
+var (
+	// ErrInvalidCredentials is a refused login. The caller cannot tell why.
+	ErrInvalidCredentials = errors.New("invalid email or password")
+
+	// ErrUnauthenticated is a request with no usable credential: no token, an
+	// unknown one, an expired one, or a revoked one. One value for all four.
+	ErrUnauthenticated = errors.New("authentication required")
+)
+
+// LockedError is a login refused because the account is locked. It is a distinct
+// type because the response has to say how long to wait, and because revealing a
+// lock *does* confirm the account exists — which is why the 423 is the one place
+// login is allowed to leak that much.
+type LockedError struct {
+	// RetryAfter is how much longer the caller must wait. Never negative.
+	RetryAfter time.Duration
+}
+
+func (e *LockedError) Error() string {
+	return fmt.Sprintf("account is locked; retry after %s", e.RetryAfter)
+}
+
+// DefaultSessionTTL is how long a session lasts when nothing overrides it.
+const DefaultSessionTTL = 30 * 24 * time.Hour
+
+// UnitOfWork runs a function inside a transaction. db.TxRunner implements it; the
+// interface is what lets the lockout matrix be tested without Postgres.
+type UnitOfWork interface {
+	Do(ctx context.Context, fn func(ctx context.Context, q db.Querier) error) error
+}
+
+// UserStore is the part of users.Store that login and registration need.
+type UserStore interface {
+	Create(ctx context.Context, q db.Querier, p users.CreateParams) (users.User, error)
+	ByEmail(ctx context.Context, q db.Querier, email string) (users.User, error)
+	ByID(ctx context.Context, q db.Querier, id id.UUID) (users.User, error)
+	RecordFailedLogin(ctx context.Context, q db.Querier, userID id.UUID, attempts int, lockedUntil *time.Time) error
+	ClearFailures(ctx context.Context, q db.Querier, userID id.UUID) error
+}
+
+// SessionStore is the part of sessions.Store that login, logout and resolution
+// need.
+type SessionStore interface {
+	Create(ctx context.Context, q db.Querier, n sessions.NewSession) (sessions.Session, error)
+	ByToken(ctx context.Context, q db.Querier, token string, now time.Time) (sessions.Session, error)
+	Revoke(ctx context.Context, q db.Querier, sessionID id.UUID) error
+}
+
+// EventAppender is the part of outbox.Store that registration needs.
+type EventAppender interface {
+	Append(ctx context.Context, q db.Querier, e outbox.Envelope) error
+}
+
+// Service is the identity use cases.
+type Service struct {
+	uow        UnitOfWork
+	read       db.QuerierSource
+	users      UserStore
+	sessions   SessionStore
+	events     EventAppender
+	hasher     *users.Hasher
+	clock      clock.Clock
+	sessionTTL time.Duration
+}
+
+// NewService wires the use cases. A non-positive sessionTTL means
+// DefaultSessionTTL.
+//
+// uow is used for the two writes that must be atomic with each other — the user
+// and its event, the session and the cleared failure counter. read is used for
+// everything else, so those lookups do not pay for a transaction.
+func NewService(
+	uow UnitOfWork,
+	read db.QuerierSource,
+	userStore UserStore,
+	sessionStore SessionStore,
+	events EventAppender,
+	hasher *users.Hasher,
+	clk clock.Clock,
+	sessionTTL time.Duration,
+) *Service {
+	if sessionTTL <= 0 {
+		sessionTTL = DefaultSessionTTL
+	}
+	return &Service{
+		uow:        uow,
+		read:       read,
+		users:      userStore,
+		sessions:   sessionStore,
+		events:     events,
+		hasher:     hasher,
+		clock:      clk,
+		sessionTTL: sessionTTL,
+	}
+}
+
+// RegisterInput is a registration request.
+type RegisterInput struct {
+	Email    string
+	Password string
+}
+
+// RegisteredUser is what a successful registration returns: the public projection
+// of the user and nothing else.
+//
+// It is its own type rather than users.User so that the digest cannot reach a
+// response body by accident. Adding a field to users.User does not add it here.
+type RegisteredUser struct {
+	ID    id.UUID
+	Email string
+}
+
+// Register creates a user and announces it.
+//
+// The row and the `identity.user.created` event are written in one transaction.
+// That is the whole reason the outbox exists, and it is why the store methods
+// take a Querier rather than the pool: if the event could not be written the user
+// must not exist either, and the other way round.
+func (s *Service) Register(ctx context.Context, in RegisterInput) (RegisteredUser, error) {
+	email := users.NormalizeEmail(in.Email)
+	if err := validateRegistration(email, in.Password); err != nil {
+		return RegisteredUser{}, err
+	}
+
+	// Hashed before the transaction opens. Validation has already passed, so this
+	// cannot fail for a request-shaped reason, and doing it outside keeps a ~100ms
+	// memory-hard operation from holding a database connection and a transaction
+	// open.
+	digest, err := s.hasher.Hash(in.Password)
+	if err != nil {
+		return RegisteredUser{}, fmt.Errorf("hashing the password: %w", err)
+	}
+
+	now := s.clock.Now()
+
+	var created users.User
+	err = s.uow.Do(ctx, func(ctx context.Context, q db.Querier) error {
+		u, err := s.users.Create(ctx, q, users.CreateParams{Email: email, PasswordDigest: digest})
+		if err != nil {
+			return err
+		}
+
+		// The event is about this user, so it is built after the insert: the
+		// subject is an id that now exists.
+		event, err := outbox.NewUserCreated(now, u.ID, u.Email)
+		if err != nil {
+			return err
+		}
+		if err := s.events.Append(ctx, q, event); err != nil {
+			return err
+		}
+
+		created = u
+		return nil
+	})
+	if err != nil {
+		return RegisteredUser{}, err
+	}
+
+	return RegisteredUser{ID: created.ID, Email: created.Email}, nil
+}
+
+// LoginInput is a login request.
+type LoginInput struct {
+	Email    string
+	Password string
+	// UserAgent and IP are recorded against the session for the incident trail.
+	// Neither is trusted for any decision.
+	UserAgent string
+	IP        *netip.Addr
+}
+
+// LoginResult is a successful login: the public projection of the user, plus the
+// one time the raw token is available.
+type LoginResult struct {
+	User      RegisteredUser
+	Token     string
+	ExpiresAt time.Time
+}
+
+// Login authenticates an email and password and mints a session.
+//
+// The order of the checks is the security property, so it is spelled out:
+//
+//  1. Validate the shape of the request. A malformed address never reaches argon2id.
+//  2. Look the account up. A miss costs a dummy hash and returns
+//     ErrInvalidCredentials — the same error, from the same path, in the same time
+//     as a wrong password.
+//  3. If the account is locked, return LockedError *before* verifying anything.
+//     There is no reason to spend a memory-hard hash on an account nobody may log
+//     into, and it means a locked account cannot be probed.
+//  4. Verify the password.
+//  5. On a mismatch, count the failure, persist it, and return
+//     ErrInvalidCredentials.
+//  6. On a match, mint the session and clear the failure run in one transaction.
+func (s *Service) Login(ctx context.Context, in LoginInput) (LoginResult, error) {
+	email := users.NormalizeEmail(in.Email)
+	if err := validateLogin(email, in.Password); err != nil {
+		return LoginResult{}, err
+	}
+
+	now := s.clock.Now()
+
+	user, err := s.users.ByEmail(ctx, s.read.Queryer(), email)
+	if err != nil {
+		if !errors.Is(err, users.ErrNotFound) {
+			return LoginResult{}, fmt.Errorf("looking up a user: %w", err)
+		}
+		// No such account. Do the same memory-hard work a real account would cost
+		// and return the same error, so neither the response nor its timing says
+		// whether this address is registered. Nothing is written: there is no row
+		// to count against, and creating one would let anyone lock any address out
+		// simply by guessing at it.
+		s.hasher.VerifyDummy(in.Password)
+		return LoginResult{}, ErrInvalidCredentials
+	}
+
+	lock := sessions.Lockout{FailedAttempts: user.FailedLoginAttempts, LockedUntil: user.LockedUntil}
+	if lock.Locked(now) {
+		return LoginResult{}, &LockedError{RetryAfter: lock.RetryAfter(now)}
+	}
+
+	if !s.hasher.Verify(user.PasswordDigest, in.Password) {
+		// The failure is counted even though the login is refused, and the count
+		// is persisted. A lockout that is not written down is not a lockout.
+		next := lock.Failed(now)
+		if err := s.recordFailure(ctx, user.ID, next); err != nil {
+			// Surfaced, not reported as invalid credentials: a store failure that
+			// looks like a wrong password stops the counter climbing, and the
+			// brute-force protection silently stops existing.
+			return LoginResult{}, fmt.Errorf("recording a failed login: %w", err)
+		}
+		return LoginResult{}, ErrInvalidCredentials
+	}
+
+	return s.startSession(ctx, user, in, now)
+}
+
+// startSession mints the session and clears the failure run together.
+func (s *Service) startSession(ctx context.Context, user users.User, in LoginInput, now time.Time) (LoginResult, error) {
+	token, digest, err := sessions.NewToken()
+	if err != nil {
+		return LoginResult{}, fmt.Errorf("minting a session token: %w", err)
+	}
+	expiresAt := now.Add(s.sessionTTL)
+
+	err = s.uow.Do(ctx, func(ctx context.Context, q db.Querier) error {
+		// The session is created first. If it fails, the transaction rolls back
+		// and the counter is untouched — which is the safe direction, because a
+		// reset with no session would hand an attacker five free attempts per
+		// attempt.
+		if _, err := s.sessions.Create(ctx, q, sessions.NewSession{
+			UserID:      user.ID,
+			TokenDigest: digest,
+			ExpiresAt:   expiresAt,
+			UserAgent:   in.UserAgent,
+			IP:          in.IP,
+		}); err != nil {
+			return err
+		}
+		return s.users.ClearFailures(ctx, q, user.ID)
+	})
+	if err != nil {
+		return LoginResult{}, err
+	}
+
+	return LoginResult{
+		User:      RegisteredUser{ID: user.ID, Email: user.Email},
+		Token:     token,
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+// recordFailure persists the new lockout state for an account.
+func (s *Service) recordFailure(ctx context.Context, userID id.UUID, next sessions.Lockout) error {
+	return s.users.RecordFailedLogin(ctx, s.read.Queryer(), userID, next.FailedAttempts, next.LockedUntil)
+}
+
+// Authenticate resolves a presented token to its user.
+//
+// A missing, unknown, expired or revoked token are one error. So is a token whose
+// user has since been deleted: the session rows go with the user, so the lookup
+// misses for a reason the caller has no way to distinguish.
+func (s *Service) Authenticate(ctx context.Context, token string) (users.User, error) {
+	if token == "" {
+		return users.User{}, ErrUnauthenticated
+	}
+
+	session, err := s.sessions.ByToken(ctx, s.read.Queryer(), token, s.clock.Now())
+	if err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			return users.User{}, ErrUnauthenticated
+		}
+		return users.User{}, fmt.Errorf("resolving a session: %w", err)
+	}
+
+	user, err := s.users.ByID(ctx, s.read.Queryer(), session.UserID)
+	if err != nil {
+		if errors.Is(err, users.ErrNotFound) {
+			return users.User{}, ErrUnauthenticated
+		}
+		return users.User{}, fmt.Errorf("loading the session's user: %w", err)
+	}
+
+	return user, nil
+}
+
+// Logout revokes the session a token belongs to.
+//
+// A token that resolves to nothing is a success, not an error. A client retrying
+// a logout, or a browser presenting a cookie that has already expired, should get
+// an answer; answering 500 would make a retry look like a failure and would make
+// the natural client behaviour (retry) pathological.
+func (s *Service) Logout(ctx context.Context, token string) error {
+	if token == "" {
+		return nil
+	}
+
+	session, err := s.sessions.ByToken(ctx, s.read.Queryer(), token, s.clock.Now())
+	if err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("resolving a session to revoke: %w", err)
+	}
+
+	if err := s.sessions.Revoke(ctx, s.read.Queryer(), session.ID); err != nil {
+		return fmt.Errorf("revoking a session: %w", err)
+	}
+	return nil
+}
+
+// validateRegistration checks the request before anything is hashed or written.
+func validateRegistration(email, password string) error {
+	if err := users.ValidateEmail(email); err != nil {
+		return err
+	}
+	return users.ValidatePassword(password)
+}
+
+// validateLogin checks the shape of a login without requiring a strong password:
+// an existing account may predate any rule, and a login that failed validation
+// because the password is short would be a way to probe which passwords are in
+// use. The length bounds still apply, because they bound the work argon2id is
+// asked to do.
+func validateLogin(email, password string) error {
+	if err := users.ValidateEmail(email); err != nil {
+		return err
+	}
+	if password == "" {
+		return &users.FieldError{Field: "password", Code: users.CodeRequired}
+	}
+	if len(password) > users.MaxPasswordLength {
+		return &users.FieldError{Field: "password", Code: users.CodeTooLong}
+	}
+	return nil
+}

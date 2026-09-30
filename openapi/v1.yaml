@@ -1,0 +1,821 @@
+# openapi/v1.yaml — the HTTP contract for identity's v1 surface.
+#
+# This file is what `exposes.api` in cafaye.yml points at, and it is written to
+# cafaye/core docs/openapi-conventions.md. Where core and this file disagree, core
+# is right and this file is the bug.
+#
+# Three places this document knowingly departs from core, all of them a manager
+# decision rather than a local choice. They are listed under "Known gaps" at the
+# bottom and repeated inline where they apply, so neither is easy to miss.
+openapi: 3.1.0
+
+info:
+  title: cafaye identity
+  version: 1.0.0
+  summary: Authentication, sessions, accounts and tenancy.
+  description: |
+    `identity` is the cafaye platform's security boundary: it is what every other
+    service asks to identify a caller.
+
+    ## Two credential surfaces
+
+    A successful `POST /v1/session` hands back the same session token twice.
+
+    * As a `__Host-session` cookie, for a browser. The cookie is `Secure`,
+      `HttpOnly`, `SameSite=Lax` and `Path=/`, with no `Domain`. The `__Host-`
+      prefix is a browser-enforced contract: such a cookie is accepted only under
+      those conditions, which is what stops a sibling or subdomain origin from
+      setting or overwriting it.
+    * As a `token` field in the response body, for an API client. A cookie is a
+      browser mechanism; a server-side client cannot use one, and core's
+      conventions say as much ("No cookies for API traffic").
+
+    Both name the same session. `DELETE /v1/session` revokes it for both surfaces
+    at once, and the token stops working immediately on both.
+
+    `GET /v1/me` accepts either. An `Authorization: Bearer` header is preferred
+    over the cookie when both are present, because a client holding both has said
+    which one it means.
+
+    ## Errors
+
+    Every non-2xx response is `application/problem+json` (RFC 9457) with core's
+    `code` and `trace_id` extensions, and no exceptions. `trace_id` is always
+    present and always equal to the `X-Trace-Id` response header; support starts
+    from that id. `errors[]` appears only on 422 and lists per-field failures.
+
+    Login never distinguishes a wrong password from an unregistered address. Both
+    are 401 with the same body. A 423 is the one place login reveals that an
+    account exists, and it does so only because the caller has just demonstrated
+    knowledge of a working password's absence five times over.
+
+    ## Request size
+
+    Request bodies are capped at 4096 bytes. A registration is an email and a
+    password; nothing legitimate approaches that, and the cap is what stops an
+    unauthenticated caller choosing how much this service parses per request.
+  contact:
+    name: identity
+    url: https://github.com/cafaye/identity
+    email: identity@cafaye.com
+  license:
+    name: MIT
+    url: https://opensource.org/license/mit
+
+servers:
+  - url: https://identity.cafaye.com
+    description: production
+  - url: http://localhost:8080
+    description: local development (docker compose up)
+
+tags:
+  - name: users
+    description: Registration. Creating the credential is the only way to obtain one.
+  - name: sessions
+    description: Logging in, resolving a session, and revoking it.
+  - name: probes
+    description: Liveness and readiness. Consumed by orchestrators, not by clients.
+
+paths:
+  /v1/users:
+    post:
+      tags: [users]
+      operationId: registerUser
+      summary: Register an account
+      description: |
+        Creates a user and, in the same database transaction, records an
+        `identity.user.created` event. Either both exist or neither does: a user
+        that exists without its event would never be announced, and an event
+        without its user would announce a registration that did not happen.
+
+        Does not create a session. Sign in separately with `POST /v1/session`.
+
+        This is the only endpoint that reveals whether an address is already
+        registered, and it answers 409. Everywhere else, "no such account" and
+        "wrong password" are indistinguishable.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            examples:
+              default:
+                summary: a new registration
+                value:
+                  email: kaka@example.com
+                  password: correct horse battery staple
+      responses:
+        '201':
+          description: The account was created.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+              examples:
+                default:
+                  value:
+                    id: ab000000-0000-0000-0000-000000000000
+                    email: kaka@example.com
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '409':
+          description: An account already exists for that address.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Retry-After:
+              description: Always absent on a 409. Present only on a 423.
+              schema:
+                type: string
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                conflict:
+                  summary: the address is taken
+                  value:
+                    type: https://errors.cafaye.com/conflict
+                    title: Conflict
+                    status: 409
+                    detail: an account already exists for that email address
+                    instance: /v1/users
+                    code: conflict
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/session:
+    post:
+      tags: [sessions]
+      operationId: createSession
+      summary: Log in
+      description: |
+        Verifies an email and password and starts a session.
+
+        Five consecutive wrong passwords for one address lock that account for
+        fifteen minutes. A locked account is refused with 423 and a `Retry-After`
+        header before the password is checked at all, so it cannot be probed; the
+        rejected attempt does not extend the window. A successful login clears the
+        count.
+
+        An unknown address and a wrong password produce the same 401 body and take
+        comparable time: the unknown-address path performs the same argon2id
+        verification against a digest nothing can match. This is deliberate and is
+        the reason a login endpoint does not enumerate accounts.
+
+        Login does not accept an `Idempotency-Key`. A login is not safely
+        repeatable — retrying it mints another session rather than returning the
+        first one — so honouring the header would be a lie. See "Known gaps".
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              default:
+                value:
+                  email: kaka@example.com
+                  password: correct horse battery staple
+      responses:
+        '200':
+          description: |
+            The credentials were correct and a session now exists. The same token
+            is in the body and in the cookie.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Set-Cookie:
+              description: The `__Host-session` cookie, or absent for a client that ignores cookies.
+              schema:
+                type: string
+              example: '__Host-session=…; Path=/; Secure; HttpOnly; SameSite=Lax'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+              examples:
+                default:
+                  value:
+                    token: 0dN3aQ2vF8kLmXpR7sT1uWzYb4cE6hJ9gK2mP5rS8tV
+                    expires_at: '2026-10-30T12:00:00Z'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          description: |
+            The credentials were refused. The body is identical whether the
+            address is unregistered or the password is wrong, and says nothing
+            about which.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                refused:
+                  value:
+                    type: https://errors.cafaye.com/unauthorized
+                    title: Unauthorized
+                    status: 401
+                    detail: authentication is required to access this resource
+                    instance: /v1/session
+                    code: unauthorized
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '423':
+          description: |
+            The account is locked after too many consecutive failures. The
+            `Retry-After` header and the `detail` both carry the remaining window
+            in whole seconds, rounded up.
+
+            The window is deliberately **not** an entry in `errors[]`: core scopes
+            that array to 422 and to fields of the request, and `retry_after` is
+            not one.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Retry-After:
+              description: Seconds until the account may be tried again. Never negative.
+              required: true
+              schema:
+                type: integer
+                minimum: 0
+              example: '900'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                locked:
+                  value:
+                    type: https://errors.cafaye.com/account_locked
+                    title: Account locked
+                    status: 423
+                    detail: too many failed sign-in attempts for this account; retry after 900 seconds
+                    instance: /v1/session
+                    code: account_locked
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags: [sessions]
+      operationId: deleteSession
+      summary: Log out
+      description: |
+        Revokes the session the presented credential names, and clears the
+        session cookie. The token stops working on both surfaces immediately: a
+        `GET /v1/me` with the revoked token is a 401 on the cookie and on the
+        bearer header alike.
+
+        Other sessions for the same account are unaffected. "Sign out everywhere"
+        is a different operation and is not in this packet.
+
+        A token that resolves to nothing is a 401, and the cookie is cleared
+        anyway. A stale cookie is the common case — the session expired hours ago
+        and the browser kept it — and leaving it in place means the user clicks
+        "sign out" again and nothing appears to happen.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '204':
+          description: The session was revoked and the cookie cleared.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Set-Cookie:
+              description: An expired `__Host-session` cookie, with the same attributes that set it.
+              schema:
+                type: string
+              example: '__Host-session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
+        '401':
+          description: No usable credential, or one that no longer resolves.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/me:
+    get:
+      tags: [sessions]
+      operationId: getCurrentUser
+      summary: The authenticated user
+      description: |
+        Resolves the presented credential and returns the account it belongs to.
+
+        A cookie and a bearer token are both accepted. When both are present the
+        `Authorization` header wins: a client holding both has said which it means,
+        and answering from the cookie would make the result depend on invisible
+        browser state.
+
+        A missing, unknown, expired or revoked token are one 401 with one body. So
+        is a token whose account has been deleted.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: The authenticated user.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+              examples:
+                default:
+                  value:
+                    id: ab000000-0000-0000-0000-000000000000
+                    email: kaka@example.com
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /healthz:
+    get:
+      tags: [probes]
+      operationId: liveness
+      summary: Liveness
+      description: |
+        Answers whether this process is running. It never touches a dependency, so
+        a database outage cannot get the process restarted out from under
+        in-flight work.
+      security: []
+      responses:
+        '200':
+          description: The process is running.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: ok
+
+  /readyz:
+    get:
+      tags: [probes]
+      operationId: readiness
+      summary: Readiness
+      description: |
+        Answers whether this process can serve traffic, by probing each named
+        dependency. `deps` lists what was probed, `"none"` when there is nothing to
+        probe.
+
+        A failing dependency is named but not described: the underlying error goes
+        to the log, because an unauthenticated request must not be a way to learn
+        that a database host is at a particular address.
+      security: []
+      responses:
+        '200':
+          description: Every dependency answered.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              examples:
+                withDatabase:
+                  value:
+                    status: ok
+                    deps: postgres
+                withoutDatabase:
+                  value:
+                    status: ok
+                    deps: none
+        '503':
+          description: |
+            At least one dependency did not answer.
+
+            This is the one non-2xx response in the service that is not a problem
+            document, and it is a known conflict rather than an oversight. See
+            "Known gaps", item 4.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: unavailable
+                deps: postgres
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-session
+      description: |
+        The browser surface. A `__Host-` cookie is accepted by the browser only
+        when it is `Secure`, has `Path=/` and carries no `Domain`, which is what
+        binds it to this origin and stops a sibling origin from setting it.
+
+        This is the "different surface" core's auth section describes, not an
+        exception to "no cookies for API traffic".
+    bearerToken:
+      type: http
+      scheme: bearer
+      description: |
+        The API surface. A session token from `POST /v1/session`, presented as
+        `Authorization: Bearer <token>`.
+
+        Not a JWT, and deliberately so: core's conventions describe JWTs for
+        *service-to-service* traffic verified against identity's JWKS. These are
+        opaque server-side session tokens, looked up by the SHA-256 of the
+        presented value. Revocation is a row delete and takes effect on the next
+        request, which a self-contained JWT cannot do. The OIDC provider, and the
+        JWTs core describes, arrive with the OIDC packet.
+
+  headers:
+    TraceId:
+      description: |
+        Correlates this response with the service's logs. Always present, and
+        always equal to the `trace_id` in a problem body. An inbound value is
+        reused when it is a well-formed identifier and replaced otherwise, so a
+        trace survives a proxy hop without letting a caller forge a header.
+      required: true
+      schema:
+        type: string
+        maxLength: 200
+      example: 0af7651916cd43dd8448eb211c80319c
+
+  schemas:
+    User:
+      type: object
+      description: |
+        The public projection of an account. Exactly two fields, always: there is
+        no password digest, no lockout state and no timestamp here, and adding one
+        is a contract change.
+      additionalProperties: false
+      required: [id, email]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The account's identifier, and the `subject` of its events.
+        email:
+          type: string
+          format: email
+          maxLength: 320
+          description: Always lower case. Registration normalizes before storing.
+
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+          description: Normalized to lower case and trimmed before storage and before comparison.
+        password:
+          type: string
+          minLength: 8
+          maxLength: 1024
+          description: |
+            At least 8 characters, hashed with argon2id. There is no composition
+            rule: requiring a mix of character classes reliably produces
+            "Password1!" and reliably rejects passphrases, and length is the
+            property that tracks entropy.
+
+            The upper bound is a DoS control, not a policy. argon2id's cost is
+            fixed in memory but its input is not, so without it an unauthenticated
+            caller chooses the size of every login's hashing work.
+
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        password:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          description: |
+            The minimum length is 1 here, not 8. A login is not a registration:
+            refusing to check a short password would be a way to learn which
+            passwords are in use, and an account may predate any rule. The upper
+            bound still applies, because it bounds the hashing work.
+
+    Session:
+      type: object
+      additionalProperties: false
+      required: [token, expires_at]
+      properties:
+        token:
+          type: string
+          description: |
+            256 bits from crypto/rand, base64url without padding. Only its
+            SHA-256 is stored; a database dump yields no usable credential.
+          minLength: 43
+          maxLength: 43
+        expires_at:
+          type: string
+          format: date-time
+          description: RFC3339 UTC. Judged against the service's clock, not the database's.
+
+    Problem:
+      type: object
+      description: |
+        The cafaye error envelope: RFC 9457 plus core's `code` and `trace_id`.
+        Every non-2xx response from this service is this shape. No service invents
+        its own error body.
+      required: [type, title, status, detail, instance, code, trace_id]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: 'A stable `https://errors.cafaye.com/<code>` URI — the machine-readable contract.'
+          example: https://errors.cafaye.com/validation_failed
+        title:
+          type: string
+          description: A fixed human-readable summary for the code. May be reworded without a version bump.
+        status:
+          type: integer
+          description: The HTTP status, repeated in the body.
+        detail:
+          type: string
+          description: |
+            Specific to this occurrence and not parsed by clients. Never contains
+            an internal error, a host, a role or a query fragment: those go to the
+            log under the same `trace_id`.
+        instance:
+          type: string
+          description: The request path. Never includes the query string, which can carry an address.
+        code:
+          type: string
+          description: The last segment of `type`, in snake_case.
+          enum:
+            - unauthorized
+            - forbidden
+            - not_found
+            - conflict
+            - validation_failed
+            - rate_limited
+            - idempotency_key_reused
+            - internal
+            - unavailable
+            # This service's extensions to core's reserved list. core owns the
+            # list; each of these is a case it does not currently describe.
+            # See "Known gaps".
+            - account_locked
+            - method_not_allowed
+            - invalid_json
+            - payload_too_large
+        trace_id:
+          type: string
+          description: Always present, always equal to the `X-Trace-Id` response header.
+        errors:
+          type: array
+          description: Per-field failures. Present only on 422.
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    FieldError:
+      type: object
+      additionalProperties: false
+      required: [field, code]
+      properties:
+        field:
+          type: string
+          description: The request field that failed.
+        code:
+          type: string
+          description: |
+            A stable slug, safe to switch on. `required`, `invalid_format`,
+            `too_short`, `too_long`.
+          example: too_short
+
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, unavailable]
+        deps:
+          type: string
+          description: The dependencies probed, comma separated, or `none`. Present on `/readyz` only.
+
+  responses:
+    Unauthenticated:
+      description: |
+        No usable credential: none was presented, or it is unknown, expired or
+        revoked. One body for all four.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/unauthorized
+            title: Unauthorized
+            status: 401
+            detail: authentication is required to access this resource
+            instance: /v1/me
+            code: unauthorized
+            trace_id: 0af7651916cd43dd8448eb211c80319c
+
+    ValidationFailed:
+      description: The request was understood and is not acceptable. `errors[]` names the fields.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            passwordTooShort:
+              summary: the password is under the minimum
+              value:
+                type: https://errors.cafaye.com/validation_failed
+                title: Validation failed
+                status: 422
+                detail: the request has an invalid field
+                instance: /v1/users
+                code: validation_failed
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+                errors:
+                  - field: password
+                    code: too_short
+            unknownField:
+              summary: the body has a field the endpoint does not accept
+              value:
+                type: https://errors.cafaye.com/validation_failed
+                title: Validation failed
+                status: 422
+                detail: the request body has a field this endpoint does not accept
+                instance: /v1/users
+                code: validation_failed
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+
+    MalformedBody:
+      description: The body is not a JSON object this endpoint accepts.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/invalid_json
+            title: Malformed request body
+            status: 400
+            detail: the request body is not a JSON object this endpoint accepts
+            instance: /v1/users
+            code: invalid_json
+            trace_id: 0af7651916cd43dd8448eb211c80319c
+
+    BodyTooLarge:
+      description: The body is larger than the 4096 bytes this endpoint accepts.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/payload_too_large
+            title: Request body too large
+            status: 413
+            detail: the request body is larger than the 4096 bytes this endpoint accepts
+            instance: /v1/users
+            code: payload_too_large
+            trace_id: 0af7651916cd43dd8448eb211c80319c
+
+    InternalError:
+      description: |
+        The request could not be completed. The cause is in the service's log
+        under the returned `trace_id` and is never in the response.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/internal
+            title: Internal server error
+            status: 500
+            detail: the request could not be completed. Quote the trace id when reporting this.
+            instance: /v1/users
+            code: internal
+            trace_id: 0af7651916cd43dd8448eb211c80319c
+
+# ---------------------------------------------------------------------------
+# Known gaps — departures from cafaye/core docs/openapi-conventions.md
+#
+# Each is a manager decision, not a local choice, and each is recorded here so it
+# cannot be discovered by a consumer instead of by a reviewer.
+#
+# 1. `Idempotency-Key` is not accepted on POST /v1/users.
+#
+#    Core's checklist says every safely-retryable mutating POST must accept it.
+#    Registration is safely retryable — a client that never saw the 201 should be
+#    able to try again — so this endpoint owes the header.
+#
+#    Not implemented here because it needs its own retention table, a request-body
+#    hash, the `(endpoint, principal, key)` scoping and the replay-versus-reuse
+#    409, and a half-built version that accepts the header and ignores it is worse
+#    than one that does not claim it. It is the first thing to add to this surface.
+#
+#    POST /v1/session is a deliberate exception and always will be: a login is not
+#    safely repeatable, since retrying it mints a second session rather than
+#    returning the first.
+#
+# 2. Three error codes are not in core's reserved list.
+#
+#    `account_locked` (423) is required by the brute-force lockout this packet
+#    specifies, and core's list has no entry for a locked account. The other two,
+#    `invalid_json` (400) and `payload_too_large` (413), are the honest answers
+#    for a syntactically broken and an oversized body; folding them into
+#    `validation_failed` would have reported both as semantic failures, and 400
+#    for malformed syntax is exactly what core's own status conventions reserve.
+#
+#    Proposal for core, not a fait accompli: add `account_locked` mapped to 423
+#    and `payload_too_large` mapped to 413 to the reserved list. `invalid_json`
+#    may be better folded into `validation_failed` at 400, since core's list is
+#    keyed by slug and one slug cannot carry two statuses.
+#
+# 3. `info.version: 1.0.0` is set.
+#
+#    core's versioning section carries an open decision (D4) about whether a
+#    document version is required alongside the `/v1` path prefix, precisely
+#    because two version numbers to keep in sync is a footgun. Setting it here
+#    satisfies the stricter reading and costs nothing; the looser reading would
+#    have core drop the field.
+#
+#  4. `GET /readyz` returns `{status, deps}` on 503, not a problem document.
+#
+#    This is a conflict between two authoritative sources, and neither should be
+#    changed unilaterally by this packet.
+#
+#    core says every non-2xx response is `application/problem+json`. core's Problem
+#    schema has nowhere to put a dependency list, and that list is the entire value
+#    of `/readyz` to whoever is reading a failing probe.
+#
+#    The behaviour came from packet identity-01, which is merged and has tests
+#    asserting it: AGENTS.md requires `/readyz` to "report which dependencies failed
+#    by name", with the cause going to the log so an unauthenticated request cannot
+#    learn that a database host sits at a particular address. That reasoning is
+#    sound and this packet did not overturn it.
+#
+#    Resolution is the manager's: either core's envelope grows a place for probe
+#    diagnostics, or `/readyz` is scoped out of the client contract as an
+#    operational endpoint. The first is a core change, the second is a manifest
+#    change, and both are core's call.
+#
+# Not gaps, recorded because a reviewer will ask:
+#
+#  * The `bearerToken` scheme is `http`/`bearer` with an opaque token, not a JWT.
+#    core's auth section describes JWTs for service-to-service traffic verified
+#    against identity's JWKS. These are server-side session tokens, and the OIDC
+#    provider that issues JWTs is a later packet.
+#  * There is no CSRF token on the cookie surface. `SameSite=Lax` plus a
+#    state-changing surface that is POST/DELETE only and carries no ambient
+#    authority covers the ordinary case; the explicit double-submit token belongs
+#    with the browser app in `parlor`. It is a real gap, not a settled question.
+#  * There is no `GET /v1/users/{id}`. Nothing needs it, and an endpoint that
+#    exists only to be probed is an endpoint that leaks.
+# ---------------------------------------------------------------------------

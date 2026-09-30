@@ -35,20 +35,30 @@ func blockingCheck(name string) Check {
 }
 
 type response struct {
-	Code int
-	Body string
-	JSON map[string]any
+	Code        int
+	Body        string
+	ContentType string
+	JSON        map[string]any
 }
 
+// do performs a request and decodes the body as JSON.
+//
+// Both application/json and application/problem+json are accepted. The split is
+// core's: 2xx responses are plain JSON, every non-2xx is an RFC 9457 problem
+// document. A helper that only accepted the first would have hidden the change
+// that made the 404 and the 405 conform.
 func do(t *testing.T, handler http.Handler, method, target string) response {
 	t.Helper()
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(method, target, nil))
 
-	res := response{Code: rec.Code, Body: rec.Body.String()}
-	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
-		t.Errorf("%s %s Content-Type = %q, want application/json", method, target, ct)
+	res := response{Code: rec.Code, Body: rec.Body.String(), ContentType: rec.Header().Get("Content-Type")}
+	switch {
+	case strings.HasPrefix(res.ContentType, "application/json"),
+		strings.HasPrefix(res.ContentType, "application/problem+json"):
+	default:
+		t.Errorf("%s %s Content-Type = %q, want application/json or application/problem+json", method, target, res.ContentType)
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &res.JSON); err != nil {
 		t.Fatalf("%s %s body %q is not JSON: %v", method, target, res.Body, err)
@@ -69,6 +79,8 @@ func TestHealthz(t *testing.T) {
 		{name: "no dependencies", checks: nil, method: http.MethodGet, want: http.StatusOK},
 		{name: "healthy dependency", checks: []Check{okCheck("postgres")}, method: http.MethodGet, want: http.StatusOK},
 		{name: "unhealthy dependency", checks: []Check{failingCheck("postgres")}, method: http.MethodGet, want: http.StatusOK},
+		// A 405 is a problem document now, so the JSON-shape assertion below is
+		// skipped for it like every other non-2xx.
 		{name: "empty method is a 405", checks: nil, method: http.MethodPost, want: http.StatusMethodNotAllowed},
 	}
 
@@ -205,7 +217,10 @@ func TestReadyzReceivesADeadline(t *testing.T) {
 	}
 }
 
-func TestUnknownRouteIsJSON404(t *testing.T) {
+// A 404 is a problem document, like every other non-2xx response. core's error
+// envelope has no exception for "not found", and a bespoke body here is how a
+// client ends up parsing two error shapes.
+func TestUnknownRouteIsProblem404(t *testing.T) {
 	t.Parallel()
 
 	got := do(t, New(nil), http.MethodGet, "/does-not-exist")
@@ -213,12 +228,18 @@ func TestUnknownRouteIsJSON404(t *testing.T) {
 	if got.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", got.Code, http.StatusNotFound)
 	}
-	if got.JSON["status"] != "not_found" {
-		t.Errorf("status field = %v, want not_found", got.JSON["status"])
+	if want := "application/problem+json"; got.ContentType != want {
+		t.Errorf("Content-Type = %q, want %q", got.ContentType, want)
+	}
+	if got.JSON["code"] != CodeNotFound {
+		t.Errorf("code = %v, want %q", got.JSON["code"], CodeNotFound)
+	}
+	if got.JSON["status"] != float64(http.StatusNotFound) {
+		t.Errorf("status field = %v, want %d", got.JSON["status"], http.StatusNotFound)
 	}
 }
 
-func TestReadyzWrongMethodIsJSON405(t *testing.T) {
+func TestReadyzWrongMethodIsProblem405(t *testing.T) {
 	t.Parallel()
 
 	got := do(t, New(nil), http.MethodPost, "/readyz")
@@ -226,8 +247,11 @@ func TestReadyzWrongMethodIsJSON405(t *testing.T) {
 	if got.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want %d", got.Code, http.StatusMethodNotAllowed)
 	}
-	if got.JSON["status"] != "method_not_allowed" {
-		t.Errorf("status field = %v, want method_not_allowed", got.JSON["status"])
+	if want := "application/problem+json"; got.ContentType != want {
+		t.Errorf("Content-Type = %q, want %q", got.ContentType, want)
+	}
+	if got.JSON["code"] != CodeMethodNotAllowed {
+		t.Errorf("code = %v, want %q", got.JSON["code"], CodeMethodNotAllowed)
 	}
 }
 

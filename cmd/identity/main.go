@@ -19,9 +19,14 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/cafaye/identity/internal/auth"
 	"github.com/cafaye/identity/internal/config"
 	"github.com/cafaye/identity/internal/httpapi"
+	"github.com/cafaye/identity/internal/outbox"
+	"github.com/cafaye/identity/internal/platform/clock"
 	"github.com/cafaye/identity/internal/platform/db"
+	"github.com/cafaye/identity/internal/sessions"
+	"github.com/cafaye/identity/internal/users"
 )
 
 // shutdownTimeout is how long in-flight requests get to finish once a
@@ -78,8 +83,10 @@ type app struct {
 	timeout  time.Duration
 }
 
-// newApp wires the service together. With no DATABASE_URL it builds no pool and
-// registers no readiness dependency, which is the v0 default.
+// newApp wires the service together. With no DATABASE_URL it builds no pool,
+// registers no readiness dependency, and mounts no /v1 routes — the v0 default,
+// where the process serves its probes and nothing else. With one, it builds the
+// pools, the stores and the use cases, and mounts the auth surface.
 func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, error) {
 	var pool *pgxpool.Pool
 	checks := make([]httpapi.Check, 0, 1)
@@ -93,7 +100,16 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 		checks = append(checks, httpapi.Check{Name: db.CheckName, Ping: pool.Ping})
 	}
 
-	handler := httpapi.New(checks, httpapi.WithLogger(logger))
+	opts := []httpapi.Option{httpapi.WithLogger(logger)}
+	if svc := buildAuth(pool, logger); svc != nil {
+		opts = append(opts, httpapi.WithAuth(svc))
+	} else {
+		// Said out loud, because a process serving probes and no auth surface is a
+		// valid configuration and a surprising one.
+		logger.Warn("no DATABASE_URL configured; the /v1 auth routes are not mounted")
+	}
+
+	handler := httpapi.New(checks, opts...)
 
 	return &app{
 		cfg:    cfg,
@@ -105,6 +121,39 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 		},
 		timeout: shutdownTimeout,
 	}, nil
+}
+
+// buildAuth assembles the use cases over a pool, or returns nil when there is no
+// pool to build them on.
+//
+// The outbox publisher is deliberately NOT started here. The loop and the
+// Publisher interface exist and are tested, but the only implementation in this
+// packet is a no-op: starting it would mark every event published and drain the
+// outbox into nowhere, and a service that silently discards the events announcing
+// its own registrations is worse than one that has not started the loop. The NATS
+// connection is the next packet. See README.md, "Not built yet".
+func buildAuth(pool *pgxpool.Pool, logger *slog.Logger) *auth.Service {
+	if pool == nil {
+		return nil
+	}
+
+	return auth.NewService(
+		// Registration's user row and its event, and login's session and cleared
+		// failure counter, are each one transaction.
+		db.TxRunner{Pool: pool},
+		// Everything else is a single statement and does not need one.
+		db.Direct{Pool: pool},
+		users.NewStore(pool),
+		sessions.NewStore(pool),
+		outbox.NewStore(pool),
+		// Built once and shared: the hasher derives a dummy digest in its
+		// constructor, and a per-request hasher would derive one per request.
+		users.NewHasher(),
+		// The real clock. Every window in the service reads time through this, which
+		// is what lets a test move time exactly.
+		clock.System{},
+		auth.DefaultSessionTTL,
+	)
 }
 
 // Listen binds the socket. It is separate from Run so the address is known —

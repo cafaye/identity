@@ -7,7 +7,6 @@ package httpapi
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -31,6 +30,7 @@ type Check struct {
 type options struct {
 	logger           *slog.Logger
 	readinessTimeout time.Duration
+	auth             Auth
 }
 
 // Option customises the handler built by New.
@@ -57,7 +57,8 @@ func WithReadinessTimeout(d time.Duration) Option {
 
 // New builds the service router. With no checks there is nothing to probe, so
 // readiness succeeds with "deps":"none" — the shape v0 ships in, before
-// DATABASE_URL exists.
+// DATABASE_URL exists. With no Auth there are no /v1 routes at all, so a process
+// without a database still serves its probes and nothing else.
 func New(checks []Check, opts ...Option) http.Handler {
 	o := options{
 		logger:           slog.New(slog.DiscardHandler),
@@ -72,8 +73,11 @@ func New(checks []Check, opts ...Option) http.Handler {
 	r.MethodNotAllowed(methodNotAllowed)
 	r.Get("/healthz", handleHealthz)
 	r.Get("/readyz", o.handleReadyz(checks))
+	o.registerRoutes(r)
 
-	return r
+	// Outermost first: the trace id must exist before anything can log or report
+	// one, and recovery must sit inside it so the panic handler can quote the id.
+	return traceMiddleware(recoverPanics(o.logger, r))
 }
 
 // HealthResponse is the /healthz body. Liveness answers whether this process
@@ -122,18 +126,16 @@ func (o options) handleReadyz(checks []Check) http.HandlerFunc {
 	}
 }
 
-func notFound(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusNotFound, map[string]string{"status": "not_found"})
+// notFound and methodNotAllowed are problem documents like every other non-2xx
+// response, per core's error envelope. A bespoke JSON body here is how a client
+// ends up with two error shapes to parse.
+func notFound(w http.ResponseWriter, r *http.Request) {
+	problemFor(w, r, http.StatusNotFound, CodeNotFound, "no route matches this request")
 }
 
-func methodNotAllowed(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"status": "method_not_allowed"})
-}
-
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+func methodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	problemFor(w, r, http.StatusMethodNotAllowed, CodeMethodNotAllowed,
+		"this route does not implement the request's method")
 }
 
 // probe runs one readiness check. A panicking dependency is a failed probe,
