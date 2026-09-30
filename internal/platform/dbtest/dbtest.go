@@ -122,7 +122,7 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if _, err := pool.Exec(ctx, `TRUNCATE TABLE outbox_events, sessions, users CASCADE`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE outbox_events, sessions, account_invitations, account_users, accounts, users CASCADE`); err != nil {
 		t.Fatalf("truncating: %v", err)
 	}
 }
@@ -139,10 +139,11 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 //
 // The tables are cloned with LIKE ... INCLUDING ALL, which copies columns,
 // defaults, CHECK constraints and indexes from whatever the migrations currently
-// define — so a schema change is picked up with no edit here. Foreign keys are
-// the one thing LIKE does not copy (they point at the original table), so the one
-// this schema has is declared explicitly below. Re-read the migrations when
-// adding a table or a constraint; this list has to stay in step with them.
+// define — so a schema change is picked up with no edit here. Two things LIKE does
+// not copy, both declared explicitly below: foreign keys (they would point at the
+// original tables) and enum types (Postgres has no LIKE for a type). Re-read the
+// migrations when adding a table, a constraint or an enum value; this list has to
+// stay in step with them.
 func Schema(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
@@ -173,8 +174,33 @@ func Schema(t *testing.T) *pgxpool.Pool {
 		`CREATE TABLE ` + schema + `.users (LIKE public.users INCLUDING ALL)`,
 		`CREATE TABLE ` + schema + `.sessions (LIKE public.sessions INCLUDING ALL)`,
 		`CREATE TABLE ` + schema + `.outbox_events (LIKE public.outbox_events INCLUDING ALL)`,
+		`CREATE TABLE ` + schema + `.accounts (LIKE public.accounts INCLUDING ALL)`,
+		`CREATE TABLE ` + schema + `.account_users (LIKE public.account_users INCLUDING ALL)`,
+		`CREATE TABLE ` + schema + `.account_invitations (LIKE public.account_invitations INCLUDING ALL)`,
+		// Postgres has no LIKE for a type, so the two enums are declared here
+		// rather than cloned. That is a second copy of the migrations' enum
+		// labels: re-read 00005 and 00007 when either changes, and note that
+		// adding a role to public does NOT add it here — a test would then fail
+		// on an enum value the database accepts and the private schema does not.
+		`CREATE TYPE ` + schema + `.account_role AS ENUM ('owner', 'admin', 'member')`,
+		`CREATE TYPE ` + schema + `.account_invitation_role AS ENUM ('admin', 'member')`,
 		`ALTER TABLE ` + schema + `.sessions ADD CONSTRAINT sessions_user_id_fkey
 			FOREIGN KEY (user_id) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.account_users ADD CONSTRAINT account_users_account_id_fkey
+			FOREIGN KEY (account_id) REFERENCES ` + schema + `.accounts (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.account_users ADD CONSTRAINT account_users_user_id_fkey
+			FOREIGN KEY (user_id) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.account_invitations ADD CONSTRAINT account_invitations_account_id_fkey
+			FOREIGN KEY (account_id) REFERENCES ` + schema + `.accounts (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.account_invitations ADD CONSTRAINT account_invitations_invited_by_fkey
+			FOREIGN KEY (invited_by) REFERENCES ` + schema + `.users (id) ON DELETE RESTRICT`,
+		// The enums are schema-local, so the clones below would otherwise resolve
+		// their role columns against public.account_role and account_invitation_role.
+		// Two casts, and the private schema is genuinely private.
+		`ALTER TABLE ` + schema + `.account_users ALTER COLUMN role TYPE ` + schema + `.account_role
+			USING role::text::` + schema + `.account_role`,
+		`ALTER TABLE ` + schema + `.account_invitations ALTER COLUMN role TYPE ` + schema + `.account_invitation_role
+			USING role::text::` + schema + `.account_invitation_role`,
 	}
 	for _, stmt := range stmts {
 		if _, err := admin.Exec(ctx, stmt); err != nil {
