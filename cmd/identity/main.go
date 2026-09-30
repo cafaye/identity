@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/cafaye/identity/internal/accounts"
 	"github.com/cafaye/identity/internal/auth"
 	"github.com/cafaye/identity/internal/config"
 	"github.com/cafaye/identity/internal/httpapi"
@@ -101,8 +102,9 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 	}
 
 	opts := []httpapi.Option{httpapi.WithLogger(logger)}
-	if svc := buildAuth(pool, logger); svc != nil {
-		opts = append(opts, httpapi.WithAuth(svc))
+	authSvc, tenancy := buildAuth(pool, logger)
+	if authSvc != nil {
+		opts = append(opts, httpapi.WithAuth(authSvc), httpapi.WithTenancy(tenancy))
 	} else {
 		// Said out loud, because a process serving probes and no auth surface is a
 		// valid configuration and a surprising one.
@@ -132,20 +134,38 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 // outbox into nowhere, and a service that silently discards the events announcing
 // its own registrations is worse than one that has not started the loop. The NATS
 // connection is the next packet. See README.md, "Not built yet".
-func buildAuth(pool *pgxpool.Pool, logger *slog.Logger) *auth.Service {
+func buildAuth(pool *pgxpool.Pool, logger *slog.Logger) (*auth.Service, *accounts.Service) {
 	if pool == nil {
-		return nil
+		return nil, nil
 	}
 
-	return auth.NewService(
-		// Registration's user row and its event, and login's session and cleared
-		// failure counter, are each one transaction.
+	// One outbox store, shared. It is stateless apart from its pool, and two of
+	// them would be two objects that have to be configured identically.
+	events := outbox.NewStore(pool)
+
+	// Tenancy is built first because registration needs it: a new user gets a
+	// personal account, and both writes are one transaction. The order of these
+	// two blocks is the dependency order, which is the reason they share a
+	// function rather than being two independent builders in newApp.
+	tenancy := accounts.NewService(
+		db.TxRunner{Pool: pool},
+		accounts.NewStore(pool),
+		events,
+		clock.System{},
+		db.Direct{Pool: pool},
+	)
+
+	authSvc := auth.NewService(
+		// Registration's user row, personal account, owner membership and two
+		// events, and login's session and cleared failure counter, are each one
+		// transaction.
 		db.TxRunner{Pool: pool},
 		// Everything else is a single statement and does not need one.
 		db.Direct{Pool: pool},
 		users.NewStore(pool),
 		sessions.NewStore(pool),
-		outbox.NewStore(pool),
+		events,
+		tenancy,
 		// Built once and shared: the hasher derives a dummy digest in its
 		// constructor, and a per-request hasher would derive one per request.
 		users.NewHasher(),
@@ -154,6 +174,8 @@ func buildAuth(pool *pgxpool.Pool, logger *slog.Logger) *auth.Service {
 		clock.System{},
 		auth.DefaultSessionTTL,
 	)
+
+	return authSvc, tenancy
 }
 
 // Listen binds the socket. It is separate from Run so the address is known —

@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/cafaye/identity/internal/accounts"
 	"github.com/cafaye/identity/internal/outbox"
 	"github.com/cafaye/identity/internal/platform/clock"
 	"github.com/cafaye/identity/internal/platform/db"
@@ -88,6 +89,27 @@ type EventAppender interface {
 	Append(ctx context.Context, q db.Querier, e outbox.Envelope) error
 }
 
+// PersonalAccountProvisioner is the part of the accounts service that
+// registration needs: the personal account a new user gets, and the ownership
+// that makes it theirs.
+//
+// It is an interface declared here, at the consumer, for the same reason
+// UserStore and SessionStore are. It is also the reason its two methods take a
+// db.Querier rather than opening their own transaction: they run inside the
+// registration's, and a user who exists with no account is a state nothing
+// downstream can repair.
+//
+// It is a required dependency rather than an optional one. A nil provisioner
+// would mean a service that registers users into a void, and the failure would
+// show up as a user with an empty account list rather than as a startup error —
+// which is the worse of the two by a long way.
+type PersonalAccountProvisioner interface {
+	// Provision creates the personal account for a user.
+	Provision(ctx context.Context, q db.Querier, userID id.UUID, email string) (accounts.Account, error)
+	// AddOwner makes that user the account's owner, and announces the account.
+	AddOwner(ctx context.Context, q db.Querier, accountID, userID id.UUID) (accounts.Membership, error)
+}
+
 // Service is the identity use cases.
 type Service struct {
 	uow        UnitOfWork
@@ -95,6 +117,7 @@ type Service struct {
 	users      UserStore
 	sessions   SessionStore
 	events     EventAppender
+	tenancy    PersonalAccountProvisioner
 	hasher     *users.Hasher
 	clock      clock.Clock
 	sessionTTL time.Duration
@@ -103,15 +126,17 @@ type Service struct {
 // NewService wires the use cases. A non-positive sessionTTL means
 // DefaultSessionTTL.
 //
-// uow is used for the two writes that must be atomic with each other — the user
-// and its event, the session and the cleared failure counter. read is used for
-// everything else, so those lookups do not pay for a transaction.
+// uow is used for the two writes that must be atomic with each other — the user,
+// its personal account, the ownership and the two events; and the session and
+// its clearing of the failure counter. read is used for everything else, so
+// those lookups do not pay for a transaction.
 func NewService(
 	uow UnitOfWork,
 	read db.QuerierSource,
 	userStore UserStore,
 	sessionStore SessionStore,
 	events EventAppender,
+	tenancy PersonalAccountProvisioner,
 	hasher *users.Hasher,
 	clk clock.Clock,
 	sessionTTL time.Duration,
@@ -125,6 +150,7 @@ func NewService(
 		users:      userStore,
 		sessions:   sessionStore,
 		events:     events,
+		tenancy:    tenancy,
 		hasher:     hasher,
 		clock:      clk,
 		sessionTTL: sessionTTL,
@@ -147,12 +173,16 @@ type RegisteredUser struct {
 	Email string
 }
 
-// Register creates a user and announces it.
+// Register creates a user, their personal account, and announces both.
 //
-// The row and the `identity.user.created` event are written in one transaction.
-// That is the whole reason the outbox exists, and it is why the store methods
-// take a Querier rather than the pool: if the event could not be written the user
-// must not exist either, and the other way round.
+// The five writes — user, account, owner membership, `identity.user.created` and
+// `identity.account.created` — are one transaction. That is the whole reason the
+// outbox exists and the whole reason the provisioner takes a Querier: a user
+// without its event would never be announced, an event without its user would
+// announce a registration that did not happen, and a user without an account is
+// somebody who has signed up and can do nothing at all.
+//
+// Does not create a session. Sign in separately.
 func (s *Service) Register(ctx context.Context, in RegisterInput) (RegisteredUser, error) {
 	email := users.NormalizeEmail(in.Email)
 	if err := validateRegistration(email, in.Password); err != nil {
@@ -177,6 +207,14 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (RegisteredUse
 			return err
 		}
 
+		// The tenancy comes before the events, because an event about an account
+		// that does not exist is exactly the drift the outbox is supposed to
+		// prevent. The user id is needed for both the slug and the ownership, so
+		// this is the first point at which it can happen at all.
+		if err := s.provisionTenancy(ctx, q, u); err != nil {
+			return err
+		}
+
 		// The event is about this user, so it is built after the insert: the
 		// subject is an id that now exists.
 		event, err := outbox.NewUserCreated(now, u.ID, u.Email)
@@ -195,6 +233,33 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (RegisteredUse
 	}
 
 	return RegisteredUser{ID: created.ID, Email: created.Email}, nil
+}
+
+// provisionTenancy creates the personal account and makes the user its owner,
+// inside the registration's transaction.
+//
+// The two steps are separate rather than one call because the packet's ordering
+// is the point: the account's slug is derived from the user id, and the ownership
+// is what makes the account administrable. A service that created the membership
+// first would have no account to attach it to.
+func (s *Service) provisionTenancy(ctx context.Context, q db.Querier, u users.User) error {
+	if s.tenancy == nil {
+		// NewService requires a provisioner, so this is a wiring bug rather than a
+		// supported configuration. It is said out loud rather than defaulted,
+		// because the alternative — registering a user into an account-less void —
+		// is a failure that would not surface until somebody complained that the
+		// product was empty.
+		return errors.New("registering: no personal account provisioner is configured")
+	}
+
+	account, err := s.tenancy.Provision(ctx, q, u.ID, u.Email)
+	if err != nil {
+		return fmt.Errorf("creating the personal account: %w", err)
+	}
+	if _, err := s.tenancy.AddOwner(ctx, q, account.ID, u.ID); err != nil {
+		return fmt.Errorf("granting ownership of the personal account: %w", err)
+	}
+	return nil
 }
 
 // LoginInput is a login request.

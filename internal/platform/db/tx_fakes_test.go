@@ -89,6 +89,10 @@ func (p *fakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, err
 
 func (p *fakePool) QueryRow(context.Context, string, ...any) pgx.Row { return nil }
 
+func (p *fakePool) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, errors.New("not implemented in this test double")
+}
+
 // fakeRunner bundles what the tests need: the runner, the transaction it opened,
 // and the pool's own view of events.
 type fakeRunner struct {

@@ -108,6 +108,14 @@ func (o options) registerRoutes(r chiRouter) {
 	r.Post("/v1/session", o.handleLogin)
 	r.Delete("/v1/session", o.handleLogout)
 	r.Get("/v1/me", o.handleMe)
+
+	// The account routes need both services: a session to resolve the caller from
+	// and a tenancy service to resolve their role in it. With only one of the two
+	// they are not mounted at all, which is the same rule as above — a
+	// misconfiguration should be a 404, not a 500 on every request.
+	if o.tenancy != nil {
+		o.registerTenancyRoutes(r)
+	}
 }
 
 // chiRouter is the slice of *chi.Mux these routes need. Naming it keeps the
@@ -116,6 +124,7 @@ type chiRouter interface {
 	Post(pattern string, h http.HandlerFunc)
 	Delete(pattern string, h http.HandlerFunc)
 	Get(pattern string, h http.HandlerFunc)
+	Patch(pattern string, h http.HandlerFunc)
 }
 
 // handleRegister creates an account.

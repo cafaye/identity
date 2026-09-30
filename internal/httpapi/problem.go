@@ -30,10 +30,18 @@ const errorTypeBase = "https://errors.cafaye.com/"
 // syntactically broken body as a semantic failure.
 const (
 	CodeUnauthorized     = "unauthorized"
+	CodeForbidden        = "forbidden"
 	CodeValidationFailed = "validation_failed"
 	CodeConflict         = "conflict"
 	CodeNotFound         = "not_found"
 	CodeInternal         = "internal"
+
+	// CodeGone is core's own name for 410, from its deprecation section: "the old
+	// surface returns 410 gone with a Link to its replacement". An expired or
+	// already-redeemed invitation is the same shape of answer — the thing is
+	// permanently not redeemable and there is a next step — so it reuses the
+	// reserved code rather than inventing one.
+	CodeGone = "gone"
 
 	CodeAccountLocked    = "account_locked"
 	CodeMethodNotAllowed = "method_not_allowed"
@@ -47,10 +55,12 @@ const (
 // the occurrence's detail.
 var titles = map[string]string{
 	CodeUnauthorized:     "Unauthorized",
+	CodeForbidden:        "Forbidden",
 	CodeValidationFailed: "Validation failed",
 	CodeConflict:         "Conflict",
 	CodeNotFound:         "Not found",
 	CodeInternal:         "Internal server error",
+	CodeGone:             "Gone",
 
 	CodeAccountLocked:    "Account locked",
 	CodeMethodNotAllowed: "Method not allowed",

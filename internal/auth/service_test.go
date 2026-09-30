@@ -215,6 +215,7 @@ type fixture struct {
 	users    *fakeUsers
 	sessions *fakeSessions
 	events   *fakeEvents
+	tenancy  *fakeTenancy
 	uow      *fakeUnitOfWork
 	reader   *fakeReader
 	clock    *clock.Fake
@@ -231,6 +232,10 @@ func (m markerQuerier) Exec(context.Context, string, ...any) (pgconn.CommandTag,
 
 func (m markerQuerier) QueryRow(context.Context, string, ...any) pgx.Row { return nil }
 
+func (m markerQuerier) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, errors.New("markerQuerier returns no rows")
+}
+
 // fakeReader hands out a marker querier for statements that need no transaction,
 // so a test can tell a read from a write inside the registration transaction.
 type fakeReader struct{ q db.Querier }
@@ -242,6 +247,7 @@ func newFixture() *fixture {
 		users:    newFakeUsers(),
 		sessions: newFakeSessions(),
 		events:   &fakeEvents{},
+		tenancy:  &fakeTenancy{},
 		clock:    clock.NewFake(start),
 	}
 	// A marker querier, so a test can tell the transaction from the pool.
@@ -256,6 +262,7 @@ func newFixture() *fixture {
 		f.users,
 		f.sessions,
 		f.events,
+		f.tenancy,
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),
