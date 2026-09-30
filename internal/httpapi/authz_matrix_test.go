@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/cafaye/identity/internal/accounts"
+	"github.com/cafaye/identity/internal/oidc"
 	"github.com/cafaye/identity/internal/platform/clock"
 	"github.com/cafaye/identity/internal/platform/dbtest"
 	"github.com/cafaye/identity/internal/platform/id"
@@ -101,10 +103,11 @@ type matrixEndpoint struct {
 }
 
 // path renders the concrete request path for a case.
-func (e matrixEndpoint) path(accountID, memberID id.UUID) string {
+func (e matrixEndpoint) path(accountID, memberID, clientID id.UUID) string {
 	out := e.pattern
 	out = strings.ReplaceAll(out, "{accountID}", accountID.String())
 	out = strings.ReplaceAll(out, "{userID}", memberID.String())
+	out = strings.ReplaceAll(out, "{clientID}", clientID.String())
 	return out
 }
 
@@ -182,15 +185,47 @@ func matrixEndpoints() []matrixEndpoint {
 			name: "delete the account", method: http.MethodDelete,
 			pattern: "/v1/accounts/{accountID}", min: accounts.RoleOwner, success: http.StatusNoContent,
 		},
+
+		// The OIDC registrations. All four are owner-only, and the reason is a
+		// security property rather than a convention: adding a client is adding a
+		// new way for code to arrive in this product and get a token back out, and
+		// "can read the member list" is not authority to widen the perimeter.
+		//
+		// A member of the account is 403 rather than 404 because they can already
+		// see the account — the resource is theirs to know about — and an owner of
+		// a DIFFERENT account is 404 because they are a non-member here. The
+		// general rules in expectedStatus produce both, and that is the point of
+		// deriving them rather than tabulating them.
+		{
+			name: "register an OIDC client", method: http.MethodPost,
+			pattern: "/v1/accounts/{accountID}/oidc-clients", min: accounts.RoleOwner, success: http.StatusCreated,
+			body: func(f *matrixFixture) string {
+				return `{"name":"` + f.caseName + `","redirect_uris":["https://matrix.example.com/cb"],` +
+					`"grant_types":["authorization_code"],"scopes":["openid","email"]}`
+			},
+		},
+		{
+			name: "list the OIDC clients", method: http.MethodGet,
+			pattern: "/v1/accounts/{accountID}/oidc-clients", min: accounts.RoleOwner, success: http.StatusOK,
+		},
+		{
+			name: "read an OIDC client", method: http.MethodGet,
+			pattern: "/v1/accounts/{accountID}/oidc-clients/{clientID}", min: accounts.RoleOwner, success: http.StatusOK,
+		},
+		{
+			name: "revoke an OIDC client", method: http.MethodDelete,
+			pattern: "/v1/accounts/{accountID}/oidc-clients/{clientID}", min: accounts.RoleOwner, success: http.StatusNoContent,
+		},
 	}
 }
 
 // matrixFixture is the world the matrix runs in: one target account, and one
 // caller per row of the role columns, each with a real session.
 type matrixFixture struct {
-	handler http.Handler
-	pool    *pgxpool.Pool
-	clock   *clock.Fake
+	handler     http.Handler
+	pool        *pgxpool.Pool
+	clock       *clock.Fake
+	oidcClients *oidc.Service
 
 	// The account every row is about, and the plain member inside it, which is
 	// what the member-scoped routes act on.
@@ -202,6 +237,17 @@ type matrixFixture struct {
 	pendingToken string
 	// caseName is the subtest's name, used to keep created account names unique.
 	caseName string
+	// seq counts the targets built so far. It is what the fixture's account NAMES
+	// are built from, and it replaced the test name for that job: a slug is capped
+	// at 63 characters, and "Elsewhere TestAuthorizationMatrix/register_an_OIDC_client-owner"
+	// and "Elsewhere TestAuthorizationMatrix/register_an_OIDC_client-owner of another
+	// account" both truncate to the same 63 characters. A harness whose fixtures
+	// collide is a harness whose failures are about the harness.
+	seq int
+	// clientID is a fresh OIDC registration in the target account, minted per case
+	// for the same reason pendingToken is: the revoke row destroys what it is
+	// given, so one shared row would be gone by the second column.
+	clientID id.UUID
 	// inviteeEmail is a fresh address for the invite row, so the partial unique
 	// index on pending invitations does not fire for a reason unrelated to
 	// authorization.
@@ -228,10 +274,13 @@ func newMatrixFixture(t *testing.T) *matrixFixture {
 
 	tenancy := realTenancy(pool, clk)
 	authSvc := authServiceFor(pool, clk)
+	clients := matrixOIDCClients(t, pool, clk)
 
 	handler := New(nil,
 		WithAuth(authSvc),
 		WithTenancy(tenancy),
+		WithOIDCClients(clients),
+		WithOIDC(newFakeOIDC()),
 		WithLogger(slogLogger(&recordingHandler{})),
 	)
 
@@ -241,14 +290,15 @@ func newMatrixFixture(t *testing.T) *matrixFixture {
 	// difference is the entire content of that column: owning an account confers
 	// nothing on any other.
 	return &matrixFixture{
-		handler:   handler,
-		pool:      pool,
-		clock:     clk,
-		owner:     actor{name: "owner", role: accounts.RoleOwner},
-		admin:     actor{name: "admin", role: accounts.RoleAdmin},
-		member:    actor{name: "member", role: accounts.RoleMember},
-		stranger:  actor{name: "non-member"},
-		elsewhere: actor{name: "owner of another account"},
+		handler:     handler,
+		pool:        pool,
+		clock:       clk,
+		oidcClients: clients,
+		owner:       actor{name: "owner", role: accounts.RoleOwner},
+		admin:       actor{name: "admin", role: accounts.RoleAdmin},
+		member:      actor{name: "member", role: accounts.RoleMember},
+		stranger:    actor{name: "non-member"},
+		elsewhere:   actor{name: "owner of another account"},
 	}
 }
 
@@ -298,9 +348,10 @@ func (f *matrixFixture) buildTarget(t *testing.T) {
 	// Recorded so the create-account row can use a name no other case has used.
 	f.caseName = strings.ReplaceAll(t.Name(), "/", " ")
 	f.inviteeEmail = dbtest.UniqueEmail(t)
+	f.seq++
 
 	created, err := realTenancy(f.pool, f.clock).Create(t.Context(), accounts.CreateInput{
-		Name:  "Matrix " + strings.ReplaceAll(t.Name(), "/", "-"),
+		Name:  f.label("Matrix"),
 		Owner: f.owner.user,
 	})
 	if err != nil {
@@ -324,11 +375,26 @@ func (f *matrixFixture) buildTarget(t *testing.T) {
 	// The "elsewhere" actor gets an account of their own, so the column is a
 	// genuine owner who simply owns the wrong account.
 	if _, err := realTenancy(f.pool, f.clock).Create(t.Context(), accounts.CreateInput{
-		Name:  "Elsewhere " + strings.ReplaceAll(t.Name(), "/", "-"),
+		Name:  f.label("Elsewhere"),
 		Owner: f.elsewhere.user,
 	}); err != nil {
 		t.Fatalf("creating the elsewhere account: %v", err)
 	}
+
+	// A fresh OIDC registration, registered through the real use case so the row
+	// in the matrix is one the service would have written.
+	registered, err := f.oidcClients.Register(t.Context(), oidc.RegisterInput{
+		AccountID:    f.accountID,
+		Name:         f.label("Matrix"),
+		RedirectURIs: []string{"https://matrix.example.com/cb"},
+		GrantTypes:   []string{oidc.GrantAuthorizationCode},
+		Scopes:       []string{oidc.ScopeOpenID, oidc.ScopeEmail},
+		RegisteredBy: f.owner.user,
+	})
+	if err != nil {
+		t.Fatalf("registering the matrix's OIDC client: %v", err)
+	}
+	f.clientID = registered.Client.ID
 
 	// A fresh, unaccepted invitation for the accept route. Per case rather than
 	// per suite, so no column spends the token another column needs.
@@ -342,6 +408,17 @@ func (f *matrixFixture) buildTarget(t *testing.T) {
 		t.Fatalf("creating the pending invitation: %v", err)
 	}
 	f.pendingToken = invited.Token
+}
+
+// label is a short unique name for a fixture row.
+//
+// Short AND unique, because accounts.Slugify truncates at 63 characters and two
+// long names that share a prefix truncate to one slug — which is a 409 on the
+// second and a failure in the harness rather than in the code under test. The
+// counter is enough on its own and reads better in a database than a test path
+// does.
+func (f *matrixFixture) label(prefix string) string {
+	return fmt.Sprintf("%s %d", prefix, f.seq)
 }
 
 // columns is the actor set the matrix runs every endpoint against.
@@ -386,7 +463,7 @@ func TestAuthorizationMatrix(t *testing.T) {
 					rec := f.send(t, endpoint, column)
 					if rec.Code != tt.wantStatus {
 						t.Fatalf("%s %s as %s = %d, want %d\nbody: %s",
-							endpoint.method, endpoint.path(f.accountID, f.memberID),
+							endpoint.method, endpoint.path(f.accountID, f.memberID, f.clientID),
 							column.name, rec.Code, tt.wantStatus, rec.Body)
 					}
 					if tt.wantProblemCode == "" {
@@ -465,7 +542,7 @@ func (f *matrixFixture) send(t *testing.T, endpoint matrixEndpoint, column actor
 		body = endpoint.body(f)
 	}
 
-	req := httptest.NewRequest(endpoint.method, endpoint.path(f.accountID, f.memberID), strings.NewReader(body))
+	req := httptest.NewRequest(endpoint.method, endpoint.path(f.accountID, f.memberID, f.clientID), strings.NewReader(body))
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -508,7 +585,7 @@ func mountedAccountRoutes() []string {
 	var found []string
 
 	r := chi.NewRouter()
-	opts := options{tenancy: newFakeTenancy(), auth: newFakeAuth()}
+	opts := options{tenancy: newFakeTenancy(), auth: newFakeAuth(), oidcClients: newFakeOIDCClients()}
 	opts.registerTenancyRoutes(r)
 
 	// chi.Walk needs a real method handler; the routes are registered on a mux

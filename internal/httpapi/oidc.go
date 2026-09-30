@@ -410,15 +410,34 @@ func (o options) finishOIDCLogin(w http.ResponseWriter, r *http.Request, request
 		return
 	}
 
-	// A clone with the callback's path, so the library's own router sees the URL
-	// it expects. The original request is untouched: it is the caller's, and the
-	// library's issuer interceptor and CORS handler both read it.
-	proxied := r.Clone(r.Context())
-	target := *r.URL
-	target.Path = oidc.PathAuthorizeCallback
-	target.RawQuery = url.Values{"id": []string{requestID}}.Encode()
-	proxied.URL = &target
-	proxied.RequestURI = ""
+	// A FRESH GET for the callback, not a rewritten clone of the POST.
+	//
+	// The clone is the obvious implementation and it is wrong: the login POST has
+	// already called ParseForm, so the clone arrives with r.Form holding
+	// `state=...&email=...&password=...` and ParseForm is a no-op from then on.
+	// The library's callback handler reads `id` out of r.Form, finds the login
+	// form instead, and answers "auth request callback is missing id" — which is
+	// exactly what the first run of the round trip did.
+	//
+	// The headers are copied because the library's issuer interceptor and its CORS
+	// handler read them, and a request with none of them would produce a document
+	// with a different issuer than the one every other response carries.
+	target := oidc.PathAuthorizeCallback + "?" + url.Values{"id": []string{requestID}}.Encode()
+	proxied, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
+	if err != nil {
+		unexpected(w, r, o.logger, fmt.Errorf("building the authorize callback request: %w", err))
+		return
+	}
+	for name, values := range r.Header {
+		// The cookie and the content type are the login POST's, and carrying
+		// either into a GET the library answers with a redirect would be
+		// confusing rather than useful. Everything else — the trace header, the
+		// user agent, the accept language — is about the request and is copied.
+		if name == "Cookie" || name == "Content-Type" || name == "Content-Length" {
+			continue
+		}
+		proxied.Header[name] = values
+	}
 
 	o.delegateOIDC(w, proxied)
 }
