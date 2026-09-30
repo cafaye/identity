@@ -433,6 +433,7 @@ internal/accounts/     the tenancy use cases: accounts, memberships, invitations
 internal/oauth/        the social-login client side: state, token cipher, registry
 internal/outbox/       transactional event envelope, SKIP LOCKED claim, publisher
 internal/platform/db/  the pgx pool, and the readiness ping
+internal/platform/ci/  the test that keeps .github/workflows/ci.yml honest
 migrations/            goose SQL files
 ```
 
@@ -443,19 +444,66 @@ type that the tests drive directly.
 
 ## Testing
 
-`go test ./...` passes on a machine with no database and no Docker. The
-integration tests skip themselves unless `TEST_DATABASE_URL` is set:
+**`go test ./...` is red on a machine with no database, and that is the design.**
+`internal/mfa`'s `TestTheDatabaseTierActuallyRan` FAILS rather than skips when
+`TEST_DATABASE_URL` is unset, because every test in that file is a database test
+and a skip there reads like coverage. A green suite that never touched Postgres
+verified nothing, so the suite says so.
+
+The database tier, once the schema is applied:
 
 ```sh
-docker compose up -d postgres
+docker compose up -d --wait postgres
+goose -dir migrations postgres "$DATABASE_URL" up
 TEST_DATABASE_URL="postgres://identity:identity@localhost:5432/identity?sslmode=disable" go test ./...
 ```
+
+Migrations are a deploy step, so they are not a test step — `goose up` is its own
+command above the suite, and a suite run against an unmigrated database fails
+loudly with `relation "public.users" does not exist` rather than skipping.
+
+With no `TEST_DATABASE_URL`: **759 PASS lines, 309 SKIP**. With it:
+**1237 PASS lines, 0 SKIP**. `internal/accounts` goes from 0.9s to ~36s and
+`internal/httpapi` from 3.3s to ~69s, and that difference is the only thing that
+tells "ran" from "skipped" from the outside.
 
 SIGTERM handling is not asserted through a mock: `TestMainHandlesSIGTERM` runs
 the real `main()` in a child process, waits for it to report that it is serving,
 sends the signal, and requires a clean exit. There are no `time.Sleep` calls in
 this repository — every wait is on a channel the code under test signals, or on
 a failure deadline (PLAN.md §3).
+
+## CI
+
+`.github/workflows/ci.yml` calls kit's reusable workflow for the shared half and
+runs this repository's own for the rest:
+
+```yaml
+uses: cafaye/kit/.github/workflows/ci.reusable.yml@master
+```
+
+`ci (kit: go)` is **expected red** — kit's Go job runs `go test` with no Postgres,
+and a caller cannot hand a reusable workflow a service container
+(`services:` is not one of the keys GitHub accepts on a calling job). It also runs
+golangci-lint's default set, which reports 31 issues in this tree today. Both are
+named in the file rather than left to be inferred.
+
+`gate` is the job to read. Postgres 17.11 as a service, `goose up` as its own step
+above the gate, `bin/prime` unmodified, and then the assertions: the database tier
+**derived from the tree**, a floor on its PASS count, zero `--- SKIP:` lines, 23
+named security tests that have to appear in the log by name, `go vet`, `gofmt -l`,
+a `git diff --exit-code` on `go.mod`/`go.sum`, and a coverage floor. `MFA_ENCRYPTION_KEY`
+is generated from `/dev/urandom` per run, masked, and printed nowhere.
+
+The floors are decrease detectors, not targets: a green run means nothing was
+deleted, skipped or excluded since they were measured.
+
+`internal/platform/ci` is the test for that file. It parses no YAML — a YAML
+dependency would move `go.mod`, and AGENTS.md's rule is that `go.mod` moves only
+for a stated cause — and it is what catches the `uses:` path drifting back to a
+directory GitHub cannot resolve, the `versions:` literal drifting away from
+`go.mod`, migrations moving below the suite, the SKIP check disappearing, and a
+named security test being renamed.
 
 ## Migrations
 

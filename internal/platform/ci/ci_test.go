@@ -85,10 +85,10 @@ var (
 // TestTheSharedJobCallsKitAtAPathThatResolves is the one that would have caught
 // six months of callers pointing at a file nobody could reach.
 //
-// It fails on the OLD path explicitly rather than only on the absence of the new
-// one: a repository that has both is a repository where somebody copied the
-// wrong line into a second job, and "some job calls kit correctly" would not
-// notice.
+// It requires exactly one call and requires its path to be the documented one,
+// because both halves matter: a second job calling kit with the OLD path is a
+// repository where somebody copied the wrong line, and "some job calls kit
+// correctly" would not notice that one.
 func TestTheSharedJobCallsKitAtAPathThatResolves(t *testing.T) {
 	var calls []string
 	for _, line := range workflowLines(t) {
@@ -339,16 +339,20 @@ func TestThePostgresServiceIsPinned(t *testing.T) {
 // TestTheLockfileGuardExists. go.sum is the lockfile and the gate's first step
 // (`go mod download`) can move it. Cheap, and it catches a class of drift nothing
 // else would.
+//
+// The two have to be on the SAME LINE, and that is the point: this repository's
+// comments name go.sum in nearly every step that touches it, so a check that
+// merely looked for the word in the script would pass on a comment.
 func TestTheLockfileGuardExists(t *testing.T) {
 	for _, script := range stepScripts(t, "gate") {
-		if strings.Contains(script, "git diff --exit-code") {
-			if strings.Contains(script, "go.sum") {
+		for _, line := range strings.Split(script, "\n") {
+			if strings.Contains(line, "git diff --exit-code") && strings.Contains(line, "go.sum") {
 				return
 			}
 		}
 	}
-	t.Error("no step runs `git diff --exit-code` on go.sum; the gate can move the lockfile and nothing " +
-		"here would say so")
+	t.Error("no step runs `git diff --exit-code … go.sum`; the gate can move the lockfile and " +
+		"nothing here would say so")
 }
 
 // TestNoSecretIsWrittenDown. MFA_ENCRYPTION_KEY and OIDC_SIGNING_KEY are read
@@ -357,20 +361,24 @@ func TestTheLockfileGuardExists(t *testing.T) {
 // invalidate every enrolled user's secret). CI must not turn either into a
 // literal, because a CI log is retained, searchable, and often public.
 //
-// An assignment is a literal when its value contains no `$`: a shell expansion is
-// generated for the run, and a fixed string is a key in a repository.
+// An assignment is a literal when its own word contains no `$`. The word and not
+// the rest of the line, because a step sets a dozen variables on one line and a
+// check that looked at the whole line would be satisfied by any one of them —
+// which is exactly the shape of bug it exists to catch.
 func TestNoSecretIsWrittenDown(t *testing.T) {
 	names := regexp.MustCompile(`(MFA_ENCRYPTION_KEY|OIDC_SIGNING_KEY)=`)
 	for i, line := range workflowLines(t) {
 		for _, name := range names.FindAllString(line, -1) {
-			value := strings.TrimSpace(strings.SplitN(line, name, 2)[1])
-			value = strings.Trim(value, `"'`)
-			if value == "" || strings.Contains(value, "$") {
+			word := strings.SplitN(line, name, 2)[1]
+			if blank := strings.IndexAny(word, " \t"); blank >= 0 {
+				word = word[:blank]
+			}
+			if word == "" || strings.Contains(word, "$") {
 				continue
 			}
 			t.Errorf("ci.yml:%d assigns %s a literal value: %s\n"+
 				"Generate it for the run from /dev/urandom and mask it, or do not set it at all.",
-				i+1, name, value)
+				i+1, name, word)
 		}
 	}
 }
@@ -505,10 +513,11 @@ func namedInWorkflow(t *testing.T) []string {
 	t.Helper()
 
 	// The list is the continuation lines of the step's `for name in \` … `; do`,
-	// one test per line and nothing else. Matching on the line's own shape rather
-	// than on the whole script is what keeps the two `Test…` names in the grep
-	// and the error message below out of the result.
-	name := regexp.MustCompile(`^\s+(Test[A-Za-z0-9_]+)\s*\\?\s*$`)
+	// one test per line and nothing else. The last line carries the `; do`, so it
+	// is optional in the shape. Matching on the line's own shape rather than on
+	// the whole script is what keeps the two `Test…` names in the grep and the
+	// error message below out of the result.
+	name := regexp.MustCompile(`^\s+(Test[A-Za-z0-9_]+)\s*(\\)?\s*(; do)?\s*$`)
 
 	var names []string
 	found := false

@@ -339,29 +339,49 @@ jobs:
           set -euo pipefail
           log="$RUNNER_TEMP/suite.log"
 
-          # (a) derive. A test that opens a pool, or that reads the variable
+          # (a) derive. A test that OPENS a pool, or that reads the variable
           # itself, is a database test — which is what dbtest.Pool, dbtest.Schema
           # and dbtest.EnvVar between them name.
+          #
+          # Comments are stripped before the match, and that is not a nicety:
+          # internal/platform/ci writes about dbtest.Pool in prose and is not a
+          # database package, and a tier derived from prose grows a package every
+          # time somebody documents one. A tier naming a package that cannot fail
+          # on a missing schema is worse than no tier, because it reads as
+          # evidence.
           grep -rl --include='*_test.go' -E 'dbtest\.(Pool|Schema|EnvVar)|TEST_DATABASE_URL' . \
-            | sed 's|^\./||' | xargs -n1 dirname | sort -u > "$RUNNER_TEMP/db-tier.txt"
-          if [ ! -s "$RUNNER_TEMP/db-tier.txt" ]; then
+            | sed 's|^\./||' | sort > "$RUNNER_TEMP/db-candidates.txt"
+          : > "$RUNNER_TEMP/db-files.txt"
+          while read -r file; do
+            if awk '{ sub(/^[[:space:]]*(\/\/|\*).*/, "") } { print }' "$file" \
+              | grep -E 'dbtest\.(Pool|Schema|EnvVar)|TEST_DATABASE_URL' > /dev/null; then
+              echo "$file" >> "$RUNNER_TEMP/db-files.txt"
+            fi
+          done < "$RUNNER_TEMP/db-candidates.txt"
+          if [ ! -s "$RUNNER_TEMP/db-files.txt" ]; then
             echo "::error::the database tier matched no test file." >&2
             echo "  an empty list would run the WHOLE suite and call it a tier" >&2
             exit 1
           fi
+          sed 's|/[^/]*$||' "$RUNNER_TEMP/db-files.txt" | sort -u > "$RUNNER_TEMP/db-tier.txt"
           echo "database packages ($(wc -l < "$RUNNER_TEMP/db-tier.txt" | tr -d ' ') of them):"
           sed 's|^|  ./|' "$RUNNER_TEMP/db-tier.txt"
 
           # (b) per-package counts, one row per package, so the arithmetic below
           # is over the database tier and not over the whole suite.
           awk '
-            function flush() { if (cur != "") { printf "%s\t%d\t%d\n", cur, p, s } }
-            /^(ok|FAIL)[[:space:]]+github\.com\/cafaye\/identity/ {
-              flush(); cur = $2; p = 0; s = 0; next
+            # `go test -v` prints a package's tests and THEN its `ok` line, so the
+            # counts accumulated so far belong to the package named on the line
+            # just read — printing them against the previous package is off by
+            # one, and silently attributes every test to its neighbour. Subtests
+            # are indented, so the pattern is not anchored to column zero: a
+            # run's PASS count is every test that passed, including the ones
+            # inside a table.
+            /^(ok|FAIL|\?)[[:space:]]+github\.com\/cafaye\/identity/ {
+              printf "%s\t%d\t%d\n", $2, p, s; p = 0; s = 0; next
             }
-            /^--- PASS:/ { p++ }
-            /^--- SKIP:/ { s++ }
-            END { flush() }
+            /^[[:space:]]*--- PASS: / { p++ }
+            /^[[:space:]]*--- SKIP: / { s++ }
           ' "$log" > "$RUNNER_TEMP/tiers.txt"
 
           # (c) every derived package is present, with tests in it.
@@ -398,7 +418,7 @@ jobs:
           fi
           echo "database tier: $tier_pass passed (floor $DATABASE_TIER_FLOOR)"
           echo "whole suite:   $suite_pass passed (floor $SUITE_FLOOR)"
-          if ! grep -q -- '--- PASS: TestTheDatabaseTierActuallyRan' "$log"; then
+          if ! grep -q -- '--- PASS: TestTheDatabaseTierActuallyRan (' "$log"; then
             echo "::error::no PASS for TestTheDatabaseTierActuallyRan; the run proved nothing about the tier" >&2
             exit 1
           fi
@@ -436,15 +456,17 @@ jobs:
             TestNewAppWithoutMFAKeyMountsNoManagementRoutesAndStillChallenges \
             TestConfirmingRevokesEverySessionIssuedBeforeMFA \
             TestOIDCRedirectURINotOnTheAllowList \
-            TestEveryRouteIsInTheMatrix
-          ; do
-            if ! grep -q -- "--- PASS: ${name}" "$log"; then
+            TestEveryRouteIsInTheMatrix; do
+            # The trailing " (" is what makes this exact: `--- PASS: TestFooBar`
+            # must not satisfy a check written for `TestFoo`, and go test always
+            # puts the duration after the name.
+            if ! grep -qF -- "--- PASS: ${name} (" "$log"; then
               echo "::error::${name} did not PASS in this run" >&2
               exit 1
             fi
             echo "  ${name}"
           done
-          if grep -qE '^--- SKIP:' "$log"; then
+          if grep -qE '^[[:space:]]*--- SKIP: ' "$log"; then
             echo "::error::a test SKIPPED. A skipped test proves nothing (PLAN.md §1)." >&2
             exit 1
           fi
