@@ -354,39 +354,57 @@ func (s *Store) Revoke(ctx context.Context, q db.Querier, rowID, accountID, by i
 	return out, nil
 }
 
-// RevokeAllForUser withdraws every token a user holds, in one statement.
+// RevokeAllForMember withdraws every credential a user holds in ONE account.
 //
-// IT EXISTS FOR THE SAME EVENT THAT SESSIONS HAVE ONE FOR, and the argument is
-// the one internal/sessions' RevokeAllForUser already makes. Enabling MFA revokes
-// every session, because a session minted under a one-factor policy was minted
-// on a password alone, and leaving it alive means the attacker holding it does
-// not have to solve the new problem.
+// IT IS SCOPED TO THE ACCOUNT AND NOT TO THE USER, and that is the difference
+// between it and a "revoke everything this person holds" sweep: a user in three
+// accounts is removed from one of them, and the credentials for the other two are
+// none of the operator's business. accounts.Service.RemoveMember calls it inside
+// the transaction that deletes the membership, so "this person is not in this
+// account" and "nothing they held in this account works" are one fact.
 //
-// AN API KEY IS THAT ARGUMENT'S STRONGER CASE, not its weaker one. A session
-// lives a fortnight and lives in a cookie nobody inspects; a token lives a
-// quarter, has a NAME on a settings page, and is exactly the credential an
-// attacker with a stolen password would mint for themselves before the user
-// noticed anything. A user who turns on a second factor to lock somebody out has,
-// without this sweep, handed that somebody a credential they cannot see.
+// IT EXISTS AT ALL BECAUSE RE-EVALUATING THE ROLE IS NOT ENOUGH, and that is a
+// finding this packet's own test produced. The resolution query joins
+// account_users, so a removal stops a token on the very next request with nothing
+// to invalidate — and then the same user is re-invited at the same role, the join
+// is satisfied again, and a contractor's CI credential that was supposed to have
+// died at offboarding quietly starts working the day somebody re-adds them. The
+// test is internal/httpapi's TestARemovedMembershipStopsTheTokenOnTheNextRequest,
+// and its LAST assertion is the one that failed first.
 //
-// A REVOCATION AND NOT A DELETE, unlike the session sweep, and the difference is
-// the audit trail: the row is what this service's own support reads afterwards to
-// answer "what did that account hold", and a delete answers it for nobody.
+// THE ALTERNATIVE CONSIDERED AND REJECTED was keying the token on the membership's
+// `created_at`, so a re-invite's new row would not match. It fails on a clock: two
+// remove-and-re-add cycles inside one second — or any test with a frozen clock,
+// which is every test in this repository — produce the same value and the token
+// revives anyway. A time-based guess about which grant a credential belongs to is
+// a guess.
 //
-// Revoking zero tokens is a success. A user who has never minted one is already in
-// the state this is called for.
-func (s *Store) RevokeAllForUser(ctx context.Context, q db.Querier, userID id.UUID, at time.Time) error {
-	if userID.IsZero() {
+// THE REASON IS A CLOSED VALUE AND NOT FREE TEXT, which is the difference from the
+// operator-facing revoke_reason on an explicit revocation: nobody typed this one, so
+// a consumer can switch on it. It is stored rather than published — the revocation
+// event carries no reason at all, for the reason outbox.NewAPIKeyRevoked gives.
+//
+// A REVOCATION AND NOT A DELETE. The row is what this service's own support reads
+// afterwards to answer "what did that account hold", and a delete answers it for
+// nobody. Revoking zero credentials is a success: a member who never minted one is
+// already in the state this is called for.
+func (s *Store) RevokeAllForMember(ctx context.Context, q db.Querier, accountID, userID id.UUID, at time.Time) error {
+	if accountID.IsZero() || userID.IsZero() {
 		return nil
 	}
 
+	// revoked_by is the member themselves, because they are the only party this
+	// statement knows and the table's whole-revocation CHECK requires a revoker. It
+	// reads as though they withdrew their own credentials, which is wrong in its
+	// literal sense; the reason carries the truth instead, and the comment above is
+	// the other half of it.
 	const query = `
 		UPDATE api_keys
-		SET revoked_at = $2, revoked_by = $1, revoke_reason = 'security posture changed'
-		WHERE user_id = $1 AND revoked_at IS NULL`
+		SET revoked_at = $3, revoked_by = $2, revoke_reason = 'membership removed'
+		WHERE account_id = $1 AND user_id = $2 AND revoked_at IS NULL`
 
-	if _, err := q.Exec(ctx, query, userID, at); err != nil {
-		return fmt.Errorf("apikeys: revoking a user's tokens: %w", err)
+	if _, err := q.Exec(ctx, query, accountID, userID, at); err != nil {
+		return fmt.Errorf("apikeys: revoking a removed member's credentials: %w", err)
 	}
 	return nil
 }

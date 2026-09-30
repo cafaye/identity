@@ -643,20 +643,28 @@ func TestTheSchemaRefusesAHalfRevocation(t *testing.T) {
 	_ = digest
 }
 
-// TestRevokeAllForUserKeepsTheRows is the sweep that answers "enabling MFA should
-// not leave a long-lived credential behind", and its second property is that it
-// is a REVOCATION rather than a delete.
-func TestRevokeAllForUserKeepsTheRows(t *testing.T) {
+// TestRevokeAllForMemberIsScopedToOneAccount is the sweep a member removal runs,
+// and its three properties are all cross-tenant or audit properties.
+//
+// It is a REVOCATION and not a delete, it is SCOPED to the account, and it leaves
+// the same user's credentials in OTHER accounts alone. The second is the one that
+// decides whether this method exists at all: a sweep scoped to the user would take
+// a colleague's credentials in a different tenant with them, which is an operator
+// removing one person from one account and breaking three others.
+func TestRevokeAllForMemberIsScopedToOneAccount(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 
 	mine := f.issue(t, "mine-a", ScopeAccountsRead)
 	also := f.issue(t, "mine-b", ScopeAccountsRead)
 
-	// Somebody else's token, in another account. The sweep must not reach it.
-	theirs := f.issueAs(t, f.owner, f.other, "theirs", ScopeAccountsRead)
+	// The same user, in ANOTHER account. The fixture's `other` belongs to `owner`,
+	// so this row is one the sweep must not touch on two counts at once.
+	elsewhere := f.issueAs(t, f.user, f.other, "elsewhere", ScopeAccountsRead)
+	// And somebody else's credential in the target account.
+	theirs := f.issueAs(t, f.owner, f.account, "theirs", ScopeAccountsRead)
 
-	if err := f.store.RevokeAllForUser(ctx, f.pool, f.user, testInstant); err != nil {
+	if err := f.store.RevokeAllForMember(ctx, f.pool, f.account, f.user, testInstant); err != nil {
 		t.Fatalf("sweeping: %v", err)
 	}
 
@@ -668,20 +676,69 @@ func TestRevokeAllForUserKeepsTheRows(t *testing.T) {
 		if row.RevokedAt == nil {
 			t.Errorf("token %q was not revoked by the sweep", key.Name)
 		}
+		// The reason is a closed value, not free text: nobody typed it, so a
+		// consumer can switch on it. See RevokeAllForMember.
+		if row.RevokeReason == nil || *row.RevokeReason != "membership removed" {
+			t.Errorf("token %q has reason %v, want %q", key.Name, row.RevokeReason, "membership removed")
+		}
+		// And the sweep is a real revocation, so the token does not resolve — the
+		// store's resolution and the row are not allowed to disagree.
+		if _, err := f.store.ByDigest(ctx, f.pool, key.TokenDigest, testInstant); !errors.Is(err, ErrNotFound) {
+			t.Errorf("a swept token resolved to %v, want ErrNotFound", err)
+		}
 	}
 
-	untouched, err := f.store.ByID(ctx, f.pool, theirs.ID)
+	for _, key := range []Key{elsewhere, theirs} {
+		row, err := f.store.ByID(ctx, f.pool, key.ID)
+		if err != nil {
+			t.Fatalf("reading a token the sweep must not have touched: %v", err)
+		}
+		if row.RevokedAt != nil {
+			t.Errorf("the sweep revoked %q, which it was not scoped to", key.Name)
+		}
+	}
+
+	// And a sweep that matches nothing is a success, because a member who never
+	// minted a credential is already in the state the sweep is for. A user with no
+	// id at all is the same: a zero uuid is a bug in the caller, not a sweep.
+	if err := f.store.RevokeAllForMember(ctx, f.pool, f.account, id.MustNew(), testInstant); err != nil {
+		t.Errorf("sweeping a member with no credentials: %v", err)
+	}
+	if err := f.store.RevokeAllForMember(ctx, f.pool, id.MustNew(), f.user, testInstant); err != nil {
+		t.Errorf("sweeping with no account: %v", err)
+	}
+}
+
+// TestTheSweepIsIdempotent is the second-sweep question, and it matters because the
+// removal runs in a transaction that a retry could replay: a second sweep that
+// MOVED revoked_at would overwrite the moment the credential actually died, which
+// is the field an incident timeline is written from.
+func TestTheSweepIsIdempotent(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	key := f.issue(t, "once", ScopeAccountsRead)
+	if err := f.store.RevokeAllForMember(ctx, f.pool, f.account, f.user, testInstant); err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	first, err := f.store.ByID(ctx, f.pool, key.ID)
 	if err != nil {
-		t.Fatalf("reading somebody else's token: %v", err)
-	}
-	if untouched.RevokedAt != nil {
-		t.Error("the sweep revoked a token belonging to somebody else")
+		t.Fatalf("reading: %v", err)
 	}
 
-	// And a sweep that matches nothing is a success, because a user who has never
-	// minted a token is already in the state the sweep is for.
-	if err := f.store.RevokeAllForUser(ctx, f.pool, id.MustNew(), testInstant); err != nil {
-		t.Errorf("sweeping a user with no tokens: %v", err)
+	later := testInstant.Add(24 * time.Hour)
+	if err := f.store.RevokeAllForMember(ctx, f.pool, f.account, f.user, later); err != nil {
+		t.Fatalf("second sweep: %v", err)
+	}
+	second, err := f.store.ByID(ctx, f.pool, key.ID)
+	if err != nil {
+		t.Fatalf("re-reading: %v", err)
+	}
+
+	if second.RevokedAt == nil || !second.RevokedAt.Equal(*first.RevokedAt) {
+		t.Errorf("a second sweep moved revoked_at from %v to %v; the moment the credential "+
+			"actually died is the field an incident is written from",
+			first.RevokedAt, second.RevokedAt)
 	}
 }
 

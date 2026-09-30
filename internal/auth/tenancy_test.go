@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/cafaye/identity/internal/accounts"
+	"github.com/cafaye/identity/internal/apikeys"
 	"github.com/cafaye/identity/internal/outbox"
 	"github.com/cafaye/identity/internal/platform/clock"
 	"github.com/cafaye/identity/internal/platform/db"
@@ -190,6 +191,7 @@ func realTenancy(pool db.Pool, clk clock.Clock) PersonalAccountProvisioner {
 		db.TxRunner{Pool: pool},
 		accounts.NewStore(pool),
 		outbox.NewStore(pool),
+		apikeys.NewStore(pool),
 		clk,
 		db.Direct{Pool: pool},
 	)
@@ -307,6 +309,7 @@ func TestIntegrationRegisterRollsBackTenancy(t *testing.T) {
 		db.TxRunner{Pool: pool},
 		accounts.NewStore(pool),
 		outbox.NewStore(pool),
+		apikeys.NewStore(pool),
 		clockForTest(),
 		db.Direct{Pool: pool},
 	)}

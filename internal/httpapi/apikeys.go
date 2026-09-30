@@ -463,7 +463,7 @@ func (o options) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claims, err := o.introspector.Introspect(r.Context(), body.Token, time.Now())
+	claims, err := o.introspector.Introspect(r.Context(), body.Token, o.clk.Now())
 	if err != nil {
 		if errors.Is(err, apikeys.ErrNotFound) || errors.Is(err, apikeys.ErrNoAccountID) {
 			// The two refusals that are not the caller's fault and not a leak:
@@ -563,21 +563,43 @@ func (o options) presentedAPIKey(r *http.Request) string {
 //
 // It is the same test as presentedAPIKey without the value, and it exists because
 // the routes that must refuse a token need the answer without handling the
-// credential. Every such route calls it and refuses; none of them consults a scope
-// list, because there is no scope for the credential surface.
+// credential.
 func (o options) isAPIKeyRequest(r *http.Request) bool {
 	return o.presentedAPIKey(r) != ""
 }
 
-// refuseAPIKeyRequest answers 403 for a request presenting a scoped token on a
-// surface a token may not reach.
+// sessionCredentialOnly refuses a request that is presenting a scoped token.
 //
-// 403 AND NOT 404, because the caller IS authenticated and the resource does
-// exist: 404 would be a lie about a route that is mounted and working, and a
-// client that believed it would treat a policy decision as a routing bug. The
-// detail names the reason in one sentence, which is the caller's own doing and not
-// a fact about anybody else.
-func refuseAPIKeyRequest(w http.ResponseWriter, r *http.Request) {
-	problemFor(w, r, http.StatusForbidden, CodeForbidden,
-		"an api key may not use this endpoint; use a session")
+// IT IS ONE MIDDLEWARE rather than a check in each handler, and the routes it
+// wraps are exactly the ones a token has NO SCOPE FOR:
+//
+//	the credential surface    a credential that can mint more credentials is a
+//	                          privilege-escalation path with a nice UI
+//	the second factor         a machine credential that could disable a second
+//	                          factor is a credential whose theft is a DOWNGRADE
+//	                          rather than a break-in
+//	the session surface       a token cannot mint, read or revoke a browser
+//	                          session, so there is nothing here for it to do
+//	the account COLLECTION    a token is bound to one account, and
+//	                          GET /v1/accounts is the question "which accounts does
+//	                          this USER belong to". Answering it with a credential
+//	                          scoped to one of them hands a CI job an inventory of
+//	                          every other tenant its owner is in, which is exactly
+//	                          what a machine credential is not for.
+//
+// 403 AND NOT 401. The caller IS authenticated — the token is a real credential
+// and it may well be live — so a 401 would be a lie, and a client that believed it
+// would go looking for a login problem. 404 would be a lie about the route. The
+// detail names the reason, which is the caller's own doing and not a fact about
+// anybody else.
+func (o options) sessionCredentialOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if o.isAPIKeyRequest(r) {
+			problemFor(w, r, http.StatusForbidden, CodeForbidden,
+				"an api key may not use this endpoint; it is a session surface. "+
+					"An api key acts on the account it was issued for, and only there")
+			return
+		}
+		next(w, r)
+	}
 }

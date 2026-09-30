@@ -140,17 +140,21 @@ func scopeFrom(ctx context.Context) []string {
 var accountRouteScopes = map[string]string{
 	// The tenancy reads. accounts:read is also the default a CI job needs and the
 	// one that leaks the least.
-	"GET /v1/accounts":                     apikeys.ScopeAccountsRead,
+	//
+	// NOT IN THIS TABLE: `GET /v1/accounts`, `POST /v1/accounts` and
+	// `POST /v1/invitations/accept`. Each is a question about the caller's WHOLE set
+	// of accounts rather than about one account, and a token is bound to one
+	// account — so they are refused outright by sessionCredentialOnly rather than
+	// gated. A row here would be a lie twice over: they do not go through
+	// requireAccountRole, and a scope that gates nothing is a comment with a type.
 	"GET /v1/accounts/{accountID}":         apikeys.ScopeAccountsRead,
 	"GET /v1/accounts/{accountID}/members": apikeys.ScopeAccountsRead,
 
 	// The account's own mutations, except deleting it.
-	"POST /v1/accounts":                                apikeys.ScopeAccountsWrite,
 	"PATCH /v1/accounts/{accountID}":                   apikeys.ScopeAccountsWrite,
 	"POST /v1/accounts/{accountID}/invitations":        apikeys.ScopeAccountsWrite,
 	"PATCH /v1/accounts/{accountID}/members/{userID}":  apikeys.ScopeAccountsWrite,
 	"DELETE /v1/accounts/{accountID}/members/{userID}": apikeys.ScopeAccountsWrite,
-	"POST /v1/invitations/accept":                      apikeys.ScopeAccountsWrite,
 
 	// Deleting the account is its own scope: it is the only one of these that
 	// cannot be undone, and a token carrying accounts:write held by somebody who
@@ -330,7 +334,7 @@ func (o options) currentCaller(w http.ResponseWriter, r *http.Request) (apikeys.
 			unauthorized(w, r)
 			return apikeys.Caller{}, false
 		}
-		caller, err := o.apiKeyCaller.Authenticate(r.Context(), token, time.Now())
+		caller, err := o.apiKeyCaller.Authenticate(r.Context(), token, o.clk.Now())
 		if err != nil {
 			unauthorized(w, r)
 			return apikeys.Caller{}, false
@@ -536,9 +540,14 @@ type changeRoleRequest struct {
 // never removed — are in the use case, not here. A route's minimum answers "may
 // this caller do this at all"; the rest answers "may they do it to this".
 func (o options) registerTenancyRoutes(r chiRouter) {
-	r.Post("/v1/accounts", o.handleCreateAccount)
-	r.Get("/v1/accounts", o.handleListAccounts)
-	r.Post("/v1/invitations/accept", o.handleAcceptInvitation)
+	// The three collection routes are SESSION-ONLY, and it is the token that makes
+	// that a decision rather than a default: each of them answers a question about
+	// the CALLER'S WHOLE SET of accounts rather than about one account, and a
+	// credential bound to one of them has no business enumerating the others. The
+	// reason in full is on sessionCredentialOnly.
+	r.Post("/v1/accounts", o.sessionCredentialOnly(o.handleCreateAccount))
+	r.Get("/v1/accounts", o.sessionCredentialOnly(o.handleListAccounts))
+	r.Post("/v1/invitations/accept", o.sessionCredentialOnly(o.handleAcceptInvitation))
 
 	r.Get("/v1/accounts/{accountID}", o.requireAccountRole(accounts.RoleMember, o.handleGetAccount))
 	r.Patch("/v1/accounts/{accountID}", o.requireAccountRole(accounts.RoleAdmin, o.handleRenameAccount))

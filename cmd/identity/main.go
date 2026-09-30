@@ -200,6 +200,19 @@ func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*aut
 	// them would be two objects that have to be configured identically.
 	events := outbox.NewStore(pool)
 
+	// The api key store, built BEFORE tenancy and handed to it. The dependency runs
+	// backwards from the rest of this file and the reason is a security rule rather
+	// than a convenience: removing a member from an account revokes the machine
+	// credentials they held in it, in the same transaction as the membership delete,
+	// and accounts.Service can only do that with a revoker to call. It is an
+	// interface declared in accounts and satisfied here, so neither package imports
+	// the other.
+	//
+	// One store, two services: apikeys.Service below takes the same *Store, so the
+	// table has a single owner in this process and there is no second object to
+	// configure identically.
+	apiKeyStore := apikeys.NewStore(pool)
+
 	// Tenancy is built first because registration needs it: a new user gets a
 	// personal account, and both writes are one transaction. The order of these
 	// two blocks is the dependency order, which is the reason they share a
@@ -208,6 +221,7 @@ func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*aut
 		db.TxRunner{Pool: pool},
 		accounts.NewStore(pool),
 		events,
+		apiKeyStore,
 		clock.System{},
 		db.Direct{Pool: pool},
 	)
@@ -311,11 +325,10 @@ func buildAPIKeys(
 		return nil, nil
 	}
 
-	store := apikeys.NewStore(pool)
 	service := apikeys.NewService(
 		db.TxRunner{Pool: pool},
 		db.Direct{Pool: pool},
-		store,
+		apikeys.NewStore(pool),
 		outbox.NewStore(pool),
 		tenancy,
 		users.NewStore(pool),

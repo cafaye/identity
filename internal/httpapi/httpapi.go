@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+
+	"github.com/cafaye/identity/internal/platform/clock"
 )
 
 // DefaultReadinessTimeout bounds a single readiness probe so a hung
@@ -30,8 +32,17 @@ type Check struct {
 type options struct {
 	logger           *slog.Logger
 	readinessTimeout time.Duration
-	auth             Auth
-	tenancy          Tenancy
+	// clk is the service's clock, and it exists because the HTTP layer has to pass
+	// an INSTANT to the stores rather than let them read one.
+	//
+	// The alternative — time.Now() at the call site — is how a credential ends up
+	// judged against a different second than the one its row was written with, and
+	// it is untestable: a suite cannot age a token out without sleeping. Every use
+	// case in this service reads time through internal/platform/clock, and this is
+	// the seam that lets the HTTP layer do the same.
+	clk     clock.Clock
+	auth    Auth
+	tenancy Tenancy
 	// apiKeyCaller resolves a scoped token to its caller. Absent means the account
 	// routes are session-only and a token presented to one is refused.
 	apiKeyCaller APIKeyCaller
@@ -75,6 +86,19 @@ func WithReadinessTimeout(d time.Duration) Option {
 	}
 }
 
+// WithClock sets the instant the HTTP layer hands to the stores.
+//
+// It is only interesting to a test, and it is here rather than a package variable
+// for the reason every other dependency is: a mutable global clock is a way for
+// one test to age another test's credential. The default is the real clock.
+func WithClock(c clock.Clock) Option {
+	return func(o *options) {
+		if c != nil {
+			o.clk = c
+		}
+	}
+}
+
 // New builds the service router. With no checks there is nothing to probe, so
 // readiness succeeds with "deps":"none" — the shape v0 ships in, before
 // DATABASE_URL exists. With no Auth there are no /v1 routes at all, so a process
@@ -83,6 +107,9 @@ func New(checks []Check, opts ...Option) http.Handler {
 	o := options{
 		logger:           slog.New(slog.DiscardHandler),
 		readinessTimeout: DefaultReadinessTimeout,
+		// The real clock, and it is a value rather than a package variable so two
+		// servers in one test binary cannot age each other's credentials.
+		clk: clock.System{},
 	}
 	for _, opt := range opts {
 		opt(&o)

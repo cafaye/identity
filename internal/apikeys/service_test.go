@@ -51,6 +51,11 @@ func realTenancy(pool *pgxpool.Pool, clk clock.Clock) *accounts.Service {
 		db.TxRunner{Pool: pool},
 		accounts.NewStore(pool),
 		outbox.NewStore(pool),
+		// The REAL revoker, which is what cmd/identity hands it. A nil here would
+		// leave the "a removal revokes the member's credentials" rule untested in
+		// this package, and it is the rule this package's whole authority model
+		// depends on.
+		NewStore(pool),
 		clk,
 		db.Direct{Pool: pool},
 	)
