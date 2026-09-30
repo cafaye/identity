@@ -32,8 +32,16 @@ type options struct {
 	readinessTimeout time.Duration
 	auth             Auth
 	tenancy          Tenancy
-	oidc             OIDC
-	oidcClients      OIDCClients
+	// apiKeyCaller resolves a scoped token to its caller. Absent means the account
+	// routes are session-only and a token presented to one is refused.
+	apiKeyCaller APIKeyCaller
+	// apiKeys is the scoped-token surface. It is separate from oidcClients because
+	// it is a different credential with a different lifetime and a different
+	// storage, and a deployment with one configured and not the other is a real one:
+	// a first-party machine credential has no key to sign with.
+	apiKeys     APIKeys
+	oidc        OIDC
+	oidcClients OIDCClients
 	// mfa is the MANAGEMENT surface — the routes that read and write a TOTP secret.
 	// It needs MFA_ENCRYPTION_KEY and is absent without it.
 	//

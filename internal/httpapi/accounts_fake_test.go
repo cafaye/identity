@@ -101,11 +101,22 @@ func (f *fakeTenancy) ListMine(_ context.Context, userID id.UUID) ([]accounts.Me
 	return f.list, nil
 }
 
+// Get answers for the account id it was ASKED ABOUT.
+//
+// Echoing the requested id rather than returning a fixed row is what makes the
+// double honest: a handler that put the account in the path and a handler that put
+// some other account there produce different ids here, so a test asserting "the use
+// case was given the account from the path" can actually fail. A double returning
+// one canned account would pass that assertion whatever the handler did.
 func (f *fakeTenancy) Get(_ context.Context, accountID, userID id.UUID) (accounts.Account, accounts.Role, error) {
 	if f.getErr != nil {
 		return accounts.Account{}, "", f.getErr
 	}
-	return f.account, f.role, nil
+	account := f.account
+	if account.ID.IsZero() {
+		account.ID = accountID
+	}
+	return account, f.role, nil
 }
 
 func (f *fakeTenancy) Members(_ context.Context, _ id.UUID) ([]accounts.MemberSummary, error) {
