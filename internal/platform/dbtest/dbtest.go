@@ -75,7 +75,9 @@ func Pool(t *testing.T) *pgxpool.Pool {
 //
 // It is built from the test's name so a failing test is greppable in the table,
 // plus random bytes so a second run against the same database does not collide
-// with the first. The result satisfies users.ValidateEmail.
+// with the first. The result satisfies users.ValidateEmail — including the RFC
+// 5321 limit of 64 characters on the local part, which a long test name will
+// otherwise blow through.
 func UniqueEmail(t *testing.T) string {
 	t.Helper()
 
@@ -84,8 +86,8 @@ func UniqueEmail(t *testing.T) string {
 		t.Fatalf("generating a unique test email: %v", err)
 	}
 
-	// The local part has to survive the users.email_format rules, so anything
-	// that is not a lowercase letter or digit becomes a dash.
+	// The local part has to survive the users.email rules, so anything that is not
+	// a lowercase letter or digit becomes a dash.
 	label := strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
@@ -96,8 +98,15 @@ func UniqueEmail(t *testing.T) string {
 			return '-'
 		}
 	}, t.Name())
+	label = strings.Trim(label, "-")
 
-	return fmt.Sprintf("%s-%s@example.com", strings.Trim(label, "-"), hex.EncodeToString(noise[:]))
+	// 64 is the local-part ceiling; 12 is the hex noise; one is the separator.
+	if len(label) > 64-12-1 {
+		label = label[:64-12-1]
+		label = strings.TrimRight(label, "-")
+	}
+
+	return fmt.Sprintf("%s-%s@example.com", label, hex.EncodeToString(noise[:]))
 }
 
 // Reset truncates every table this service owns.

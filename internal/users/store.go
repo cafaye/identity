@@ -142,14 +142,23 @@ func scanOne(row interface{ Scan(...any) error }) (User, error) {
 	return u, nil
 }
 
-// isEmailTaken reports whether err is the unique violation on users_email_key.
+// isEmailTaken reports whether err is a unique violation raised by the email
+// index.
 //
-// The constraint name is checked as well as the code so that a unique violation
-// raised by some other index is not misreported as a duplicate address.
+// It matches on the SQLSTATE alone, and that is load-bearing rather than lazy: the
+// users table has exactly one unique index, on email, so 23505 can only mean the
+// address is taken. Matching the constraint *name* instead would be more precise
+// in principle and is in practice brittle — Postgres renames an index when a table
+// is cloned with LIKE ... INCLUDING INDEXES, which is exactly what the integration
+// tests do, and a future migration could rename it legitimately. A silently
+// mis-detected duplicate turns a 409 into a 500.
+//
+// TestUsersHasExactlyOneUniqueIndex fails if a second unique index is ever added,
+// which is the point at which this has to become precise.
 func isEmailTaken(err error) bool {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
 		return false
 	}
-	return pgErr.Code == uniqueViolation && pgErr.ConstraintName == "users_email_key"
+	return pgErr.Code == uniqueViolation
 }

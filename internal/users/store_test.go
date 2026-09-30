@@ -247,6 +247,49 @@ func TestStoreClearFailures(t *testing.T) {
 	}
 }
 
+// isEmailTaken matches on the SQLSTATE alone, which is only sound while email is
+// the table's only *application-level* unique index. This test is what makes that
+// assumption self-enforcing: add a second one and this fails, at which point the
+// detection has to start distinguishing them.
+//
+// The primary key is excluded. It is also a unique index and also raises 23505,
+// but it covers a server-generated UUID whose collision probability is around
+// 2^-122 — reporting one as "that address is taken" is a confusing message for an
+// event that will not happen, and refusing to report it at all would be worse.
+func TestUsersHasExactlyOneApplicationUniqueIndexAndItIsOnEmail(t *testing.T) {
+	pool := dbtest.Pool(t)
+
+	rows, err := pool.Query(context.Background(), `
+		SELECT a.attname
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+		WHERE i.indrelid = 'users'::regclass AND i.indisunique AND NOT i.indisprimary
+		ORDER BY a.attname`)
+	if err != nil {
+		t.Fatalf("listing unique indexes on users: %v", err)
+	}
+	defer rows.Close()
+
+	var columns []string
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			t.Fatalf("scanning an index column: %v", err)
+		}
+		columns = append(columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("reading the index list: %v", err)
+	}
+
+	if len(columns) != 1 || columns[0] != "email" {
+		t.Errorf("users has application-level unique indexes on %v, want exactly one on "+
+			"email. isEmailTaken matches on SQLSTATE 23505 alone and can no longer tell a "+
+			"duplicate address from a violation of a new constraint", columns)
+	}
+}
+
 func TestStoreCreateInsideATransactionRollsBackWithIt(t *testing.T) {
 	pool := dbtest.Pool(t)
 	store := NewStore(pool)
