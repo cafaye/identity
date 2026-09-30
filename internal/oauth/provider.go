@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+
+	"golang.org/x/oauth2"
 )
 
 // Provider names. These are the two values of the `oauth_provider` enum in
@@ -63,9 +65,9 @@ type Provider struct {
 	// address is private, and /user/emails is the documented way to get it.
 	// Empty for providers that always return the address on the identity call.
 	EmailsURL string
-	// ExtraAuthorizeParams are provider-specific and are appended to every
+	// ExtraAuthorizeOptions are provider-specific parameters appended to every
 	// authorize URL. There is exactly one, and why it exists is in Google().
-	ExtraAuthorizeParams url.Values
+	ExtraAuthorizeOptions []oauth2.AuthCodeOption
 }
 
 // Google returns the provider definition with this service's endpoint choices.
@@ -87,7 +89,7 @@ func Google() Provider {
 		// request asks for offline access. Without this, refresh_token is NULL on
 		// every account forever, and the stored credential dies an hour later with
 		// nothing to renew it.
-		ExtraAuthorizeParams: url.Values{"access_type": {"offline"}},
+		ExtraAuthorizeOptions: []oauth2.AuthCodeOption{oauth2.AccessTypeOffline},
 	}
 }
 
@@ -111,22 +113,31 @@ func GitHub() Provider {
 // the exchange is refused. prompt/response_type/scope are the provider's own
 // requirements.
 func (p Provider) AuthCodeURL(state, redirectURI string) string {
-	query := url.Values{
-		"client_id":     {p.ClientID},
-		"redirect_uri":  {redirectURI},
-		"response_type": {"code"},
-		"state":         {state},
-		"scope":         {strings.Join(p.Scopes, " ")},
-	}
-	for name, values := range p.ExtraAuthorizeParams {
-		for _, value := range values {
-			query.Add(name, value)
-		}
-	}
+	conf := p.oauth2Config()
+	conf.RedirectURL = redirectURI
 
-	// url.Values.Encode sorts, so the URL is stable for a given state. That makes
-	// it assertable and makes provider-side logs comparable.
-	return p.AuthorizeURL + "?" + query.Encode()
+	// The URL is built by golang.org/x/oauth2 rather than assembled here, so the
+	// authorize step and the exchange step are guaranteed to agree about the
+	// client, the scopes and the endpoint. Two implementations of "what the
+	// provider expects" in one service is a bug waiting for the one provider
+	// whose authorize parameters differ from its token parameters.
+	return conf.AuthCodeURL(state, p.ExtraAuthorizeOptions...)
+}
+
+// oauth2Config is the provider expressed as an x/oauth2 configuration. It is
+// unexported because callers outside this package have no business constructing
+// one: they should call AuthCodeURL or Client.Exchange, both of which set the
+// fields that matter.
+func (p Provider) oauth2Config() *oauth2.Config {
+	return &oauth2.Config{
+		ClientID:     p.ClientID,
+		ClientSecret: p.ClientSecret,
+		Scopes:       p.Scopes,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  p.AuthorizeURL,
+			TokenURL: p.TokenURL,
+		},
+	}
 }
 
 // RedirectURI is the callback URL this provider must send the browser back to.
