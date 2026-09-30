@@ -213,3 +213,32 @@ owner:
 # carries `account_id`, and one with no account is answered `{"active": false}`
 # rather than being issued a subject to guess a tenancy key from.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# DECISION NEEDED — twelve operations are served and written down in no document.
+#
+# Open as D1 in this repository's DECISIONS.md. Recorded here as well because
+# `exposes.api` names openapi/v1.yaml, and the first thing a consumer reads is
+# this file: it promises a document describes this service's HTTP surface, and
+# for twelve operations it does not.
+#
+# WHAT IS MISSING, read out of the router's own chi.Walk rather than off a list:
+#
+#   - the ten tenancy operations: POST and GET /v1/accounts, GET, PATCH and
+#     DELETE /v1/accounts/{account_id}, GET /v1/accounts/{account_id}/members,
+#     POST /v1/accounts/{account_id}/invitations, PATCH and DELETE
+#     /v1/accounts/{account_id}/members/{user_id}, POST /v1/invitations/accept.
+#   - POST /oidc/authorize and POST /oidc/userinfo, which openid/openid.yaml
+#     leaves out although registerOIDCRoutes mounts them deliberately.
+#
+# They are gated, scope-checked and in the authorization matrix. They are simply
+# not in a contract, so a client generated from either document has no method for
+# any of them. That is what the tripwire in internal/httpapi/openapi_drift_test.go
+# reports, and it is pinned in a list called knownDrift — named for what it is,
+# not for what it excuses — which cannot grow and cannot be emptied.
+#
+# THIS SERVICE DOES NOT PICK A SIDE. Documenting them is a contract change and
+# belongs in its own packet; ruling them out of the contract has to be recorded
+# in the document and the README, not in a list. See D1 for the two calls and
+# the cost of each.
+# ---------------------------------------------------------------------------
