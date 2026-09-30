@@ -169,6 +169,25 @@ var accountRouteScopes = map[string]string{
 	"GET /v1/accounts/{accountID}/oidc-clients":               apikeys.ScopeOIDCClientsWrite,
 	"GET /v1/accounts/{accountID}/oidc-clients/{clientID}":    apikeys.ScopeOIDCClientsWrite,
 	"DELETE /v1/accounts/{accountID}/oidc-clients/{clientID}": apikeys.ScopeOIDCClientsWrite,
+
+	// The admin surface. Two scopes, and NOT one scope called `admin` — the
+	// vocabulary's own comment rules that name out, because a category name is
+	// where a wildcard grows back. What a token can do on this surface is exactly
+	// what it is granted here.
+	//
+	// Reading the trail is its own scope rather than accounts:read because the two
+	// answer different questions, and a record of authority being used over time
+	// is a different sensitivity from the account's current shape.
+	//
+	// The three rows are the whole surface, and that is the privilege boundary in
+	// code: a token holding neither scope reaches no admin route, and a token
+	// holding both can revoke invitations and read the trail and nothing else in
+	// this service. There is no fourth row to add by accident, because a new row
+	// would be a new scope and a new scope is a decision somebody has to make in
+	// internal/apikeys.
+	"GET /v1/accounts/{accountID}/admin/audit-log":                     apikeys.ScopeAuditLogRead,
+	"DELETE /v1/accounts/{accountID}/admin/invitations/{invitationID}": apikeys.ScopeAccountInvitationsWrite,
+	"POST /v1/accounts/{accountID}/admin/invitation-revocations":       apikeys.ScopeAccountInvitationsWrite,
 }
 
 // scopeRequiredBy returns the scope a token needs for the route it reached, or ""
@@ -572,6 +591,18 @@ func (o options) registerTenancyRoutes(r chiRouter) {
 	// is refused: the credential surface is the one surface a credential may not
 	// manage. See the note in apikeys.go.
 	o.registerAPIKeyRoutes(r)
+
+	// And so do the admin routes, which is why this is a call from HERE rather
+	// than from registerRoutes: an admin action is an action on an account, so
+	// these routes are account-scoped, so they belong in the registrar that
+	// TestEveryMountedRouteIsAnAccountRoute and TestEveryRouteIsInTheMatrix walk.
+	// Mounted anywhere else, three account routes would sit outside both checks.
+	//
+	// They are in accountRouteScopes, unlike the api keys above, because a token
+	// IS the right credential for them: the admin surface refuses sessions
+	// outright, so an admin action is always performed by a machine credential
+	// that the audit record can name.
+	o.registerAdminRoutes(r)
 }
 
 // handleCreateAccount provisions an account and makes the caller its owner.

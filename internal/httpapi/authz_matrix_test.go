@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/cafaye/identity/internal/accounts"
+	"github.com/cafaye/identity/internal/admin"
 	"github.com/cafaye/identity/internal/apikeys"
 	"github.com/cafaye/identity/internal/oidc"
 	"github.com/cafaye/identity/internal/outbox"
@@ -101,18 +102,31 @@ type matrixEndpoint struct {
 	// being shared between cases.
 	body func(f *matrixFixture) string
 	// min is the route's minimum role, restated here so the expectations are
-	// derived from the route rather than guessed. TestRouteMinimumsMatchTheRouter
-	// is what keeps this honest.
+	// derived from the route rather than guessed.
+	//
+	// A PREVIOUS VERSION OF THIS COMMENT said TestRouteMinimumsMatchTheRouter kept
+	// it honest. That test does not exist and cannot: chi's tree records the
+	// handler, and the minimum is a CLOSURE ARGUMENT to requireAccountRole, so
+	// there is nothing in the walk to compare this against. The claim was a
+	// promise to a check nobody wrote, which is worse than no comment.
+	//
+	// What actually keeps it honest is that the minimums are enforced by the REAL
+	// router in these tests — fakeTenancy is the only double, and requireAccountRole
+	// is the production middleware — so a cell expecting 403 for a member on an
+	// admin-minimum route fails the day somebody lowers that route's minimum. And
+	// for the three admin routes, whose expectations are all 403 regardless of
+	// role, the minimums are pinned separately by TestTheBulkRouteIsOwnerOnly.
 	min accounts.Role
 }
 
 // path renders the concrete request path for a case.
-func (e matrixEndpoint) path(accountID, memberID, clientID, keyID id.UUID) string {
+func (e matrixEndpoint) path(accountID, memberID, clientID, keyID, invitationID id.UUID) string {
 	out := e.pattern
 	out = strings.ReplaceAll(out, "{accountID}", accountID.String())
 	out = strings.ReplaceAll(out, "{userID}", memberID.String())
 	out = strings.ReplaceAll(out, "{clientID}", clientID.String())
 	out = strings.ReplaceAll(out, "{keyID}", keyID.String())
+	out = strings.ReplaceAll(out, "{invitationID}", invitationID.String())
 	return out
 }
 
@@ -145,6 +159,13 @@ func matrixEndpoints() []matrixEndpoint {
 			pattern: "/v1/invitations/accept", unscoped: true, success: http.StatusOK,
 			body: func(f *matrixFixture) string { return `{"token":"` + f.pendingToken + `"}` },
 			expect: func(column actor) (int, string) {
+				// The anonymous column is a 401 and it is stated here rather than
+				// inherited, because the authentication check in expectedStatus now
+				// runs AFTER an override. The route resolves the caller from a
+				// session before anything else, so 401 is what the service answers.
+				if column.token == "" {
+					return http.StatusUnauthorized, CodeUnauthorized
+				}
 				// The token names the target account, and the member, admin and
 				// owner columns are already in it. A second invitation for an
 				// account you are already in is a 409, and it is one no amount of
@@ -251,7 +272,88 @@ func matrixEndpoints() []matrixEndpoint {
 			name: "revoke an api key", method: http.MethodDelete,
 			pattern: "/v1/accounts/{accountID}/api-keys/{keyID}", min: accounts.RoleOwner, success: http.StatusNoContent,
 		},
+
+		// THE ADMIN SURFACE. Three rows, and the columns are not the same as
+		// everywhere else on this table, which is the whole of what makes them
+		// interesting.
+		//
+		// These routes are TOKEN-ONLY, so every one of them answers 403 to the
+		// session columns — and that is a row in the table that reads like a
+		// failure. It is not: the matrix's six columns are all SESSIONS, so on this
+		// surface every one of them is refused, and the success status is asserted
+		// by admin_test.go's token fixtures instead.
+		//
+		// INCLUDING THE ANONYMOUS COLUMN, which is 403 here and 401 on every other
+		// row of this table. requireAdminToken runs outside requireAccountRole, so
+		// "no credential" is answered as "not the right kind of caller" on a
+		// surface whose authentication story is entirely about credential kind. See
+		// adminRouteRefused.
+		//
+		// WHICH IS THE POINT, and it is worth being explicit that the matrix has a
+		// hole rather than pretending otherwise: the authorization this packet adds
+		// is not "which role may do this", it is "which CREDENTIAL may do this",
+		// and the six columns are six of the same credential. The role minimums are
+		// still asserted below — TestTheAdminRouteMinimumsMatchTheRouter reads them
+		// off the router rather than off this table, so the two cannot disagree —
+		// but the session/token axis is the one this table cannot express, and
+		// TestNoAdminRouteIsReachableWithASessionAlone and
+		// TestAnAdminTokenHoldingNeitherScopeIsRefused are what cover it.
+		//
+		// So the three rows here exist to keep the completeness check honest, not to
+		// carry the authorization claims.
+		{
+			name: "read the admin audit log", method: http.MethodGet,
+			pattern: "/v1/accounts/{accountID}/admin/audit-log", min: accounts.RoleAdmin, success: http.StatusOK,
+			expect: adminRouteRefused,
+		},
+		{
+			name: "revoke one pending invitation", method: http.MethodDelete,
+			pattern: "/v1/accounts/{accountID}/admin/invitations/{invitationID}",
+			min:     accounts.RoleOwner, success: http.StatusNoContent,
+			expect: adminRouteRefused,
+		},
+		{
+			name: "bulk revoke pending invitations", method: http.MethodPost,
+			pattern: "/v1/accounts/{accountID}/admin/invitation-revocations",
+			min:     accounts.RoleOwner, success: http.StatusOK,
+			body: func(f *matrixFixture) string {
+				return `{"invitation_ids":["` + f.pendingInvitationID.String() + `"],"confirm":true}`
+			},
+			expect: adminRouteRefused,
+		},
 	}
+}
+
+// adminRouteRefused is what every matrix column expects of an admin route, and
+// it says why in one place.
+//
+// A SESSION reaches none of the three, whatever their role, because the admin
+// surface is token-only. A function rather than six tabulated cells because the
+// columns in this table are all the same credential, and six identical answers
+// written out longhand would read as six independent findings when they are one.
+//
+// THE ANONYMOUS COLUMN IS 401, NOT 403, and the reason is that `expectedStatus`
+// reaches its authentication check before this function is ever called: a
+// credential-less request is a 401 on every route in this service without
+// exception, because "who are you" is the one decision no endpoint overrides.
+// The three admin rows therefore inherit that answer rather than restating it —
+// which is why this function does not need to look at the column at all.
+// It takes the column and ignores it, and the parameter is there to make the
+// signature match the other `expect` funcs in this table.
+//
+// The ANONYMOUS column is the interesting one and it deserves the reason, because
+// it is not 401 and `expectedStatus`'s comment says authentication is "the one
+// decision no endpoint overrides". That holds where the credential is resolved
+// FIRST. On the admin surface the credential KIND is resolved first, by
+// requireAdminToken, which runs OUTSIDE requireAccountRole — so a request with no
+// credential at all is refused there as a wrong-kind-of-caller, and answers 403.
+//
+// The value of recording that rather than smoothing it away: this table is
+// generated from the router, and a cell that said 401 would have been a false
+// claim about a route whose whole authentication story is "a scoped api key". An
+// earlier version of the comment above these rows asserted 401 and was wrong.
+func adminRouteRefused(_ actor) (int, string) {
+	return http.StatusForbidden, CodeForbidden
 }
 
 // matrixFixture is the world the matrix runs in: one target account, and one
@@ -297,6 +399,11 @@ type matrixFixture struct {
 	// reason clientID is: the revoke row destroys what it is given, so one shared
 	// row would be gone by the second column.
 	keyID id.UUID
+	// pendingInvitationID is a fresh, unaccepted invitation in the target account,
+	// for the admin surface's rows. Per case for the same reason pendingToken is:
+	// the revoke row consumes it, so a shared one would be a 409 in every column
+	// but the first.
+	pendingInvitationID id.UUID
 
 	// One actor per column. A fresh target account is built per case, because
 	// one of the cases is "delete the account" and it would take the fixture with
@@ -321,6 +428,18 @@ func newMatrixFixture(t *testing.T) *matrixFixture {
 	authSvc := authServiceFor(pool, clk)
 	clients := matrixOIDCClients(t, pool, clk)
 	keys := matrixAPIKeys(pool, clk, tenancy)
+	// The admin surface, over the same private schema. The double is a real
+	// Service rather than a fake so the three admin rows exercise the real
+	// transaction and the real SQL — and so the 403s those rows expect are
+	// produced by the real requireAdminToken rather than by a double's opinion of
+	// it.
+	adminSvc := admin.NewService(
+		db.TxRunner{Pool: pool},
+		admin.NewStore(pool),
+		accounts.NewStore(pool),
+		db.Direct{Pool: pool},
+		clk,
+	)
 
 	handler := New(nil,
 		WithAuth(authSvc),
@@ -329,6 +448,12 @@ func newMatrixFixture(t *testing.T) *matrixFixture {
 		WithOIDC(newFakeOIDC()),
 		WithAPIKeys(keys),
 		WithAPIKeyCaller(keys),
+		// Without this the admin routes are not mounted and the three admin rows
+		// see a 404 — which is exactly what they reported before it was added.
+		// That is not a fixture bug being papered over: the rows assert that a
+		// SESSION is refused, and the surface has to exist for there to be
+		// anything to refuse.
+		WithAdmin(adminSvc),
 		WithLogger(slogLogger(&recordingHandler{})),
 	)
 
@@ -475,6 +600,23 @@ func (f *matrixFixture) buildTarget(t *testing.T) {
 	}
 	f.pendingToken = invited.Token
 
+	// A SECOND pending invitation for the admin surface's rows, and a second one
+	// rather than a reuse of the one above because the accept route CONSUMES it:
+	// an invitation is accepted by setting accepted_at, and the admin route refuses
+	// an accepted invitation with a 409. One shared row would make the accept row
+	// and the admin row contradict each other, and the failure would look like an
+	// authorization bug in one of them.
+	adminInvite, err := realTenancy(f.pool, f.clock).Invite(t.Context(), accounts.InviteInput{
+		AccountID: f.accountID,
+		Email:     dbtest.UniqueEmail(t),
+		Role:      accounts.RoleMember,
+		InvitedBy: f.owner.user,
+	})
+	if err != nil {
+		t.Fatalf("creating the admin surface's pending invitation: %v", err)
+	}
+	f.pendingInvitationID = adminInvite.Invitation.ID
+
 	// A fresh api key for the revoke row, minted through the real use case so the
 	// row in the matrix is one the service would have written — and through the
 	// OWNER's session semantics (the use case asks for an owner, which the owner
@@ -545,7 +687,7 @@ func TestAuthorizationMatrix(t *testing.T) {
 					rec := f.send(t, endpoint, column)
 					if rec.Code != tt.wantStatus {
 						t.Fatalf("%s %s as %s = %d, want %d\nbody: %s",
-							endpoint.method, endpoint.path(f.accountID, f.memberID, f.clientID, f.keyID),
+							endpoint.method, endpoint.path(f.accountID, f.memberID, f.clientID, f.keyID, f.pendingInvitationID),
 							column.name, rec.Code, tt.wantStatus, rec.Body)
 					}
 					if tt.wantProblemCode == "" {
@@ -568,14 +710,26 @@ func TestAuthorizationMatrix(t *testing.T) {
 // else gets what the route does" cannot drift from the route's own minimum,
 // because it reads it. A hand-written cell can, and would.
 func expectedStatus(_ *testing.T, endpoint matrixEndpoint, column actor) (status int, problemCode string) {
-	// Authentication is the one decision no endpoint overrides: a route with no
-	// usable credential is a 401 whatever the body says, and the override below
-	// never sees an unauthenticated column.
-	if column.token == "" {
-		return http.StatusUnauthorized, CodeUnauthorized
-	}
+	// The endpoint's own override comes FIRST, before the authentication check
+	// below.
+	//
+	// It used to come second, on the grounds that "authentication is the one
+	// decision no endpoint overrides". That is true where the credential is
+	// resolved before anything else — but on the admin surface the credential
+	// KIND is resolved first, by requireAdminToken, which runs outside
+	// requireAccountRole. A request with no credential is therefore refused there
+	// as a wrong-kind-of-caller, and the router really does answer 403.
+	//
+	// The order matters because the check below is unconditional and was silently
+	// overriding three rows with an answer the service does not give. An override
+	// a test cannot reach is not an override, so the two are swapped: a row that
+	// needs the 401 answers it in its own `expect`, and every row that does not
+	// set one still gets it from here.
 	if endpoint.expect != nil {
 		return endpoint.expect(column)
+	}
+	if column.token == "" {
+		return http.StatusUnauthorized, CodeUnauthorized
 	}
 
 	switch {
@@ -624,7 +778,7 @@ func (f *matrixFixture) send(t *testing.T, endpoint matrixEndpoint, column actor
 		body = endpoint.body(f)
 	}
 
-	req := httptest.NewRequest(endpoint.method, endpoint.path(f.accountID, f.memberID, f.clientID, f.keyID), strings.NewReader(body))
+	req := httptest.NewRequest(endpoint.method, endpoint.path(f.accountID, f.memberID, f.clientID, f.keyID, f.pendingInvitationID), strings.NewReader(body))
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -676,6 +830,15 @@ func mountedAccountRoutes() []string {
 		auth:        newFakeAuth(),
 		oidcClients: newFakeOIDCClients(),
 		apiKeys:     newFakeAPIKeys(),
+		// admin and apiKeyCaller are set for the same reason apiKeys is, and the
+		// first of them was found the hard way: with this field absent,
+		// registerAdminRoutes returned early, the three admin routes were missing
+		// from this walk, and TestEveryRouteIsInTheMatrix passed with no admin row
+		// required. A walk of a router missing routes reports the matrix as
+		// complete when it is silent about a whole surface. See
+		// router_walk_test.go.
+		admin:        newFakeAdmin(),
+		apiKeyCaller: newFakeAPIKeyCaller(users.User{ID: id.MustNew()}, apikeys.Key{ID: id.MustNew(), AccountID: id.MustNew()}),
 	}
 	opts.registerTenancyRoutes(r)
 

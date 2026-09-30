@@ -239,6 +239,25 @@ func servedRoutes(t *testing.T) map[operationKey]string {
 		apiKeys:      newFakeAPIKeys(),
 		mfa:          newFakeMFAManage(),
 		introspector: newFakeIntrospector(),
+		// admin is here because a route that is not in this struct literal is a
+		// route this walk does not see, and a check that cannot see a route cannot
+		// report it as undocumented.
+		//
+		// IT IS NOT A HYPOTHETICAL. Adding the admin surface with the field left
+		// out of this literal made TestEveryServedRouteIsDocumentedOrNamed, this
+		// file's own finding, PASS while three undocumented operations were
+		// mounted — because registerAdminRoutes returns early when the service is
+		// absent, exactly like every other conditional surface here. The check went
+		// green by not checking, which is the one outcome AGENTS.md names as the
+		// failure mode this file exists to prevent, and it happened to the check
+		// that was written to catch precisely that.
+		//
+		// The list above is therefore a completeness obligation, not a
+		// convenience. TestEveryConditionalSurfaceIsVisibleToTheWalk in
+		// router_walk_test.go holds it: it compares this literal against the option
+		// struct's own field list, so the next conditional surface added to
+		// internal/httpapi fails there until somebody adds its double to this walk.
+		admin: newFakeAdmin(),
 	}
 
 	served := map[operationKey]string{}
@@ -332,8 +351,20 @@ func TestEveryDocumentedOperationIsServed(t *testing.T) {
 // rather than documented the routes. The only legal change is a shrink, and a
 // shrink happens by fixing a route, not by editing a list.
 func TestKnownDriftIsExactlyTheRoutesItClaimsToBe(t *testing.T) {
-	// The count this packet recorded. Twelve: ten tenancy operations and the two
+	// The count this file records. Twelve: ten tenancy operations and the two
 	// OIDC POSTs.
+	//
+	// UNCHANGED BY THE ADMIN SURFACE, and the fact that it is worth a comment is
+	// the point. Packet identity-11 added three operations to this service's
+	// router and the answer was to DOCUMENT them — in openapi/v1.yaml, with
+	// operationIds and full request and response schemas — rather than to add
+	// three entries here. The pin below did not move, which is the only honest
+	// way this list can be smaller than the number of undocumented routes that
+	// were once in it.
+	//
+	// If a future packet adds an admin operation and finds itself tempted to bump
+	// this constant, the tripwire is telling the truth and the constant is the
+	// lie. Document the route.
 	const want = 12
 
 	if len(knownDrift) == want {
@@ -465,9 +496,11 @@ func TestEveryOperationHasAnOperationIdAndNoOperationIdIsUsedTwice(t *testing.T)
 // `info.version` is pinned rather than derived: a test that read the version out
 // of the document and compared it with itself would pass every document ever
 // written, including a regenerated one, and the whole point of the field is that
-// a consumer has to be able to notice it move. 1.3.0 is the scoped-API-token
-// build — identity-08's four operations. This packet adds no operations, so it
-// does not bump it; a packet that does must move this pin in the same commit.
+// a consumer has to be able to notice it move.
+//
+// 1.4.0 is the admin surface — identity-11's three operations under the `admin`
+// tag. It is a non-breaking addition, which is what core's sync rule asks for, and
+// therefore the only thing that moved.
 func TestTheDocumentIsOpenAPI31AndCarriesAVersion(t *testing.T) {
 	doc, err := readOpenAPIDocument(v1Document)
 	if err != nil {
@@ -480,7 +513,7 @@ func TestTheDocumentIsOpenAPI31AndCarriesAVersion(t *testing.T) {
 			v1Document, doc.SpecVersion)
 	}
 
-	const want = "1.3.0"
+	const want = "1.4.0"
 	if doc.InfoVersion != want {
 		t.Errorf("%s declares info.version %q, not %q. core's sync rule is that the /v1 "+
 			"prefix says which contract and this says which build of it, and a non-breaking "+

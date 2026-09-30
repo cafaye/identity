@@ -211,6 +211,17 @@ func TestEveryScopeIsWiredToARoute(t *testing.T) {
 			"GET /v1/accounts/{accountID}/oidc-clients/{clientID}",
 			"DELETE /v1/accounts/{accountID}/oidc-clients/{clientID}",
 		},
+		// The admin surface's two scopes. Listed here because the test's claim is
+		// that a scope in the vocabulary is enforced somewhere, and these were
+		// added to the vocabulary with their routes in the same commit — which is
+		// the only order in which the claim stays true.
+		ScopeAuditLogRead: {
+			"GET /v1/accounts/{accountID}/admin/audit-log",
+		},
+		ScopeAccountInvitationsWrite: {
+			"DELETE /v1/accounts/{accountID}/admin/invitations/{invitationID}",
+			"POST /v1/accounts/{accountID}/admin/invitation-revocations",
+		},
 	}
 
 	if len(want) != len(AllScopes()) {

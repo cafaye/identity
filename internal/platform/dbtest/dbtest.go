@@ -122,7 +122,7 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if _, err := pool.Exec(ctx, `TRUNCATE TABLE api_keys, mfa_challenges, mfa_used_totp_steps, mfa_recovery_codes, mfa_credentials, oidc_access_tokens, oidc_auth_requests, oidc_clients, outbox_events, connected_accounts, sessions, account_invitations, account_users, accounts, users CASCADE`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE account_audit_log, api_keys, mfa_challenges, mfa_used_totp_steps, mfa_recovery_codes, mfa_credentials, oidc_access_tokens, oidc_auth_requests, oidc_clients, outbox_events, connected_accounts, sessions, account_invitations, account_users, accounts, users CASCADE`); err != nil {
 		t.Fatalf("truncating: %v", err)
 	}
 }
@@ -150,7 +150,9 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 // either, and 00011 added api_keys, which is a text[] and two timestamps. A
 // registration's grant types and scopes are text arrays validated in Go, because
 // those closed sets are a code fact — adding a scope must not be a migration. An
-// api key's scopes are validated in Go for exactly the same reason.
+// api key's scopes are validated in Go for exactly the same reason. 00012 added
+// account_audit_log, whose `action` column is the same kind of closed set and is
+// validated in Go for the same reason.
 func Schema(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
@@ -266,6 +268,26 @@ func Schema(t *testing.T) *pgxpool.Pool {
 			FOREIGN KEY (account_id) REFERENCES ` + schema + `.accounts (id) ON DELETE CASCADE`,
 		`ALTER TABLE ` + schema + `.api_keys ADD CONSTRAINT api_keys_revoked_by_fkey
 			FOREIGN KEY (revoked_by) REFERENCES ` + schema + `.users (id) ON DELETE RESTRICT`,
+		// The admin audit log. LIKE copies the table and its indexes, and NOT the
+		// trigger — LIKE does not copy triggers, so the append-only guarantee has to
+		// be re-established here or a test in a private schema would run against a
+		// table the production one can never UPDATE. It is created rather than
+		// copied so that the test which forces an audit write to fail can replace
+		// the function body with one that raises, in this schema only.
+		//
+		// The foreign keys are deliberately absent: 00012 declares none on this
+		// table, and adding them here would make the private schema stricter than
+		// production, which is the direction that hides a bug.
+		`CREATE TABLE ` + schema + `.account_audit_log (LIKE public.account_audit_log INCLUDING ALL)`,
+		`CREATE FUNCTION ` + schema + `.account_audit_log_is_append_only() RETURNS trigger AS $$
+			BEGIN
+				RAISE EXCEPTION 'account_audit_log is append-only; % is not permitted', TG_OP
+					USING ERRCODE = 'restrict_violation';
+			END;
+		$$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER account_audit_log_append_only
+			BEFORE UPDATE OR DELETE ON ` + schema + `.account_audit_log
+			FOR EACH ROW EXECUTE FUNCTION ` + schema + `.account_audit_log_is_append_only()`,
 	}
 	for _, stmt := range stmts {
 		if _, err := admin.Exec(ctx, stmt); err != nil {
