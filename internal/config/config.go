@@ -5,6 +5,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -48,7 +49,30 @@ var (
 	// the one thing they have to do, rather than being told their configuration is
 	// invalid.
 	ErrInsecureOIDCIssuer = errors.New("OIDC_ISSUER is http")
+
+	// ErrInvalidMFA means MFA_ENCRYPTION_KEY is present and unreadable. A startup
+	// failure rather than a degraded mode, for the reason the OIDC block is: a
+	// deployment whose key does not decode cannot seal a TOTP secret, so every
+	// enrolled user would be locked out at their second factor — and would find
+	// out at login, in front of somebody who thought they had a second factor.
+	ErrInvalidMFA = errors.New("invalid MFA_ENCRYPTION_KEY")
+
+	// ErrNoMFAEncryptionKey means MFA_ENCRYPTION_KEY is not set at all, which is a
+	// supported state: a deployment with no second factor. It is a distinct
+	// sentinel from ErrInvalidMFA because the two lead to completely different
+	// places — one starts up, the other mounts a reduced surface and logs why.
+	ErrNoMFAEncryptionKey = errors.New("MFA_ENCRYPTION_KEY is not configured")
 )
+
+// DefaultMFAIssuer is what an authenticator app displays next to the entry when
+// MFA_ISSUER is unset.
+//
+// "cafaye identity", with a space rather than a hyphen, because that is what a
+// person reads in a phone's authenticator next to the six digits and the clock.
+// It is also what the provisioning URI's issuer parameter carries, so changing it
+// changes what every future enrollment shows and nothing about the credentials
+// already confirmed.
+const DefaultMFAIssuer = "cafaye identity"
 
 // Config is the fully validated service configuration.
 type Config struct {
@@ -75,6 +99,42 @@ type Config struct {
 	// deployment is local" is a fact about the deployment and guessing it from
 	// the hostname would be a security decision made by a string match.
 	OIDCAllowInsecure bool
+
+	// MFAEncryptionKeyValue is the raw key a TOTP secret is sealed under, decoded
+	// from MFA_ENCRYPTION_KEY. Empty means "this deployment has no second factor",
+	// which is a supported state and reduces the surface rather than failing.
+	MFAEncryptionKeyValue []byte
+
+	// MFAIssuerLabel is what an authenticator app displays. It is NOT a secret, and
+	// changing it is harmless to every credential already confirmed.
+	MFAIssuerLabel string
+}
+
+// MFAEncryptionKey returns the configured key, or ErrNoMFAEncryptionKey.
+//
+// The decoding is base64url and then a length check, and BOTH failures are startup
+// errors. The length check belongs here rather than at the cipher because an
+// operator who pasted a 16-byte key has configured half the entropy they think they
+// have, and quietly stretching it would hide that until the day it matters.
+func (c Config) MFAEncryptionKey() ([]byte, error) {
+	if len(c.MFAEncryptionKeyValue) == 0 {
+		return nil, ErrNoMFAEncryptionKey
+	}
+	if len(c.MFAEncryptionKeyValue) != 32 {
+		return nil, fmt.Errorf("%w: it decodes to %d bytes, want exactly 32",
+			ErrInvalidMFA, len(c.MFAEncryptionKeyValue))
+	}
+	return c.MFAEncryptionKeyValue, nil
+}
+
+// MFAIssuer is the label an authenticator app displays next to the entry.
+func (c Config) MFAIssuer() string { return c.MFAIssuerLabel }
+
+// MFAEncryptionKeyConfigured reports whether this deployment has a usable key,
+// without revealing anything about it. main uses it to decide whether to mount the
+// MFA management routes.
+func (c Config) MFAEncryptionKeyConfigured() bool {
+	return len(c.MFAEncryptionKeyValue) == 32
 }
 
 // OIDCEnabled reports whether the OIDC surface is configured.
@@ -126,7 +186,48 @@ func Load(lookup Lookup) (Config, error) {
 		return Config{}, err
 	}
 
+	if err := cfg.loadMFA(lookup); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
+}
+
+// loadMFA reads the MFA block.
+//
+// The asymmetry with the OIDC block above is deliberate and is the whole of this
+// function: OIDC's three variables are all-or-nothing because a provider with an
+// issuer and no key is a broken provider, whereas MFA's single variable has a
+// SUPPORTED absent state — a deployment that has not turned a second factor on.
+//
+// That is the only thing absent means here. Present-but-unreadable is still a
+// startup failure, because a deployment that believes it has a key and has one
+// that does not decode would lock every enrolled user out at their second factor
+// and tell nobody why.
+//
+// MFA_ISSUER is the exception to "absent is supported": absent means the default
+// label, because it is a display string and not a secret, and a default is what a
+// display string wants.
+func (c *Config) loadMFA(lookup Lookup) error {
+	c.MFAIssuerLabel = DefaultMFAIssuer
+	if issuer := lookupValue(lookup, "MFA_ISSUER"); issuer != "" {
+		c.MFAIssuerLabel = issuer
+	}
+
+	encoded := lookupValue(lookup, "MFA_ENCRYPTION_KEY")
+	if encoded == "" {
+		return nil
+	}
+
+	// base64url, no padding — the same shape as every other secret this service
+	// takes, so an operator pasting from the same secret store as
+	// OIDC_SIGNING_KEY does not have to think about it.
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return fmt.Errorf("%w: it is not base64url: %v", ErrInvalidMFA, err)
+	}
+	c.MFAEncryptionKeyValue = decoded
+	return nil
 }
 
 // loadOIDC reads and validates the OIDC block.

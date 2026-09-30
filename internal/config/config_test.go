@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"log/slog"
+	"reflect"
 	"testing"
 )
 
@@ -120,7 +121,18 @@ func TestLoad(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load() unexpected error: %v", err)
 			}
-			if got != tt.want {
+			// The one field Load fills in on its own is MFAIssuerLabel, and it is
+			// set BEFORE the comparison rather than repeated in every table row: a
+			// default every case must carry is a default a new case will forget.
+			if tt.want.MFAIssuerLabel == "" {
+				tt.want.MFAIssuerLabel = DefaultMFAIssuer
+			}
+
+			// Compared field by field rather than with ==, because Config carries the
+			// decoded MFA key as a []byte and a struct containing a slice is not
+			// comparable. Saying so here is better than a test that stopped checking
+			// the struct the next time a key appeared in it.
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Load() = %+v, want %+v", got, tt.want)
 			}
 		})
@@ -134,8 +146,11 @@ func TestLoadNilLookupReturnsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(nil) unexpected error: %v", err)
 	}
-	want := Config{Port: DefaultPort, DatabaseURL: "", LogLevel: DefaultLogLevel}
-	if got != want {
+	// MFAIssuerLabel is the one field with a non-zero default: a display string,
+	// not a secret. It is asserted separately rather than folded into a comparable
+	// literal, because Config carries a []byte and is no longer comparable.
+	want := Config{Port: DefaultPort, DatabaseURL: "", LogLevel: DefaultLogLevel, MFAIssuerLabel: DefaultMFAIssuer}
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Load(nil) = %+v, want %+v", got, want)
 	}
 }

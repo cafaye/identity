@@ -23,6 +23,7 @@ import (
 	"github.com/cafaye/identity/internal/auth"
 	"github.com/cafaye/identity/internal/config"
 	"github.com/cafaye/identity/internal/httpapi"
+	"github.com/cafaye/identity/internal/mfa"
 	"github.com/cafaye/identity/internal/oidc"
 	"github.com/cafaye/identity/internal/outbox"
 	"github.com/cafaye/identity/internal/platform/clock"
@@ -103,9 +104,16 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 	}
 
 	opts := []httpapi.Option{httpapi.WithLogger(logger)}
-	authSvc, tenancy := buildAuth(pool, logger)
+	authSvc, tenancy, secondFactor, err := buildAuth(cfg, pool, logger)
+	if err != nil {
+		return nil, err
+	}
 	if authSvc != nil {
-		opts = append(opts, httpapi.WithAuth(authSvc), httpapi.WithTenancy(tenancy))
+		opts = append(opts,
+			httpapi.WithAuth(authSvc),
+			httpapi.WithTenancy(tenancy),
+			httpapi.WithMFA(secondFactor),
+		)
 	} else {
 		// Said out loud, because a process serving probes and no auth surface is a
 		// valid configuration and a surprising one.
@@ -149,9 +157,12 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 // outbox into nowhere, and a service that silently discards the events announcing
 // its own registrations is worse than one that has not started the loop. The NATS
 // connection is the next packet. See README.md, "Not built yet".
-func buildAuth(pool *pgxpool.Pool, logger *slog.Logger) (*auth.Service, *accounts.Service) {
+// It returns the MFA use cases alongside the auth ones because auth.Login cannot
+// work without them: a correct password must not mint a session for an account
+// that has a second factor, and the only way to know is to ask.
+func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*auth.Service, *accounts.Service, *mfa.Service, error) {
 	if pool == nil {
-		return nil, nil
+		return nil, nil, nil, nil
 	}
 
 	// One outbox store, shared. It is stateless apart from its pool, and two of
@@ -170,10 +181,52 @@ func buildAuth(pool *pgxpool.Pool, logger *slog.Logger) (*auth.Service, *account
 		db.Direct{Pool: pool},
 	)
 
+	// The second factor is built before auth for the reason the comment above says:
+	// auth takes it as a required dependency, so it has to exist before NewService
+	// is called.
+	//
+	// NO MFA_ENCRYPTION_KEY means the vault is mfa.Unavailable{}, never nil. Every
+	// path that reads or writes a secret fails with ErrNoVault, and the ENROLLMENT
+	// ROUTES ARE NOT MOUNTED — a user must not be talked into enrolling a factor
+	// this process could not later verify.
+	//
+	// The login path still works and still creates a challenge for users who
+	// enrolled elsewhere, because mfa.Enabled needs no key. That is the fail-closed
+	// direction: such a user is refused rather than let in on their password.
+	// A wrong key is a startup failure and not a warning: an operator who
+	// configured a 16-byte key believes they have 128 bits of entropy protecting
+	// every second factor on the platform, and they do not.
+	vault, err := buildMFASecret(cfg, logger)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	secondFactor := mfa.NewService(
+		db.TxRunner{Pool: pool},
+		db.Direct{Pool: pool},
+		mfa.NewStore(pool),
+		events,
+		sessions.NewStore(pool),
+		vault,
+		clock.System{},
+		cfg.MFAIssuer(),
+	)
+	if _, unusable := vault.(mfa.Unavailable); unusable {
+		logger.Warn("MFA_ENCRYPTION_KEY is not configured; the MFA management routes are not mounted " +
+			"and this process cannot verify a second factor for anybody")
+	} else {
+		logger.Info("multi-factor authentication is available",
+			"issuer", cfg.MFAIssuer(),
+			"period_seconds", int(mfa.Period.Seconds()),
+			"digits", mfa.Digits,
+			"skew_steps", mfa.SkewSteps,
+		)
+	}
+
 	authSvc := auth.NewService(
 		// Registration's user row, personal account, owner membership and two
-		// events, and login's session and cleared failure counter, are each one
-		// transaction.
+		// events; login's session and cleared failure counter; and the
+		// second-factor login's session, challenge consumption and two cleared
+		// counters, are each one transaction.
 		db.TxRunner{Pool: pool},
 		// Everything else is a single statement and does not need one.
 		db.Direct{Pool: pool},
@@ -181,6 +234,7 @@ func buildAuth(pool *pgxpool.Pool, logger *slog.Logger) (*auth.Service, *account
 		sessions.NewStore(pool),
 		events,
 		tenancy,
+		secondFactor,
 		// Built once and shared: the hasher derives a dummy digest in its
 		// constructor, and a per-request hasher would derive one per request.
 		users.NewHasher(),
@@ -190,7 +244,35 @@ func buildAuth(pool *pgxpool.Pool, logger *slog.Logger) (*auth.Service, *account
 		auth.DefaultSessionTTL,
 	)
 
-	return authSvc, tenancy
+	return authSvc, tenancy, secondFactor, nil
+}
+
+// buildMFASecret returns the vault for the configured key, or mfa.Unavailable{}.
+//
+// Three outcomes, and the third is a startup failure rather than a warning:
+//
+//	key absent   Unavailable{} — a deployment that has not turned MFA on
+//	key present  a real AES-256-GCM vault
+//	key wrong    an error
+//
+// It is NEVER generated at boot. A generated key would mean every restart
+// invalidates every enrolled user's secret, and a restart is not something anybody
+// decides to do — which is the same rule AGENTS.md states for OIDC_SIGNING_KEY.
+func buildMFASecret(cfg config.Config, logger *slog.Logger) (mfa.Vault, error) {
+	key, err := cfg.MFAEncryptionKey()
+	switch {
+	case errors.Is(err, config.ErrNoMFAEncryptionKey):
+		logger.Warn("MFA_ENCRYPTION_KEY is not set")
+		return mfa.Unavailable{}, nil
+	case err != nil:
+		return nil, fmt.Errorf("reading MFA_ENCRYPTION_KEY: %w", err)
+	}
+
+	vault, err := mfa.NewAESCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("building the MFA encryption key: %w", err)
+	}
+	return vault, nil
 }
 
 // buildOIDC assembles the OpenID Connect provider, or returns nils when this

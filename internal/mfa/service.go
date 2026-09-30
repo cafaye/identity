@@ -562,6 +562,25 @@ func (c Claim) Method() string { return c.method }
 // this one, so the number a user reads is the number they have.
 func (c Claim) RecoveryCodesRemaining() int { return c.recoveryCodesRemaining }
 
+// ClaimForTest returns a Claim that names only a user.
+//
+// IT EXISTS FOR TEST DOUBLES, and the reason is structural rather than cosmetic: a
+// Claim's fields are unexported precisely so that the only way to obtain one is to
+// verify a factor, and internal/auth's SecondFactor tests need to return one from
+// a fake. Exporting the fields to fix that would delete the guarantee.
+//
+// What it does NOT do is grant anything. A Claim built here carries no step, no
+// recovery-code row and no challenge, so Commit on one consumes nothing and clears
+// no credential's failure run — there is no credential for it to name. The real
+// guarantee is unchanged and is in the type: Commit takes a Claim rather than a
+// user id, so a caller that has not called VerifyFactor has nothing to hand it
+// that names a real credential, and a Claim that came from somewhere real always
+// went through the check.
+//
+// A production call to this function would therefore be inert rather than
+// dangerous, which is the property that makes it acceptable to ship at all.
+func ClaimForTest(userID id.UUID) Claim { return Claim{userID: userID} }
+
 // VerifyFactor checks a presented code against a user's live credential and
 // returns the claim for it.
 //

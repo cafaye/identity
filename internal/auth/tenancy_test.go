@@ -207,6 +207,7 @@ func newServiceWithTenancy(t *testing.T, pool *pgxpool.Pool, tenancy PersonalAcc
 		sessions.NewStore(pool),
 		outbox.NewStore(pool),
 		tenancy,
+		realSecondFactor(t, pool, clockForTest()),
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),
