@@ -35,10 +35,10 @@ package client
 // regeneration gate's blast radius visible instead of spread across twenty call
 // sites.
 //
-// The twenty methods below are the document's twenty `operationId`s, in the
-// document's order, with the generated parameter types. The compile-time assertion
-// at the bottom is what proves the generated `*generated.Client` still satisfies it,
-// so a mismatch is a build failure rather than a runtime surprise.
+// The twenty-three methods below are the document's twenty-three `operationId`s, in
+// the document's order, with the generated parameter types. The compile-time
+// assertion at the bottom is what proves the generated `*generated.Client` still
+// satisfies it, so a mismatch is a build failure rather than a runtime surprise.
 
 import (
 	"context"
@@ -78,6 +78,9 @@ type Transport interface {
 	IntrospectAPIKey(ctx context.Context, body generated.IntrospectAPIKeyJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	Liveness(ctx context.Context, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	Readiness(ctx context.Context, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	ListAccountAuditLog(ctx context.Context, accountId openapiTypes.UUID, params *generated.ListAccountAuditLogParams, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	RevokeAccountInvitation(ctx context.Context, accountId openapiTypes.UUID, invitationId openapiTypes.UUID, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	RevokeAccountInvitations(ctx context.Context, accountId openapiTypes.UUID, body generated.BulkInvitationRevocation, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 }
 
 // The proof that the generated client still satisfies the interface above.

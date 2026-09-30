@@ -681,6 +681,50 @@ func (c *Client) IntrospectAPIKey(ctx context.Context, body generated.Introspect
 	return &out, err
 }
 
+// ListAccountAuditLog reads one page of an account's admin audit trail. Corresponds to
+// `GET /v1/accounts/{account_id}/admin/audit-log`.
+//
+// The trail is append-only in the DATABASE, so this is a read of a record nothing can
+// edit — which is the reason an audit log is worth keeping and the reason a caller
+// cannot ask for a correction. `Next` is an opaque cursor to pass back as `Before`;
+// empty means the page is the last one.
+func (c *Client) ListAccountAuditLog(ctx context.Context, accountId openapiTypes.UUID, params *generated.ListAccountAuditLogParams) (*generated.AuditLogPage, error) {
+	var out generated.AuditLogPage
+	err := call(c, "listAccountAuditLog", func() (*http.Response, error) {
+		return c.transport.ListAccountAuditLog(ctx, accountId, params)
+	}, &out)
+	return &out, err
+}
+
+// RevokeAccountInvitation withdraws one pending invitation. Corresponds to
+// `DELETE /v1/accounts/{account_id}/admin/invitations/{invitation_id}`.
+//
+// A 204, so this returns no body: the invitation's address is freed to be invited
+// again, and the audit record naming the credential that did it exists in the same
+// transaction. An invitation that was already revoked, already accepted, or belongs
+// to another account is a 404 — this operation cannot report on somebody else's row.
+func (c *Client) RevokeAccountInvitation(ctx context.Context, accountId, invitationId openapiTypes.UUID) error {
+	return callVoid(ctx, c, "revokeAccountInvitation", func() (*http.Response, error) {
+		return c.transport.RevokeAccountInvitation(ctx, accountId, invitationId)
+	})
+}
+
+// RevokeAccountInvitations withdraws up to 50 pending invitations in one transaction.
+// Corresponds to `POST /v1/accounts/{account_id}/admin/invitation-revocations`.
+//
+// **The two counts in the result differ, and both are returned.** `Requested` is how
+// many ids the body named after de-duplication; `Revoked` is how many rows the
+// database actually changed. Ids that were already revoked, already accepted, or
+// belong to another account are not an error — they change nothing and are not
+// counted — so a caller that reports `Requested` as done has reported a lie.
+func (c *Client) RevokeAccountInvitations(ctx context.Context, accountId openapiTypes.UUID, body generated.BulkInvitationRevocation) (*generated.BulkRevocationResult, error) {
+	var out generated.BulkRevocationResult
+	err := call(c, "revokeAccountInvitations", func() (*http.Response, error) {
+		return c.transport.RevokeAccountInvitations(ctx, accountId, body)
+	}, &out)
+	return &out, err
+}
+
 // itoa avoids importing strconv for one call in a message string.
 func itoa(n int) string {
 	if n == 0 {

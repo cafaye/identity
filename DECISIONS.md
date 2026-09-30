@@ -517,3 +517,75 @@ The three answers, in the order this packet would rank them:
 
 Whichever is chosen, it is a decision about the repository's coverage policy rather
 than about this client, and it is recorded here rather than made silently.
+
+### ANSWERED 2026-09-30 by packet `identity-12-coverage`: option 1, and why not 2
+
+MD16 in the workspace `DECISIONS.md` ruled it. This records what was actually done
+here rather than a summary of the ruling.
+
+**Option 1, taken.** `coverage-exclusions` at the repository root declares
+`client/generated` — one entry, one directory, with a reason, an owner, a `since`, an
+`until`, the `files=` and `lines=` it covers, and the floor it was justified against.
+`bin/coverage-floor` reads it, filters the profile, prints the measured number, the
+excluded set and the floor in one block, and compares.
+`TestTheCoverageExclusionIsOnlyGeneratedCode` in `internal/platform/ci` walks the tree
+and fails if anything under the excluded directory is not itself generated, or if the
+recorded file and line counts no longer match.
+
+**Option 2 refused, and the numbers here are why.** This tree measures **44.6%** with
+the generated client in it and **73.6%** without it. A floor of 45 is a threshold
+chosen to be met: the gap it absorbs is a real regression in hand-written code, and
+the generated code's weight in the denominator never changes, so the gap would be
+permanent and invisible. Keeping 70 means the floor is still the number that was
+measured against the code somebody wrote.
+
+**The floor was not moved, and no test was added to generated code.** A test written
+against `client/generated/api.gen.go` would be deleted by the next `go generate` and
+the coverage would not survive a week — the same argument the lint exclusion in
+`.golangci.yml` makes, for the same file, in the same shape.
+
+### What is still open, and it is a different question from the one above
+
+**Option 3 is not answered, and it is the correct long-term shape.** A generated SDK
+is a different artefact with different properties, and a separate Go module makes the
+boundary a compile-time fact rather than a config entry. It is not done here because
+it changes the import path of a published client, which is a decision with a
+deprecation window attached.
+
+The signal to settle it is the one MD16 names: **a second repository asking for a
+generated client.** Before then, `coverage-exclusions`'s `until=2027-03-31` fails the
+build, so the question is asked on a date rather than whenever somebody is under
+pressure.
+
+### WHY THE MECHANISM LIVES HERE AND NOT IN kit, which is a judgement and not a fact
+
+The shared workflow should carry the *mechanism* and each repository its own
+*declaration* — that is the right shape and it is what the brief asks for.
+
+It is not here for one concrete reason: **identity's enforcing coverage step is its
+own `coverage` step in the `gate` job, and kit's cannot enforce anything in this
+repository at all.** kit's `test` step runs with no database, so
+`internal/mfa`'s `TestTheDatabaseTierActuallyRan` fails first and the run never
+reaches a coverage step. A mechanism in kit would therefore not be the mechanism this
+repository uses: identity would still need its own copy, and a copy in a repository
+that cannot read kit's at run time is a drifting copy with extra steps — the argument
+`templates/tier/skip-allowlist` already makes about the fleet-wide file.
+
+So the mechanism is here, the declaration is here, and `kit` is untouched, which also
+means this packet does not collide with `kit-04`, live in that repository.
+
+**What kit should grow, and when.** A `coverage-exclusions` input on the reusable
+workflow plus the filter, so a second repository gets the mechanism without writing
+it. The test that should move with it is the "every `.go` file under the excluded
+directory is generated" walk — that is the load-bearing part and the part a consumer
+is most likely to skip. **Do it as a kit packet, not by copying a file across**: a
+copy is a second dialect of the same rule, which is the thing this packet was told not
+to create.
+
+**And the disagreement that leaves behind.** `coverage-fail-under: '70'` is still
+passed to kit. kit's step computes `total:` over the whole profile and cannot be told
+about this declaration, so it would read 44.6% if it ever ran. Left alone on purpose:
+lowering the input to 45 is option 2, and 0 would be weakening a gate to make a build
+green. The threshold is stated in both files, and
+`TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor` fails if they stop being the
+same number.

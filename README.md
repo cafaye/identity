@@ -79,7 +79,10 @@ Direct dependencies, each with a cause:
   already do. `go list -deps ./cmd/identity | grep oapi-codegen` is empty, and
   `TestTheServiceBinaryDoesNotReachTheGeneratedClient` holds that as a check rather
   than a claim. The full reasoning, including what it costs the coverage floor, is
-  [DECISIONS.md](DECISIONS.md) D6.
+  [DECISIONS.md](DECISIONS.md) D6 — and what it costs is answered there now: the
+  generated client is **excluded from the coverage measurement** by a declared path,
+  with the floor left where it was. See "The coverage floor, and what it is a
+  percentage of" below.
 
 - `go-jose/v4` — **forced, not chosen.** `op.SigningKey` returns a
   `jose.SignatureAlgorithm` and `op.Key.Key()` holds a `jose` key, so the
@@ -980,6 +983,93 @@ for a stated cause — and it is what catches the `uses:` path drifting back to 
 directory GitHub cannot resolve, the `versions:` literal drifting away from
 `go.mod`, migrations moving below the suite, the SKIP check disappearing, and a
 named security test being renamed.
+
+### The coverage floor, and what it is a percentage of
+
+`gate`'s `coverage` step runs `bin/coverage-floor`, and this is the one number in
+this repository whose denominator is a decision rather than a fact.
+
+Go's `go tool cover -func` prints a `total:` over **every** block in the profile,
+and it has no flag to leave a path out. `client/generated/api.gen.go` is 12,284
+lines of committed oapi-codegen output with **3,001 statements and no test**, so it
+drags module coverage from **73.6% to 44.6%** — measured, both ways, on this tree,
+by `go test -count=1 -race -coverprofile=coverage.out ./...` against Postgres.
+
+Two things that would have been one-line edits, and neither was taken:
+
+- **Lowering the floor to 45.** A floor catches a *decrease*, and 70 was measured
+  against hand-written code. Lowering it admits a real 29-point regression in
+  hand-written code permanently, because the generated file's weight in the
+  denominator never changes.
+- **Adding tests to the generated code.** They would be deleted by the next
+  `go generate`, so the coverage would not survive a week.
+
+So `client/generated` is excluded, by a **declared** path in
+[`coverage-exclusions`](coverage-exclusions) at the repository root:
+
+```
+excluded coverage client/generated files=1 lines=12284 coverage-fail-under=70 \
+  reason="oapi-codegen v2.8.0 output …" owner=identity since=2026-09-30 until=2027-03-31
+```
+
+**Declared, never inferred.** The alternative — skipping any file whose header says
+`// Code generated … DO NOT EDIT.` — fails toward *less* coverage: the header is
+written by whichever generator ran, and one that stops writing it silently
+un-excludes a quarter of the module while the floor stays at 70. An inferred
+exclusion that fails toward *more* coverage is safe. One that fails toward less is
+not.
+
+**A directory, because the tool takes a package and not a file.** That is coarser
+than the anchored regex the lint exclusion uses for the same file, and the
+coarseness is paid for by
+`TestTheCoverageExclusionIsOnlyGeneratedCode`, which enumerates every `.go` file
+under `client/generated` and fails if one is not itself generated.
+`client/` would be a perfectly legal declaration and it would exempt `baseurl.go`,
+`credentials.go`, `errors.go`, `redact.go` and every test in the package.
+
+**The entry must earn its place.** Reason, owner, `since`, `until`, the `files=`
+and `lines=` it covers, and the floor — and **an entry matching nothing is a
+failure** (kit's rule 4, from ESLint's `reportUnusedDisableDirectives`). The
+`files=`/`lines=` fingerprint is what turns "a file appeared under the excluded
+directory" into a red build instead of a silent change of denominator.
+
+**The three facts are printed together, on a green run too.** `bin/coverage-floor`
+emits the measured number, the excluded set with its reason and owner, and the
+floor, in one block, before it compares them:
+
+```
+coverage 73.6% of 4628 statements, over the profile minus 2257 block(s) this file excludes
+excluded — 1 declared entry/entries in coverage-exclusions:
+  client/generated  files=1 lines=12284  owner=identity since=2026-09-30 until=2027-03-31
+      reason: oapi-codegen v2.8.0 output for openapi/v1.yaml, …
+floor 70%  (coverage-fail-under, restated here so the measured number, the excluded set and the floor are read together)
+coverage 73.6% at or above the 70% floor
+```
+
+"coverage 73.6% (floor 70%)" on its own is decoration: a reader cannot tell 70% of
+what. **No percentage is written into `ci.yml`**, which is why the one that used to
+be there is gone rather than updated.
+
+**The floor is still the floor.** `TestTheCoverageFilterCanFail` runs the real
+script over twenty-one broken declarations and profiles, and includes a module at
+**69.9%** (red) and one at **70.1%** (green), with the exclusion in place and
+unchanged. An exclusion that made coverage unrestrictable would fail that test.
+
+**Where the mechanism lives, and the disagreement it leaves.** It lives here, not
+in kit — identity's *enforcing* coverage step is its own, in `gate`, because kit's
+`test` step runs with no database and dies before reaching a coverage step at all.
+kit is untouched. The consequence, stated rather than hidden: kit's coverage step
+computes `total:` over the whole profile and cannot be told about this declaration,
+so `coverage-fail-under: '70'` is still passed to it and it would read 44.6%. That
+input is left alone on purpose — 45 is the rejected option and 0 is a weakened gate
+— and the threshold is checked in three places by
+`TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor`. The full reasoning is in
+[DECISIONS.md](DECISIONS.md) D6.
+
+**What is still open.** Generating the client into its own Go module, which makes
+the boundary a compile-time fact rather than a config entry. It changes the import
+path of a published client, so it waits; the signal is a second repository asking
+for a generated client, and `until=2027-03-31` fails the build in the meantime.
 
 ## Migrations
 

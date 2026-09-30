@@ -42,15 +42,48 @@ func (e APIKeyScope) Valid() bool {
 	}
 }
 
+// Defines values for AuditLogEntryAction.
+const (
+	InvitationRevoked  AuditLogEntryAction = "invitation.revoked"
+	InvitationsRevoked AuditLogEntryAction = "invitations.revoked"
+)
+
+// Valid indicates whether the value is a known member of the AuditLogEntryAction enum.
+func (e AuditLogEntryAction) Valid() bool {
+	switch e {
+	case InvitationRevoked:
+		return true
+	case InvitationsRevoked:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for BulkInvitationRevocationConfirm.
+const (
+	BulkInvitationRevocationConfirmTrue BulkInvitationRevocationConfirm = true
+)
+
+// Valid indicates whether the value is a known member of the BulkInvitationRevocationConfirm enum.
+func (e BulkInvitationRevocationConfirm) Valid() bool {
+	switch e {
+	case BulkInvitationRevocationConfirmTrue:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ConfirmedEnrollmentEnabled.
 const (
-	True ConfirmedEnrollmentEnabled = true
+	ConfirmedEnrollmentEnabledTrue ConfirmedEnrollmentEnabled = true
 )
 
 // Valid indicates whether the value is a known member of the ConfirmedEnrollmentEnabled enum.
 func (e ConfirmedEnrollmentEnabled) Valid() bool {
 	switch e {
-	case True:
+	case ConfirmedEnrollmentEnabledTrue:
 		return true
 	default:
 		return false
@@ -410,6 +443,131 @@ type APIKey struct {
 // holding a name this build does not know is refused at the point of use
 // rather than being treated as "and so anything goes".
 type APIKeyScope string
+
+// AuditLogEntry One admin action.
+//
+// **There is no field here that could hold a credential, and that is
+// structural rather than a convention.** `actor_user_id` and `actor_key_id`
+// are row ids. The api key's digest is a field on the struct a handler holds,
+// and an audit log is exactly where a careless `fmt.Sprintf("%+v", …)` of it
+// would end up — so a test walks the types that reach this table and fails if
+// any of them grows a field that could hold a value.
+//
+// An operator copies this response into an incident ticket, and a response
+// shape with a `token` field is one somebody will eventually populate.
+type AuditLogEntry struct {
+	// Action What was done, from a closed set validated in Go rather than by a
+	// schema CHECK — a closed vocabulary is a code fact, and putting it in
+	// the schema would make adding an action a migration.
+	//
+	// The two names are distinct because the two are different events: one
+	// invitation revoked is a decision about a person, and a hundred at once
+	// is a decision about the account. Collapsing them would lose the answer
+	// an operator is asking for — "was that one, or was that all of them".
+	Action AuditLogEntryAction `json:"action"`
+
+	// ActorKeyID **Which** token acted — the row's id, never its value. "Somebody in the
+	// account" is not an answer an incident review can use, and this is the id
+	// an operator revokes by.
+	ActorKeyID openapi_types.UUID `json:"actor_key_id"`
+
+	// ActorUserID The human the acting token was minted for.
+	ActorUserID openapi_types.UUID `json:"actor_user_id"`
+
+	// Affected How many rows the action changed — the number the mutation reported, not
+	// the length of the request. `0` on the bulk route means every named
+	// invitation was already in a non-revocable state, and the response's
+	// `revoked` count says so too.
+	Affected int `json:"affected"`
+
+	// ID The record's own id.
+	ID openapi_types.UUID `json:"id"`
+
+	// OccurredAt When the action happened, from the service's clock.
+	OccurredAt time.Time `json:"occurred_at"`
+
+	// Target A short label for what was acted on: an invitation id for the single
+	// route, `invitation-revocations` for the bulk one. A label and not a
+	// list, so one record stays one record however large the request was.
+	Target string `json:"target"`
+
+	// TraceID The request's trace id, which is also the `X-Trace-Id` response header
+	// and the `trace_id` in the problem document if the action failed. This
+	// joins an audit record to a log line without either carrying a timestamp
+	// comparison. Never a credential.
+	TraceID string `json:"trace_id"`
+}
+
+// AuditLogEntryAction What was done, from a closed set validated in Go rather than by a
+// schema CHECK — a closed vocabulary is a code fact, and putting it in
+// the schema would make adding an action a migration.
+//
+// The two names are distinct because the two are different events: one
+// invitation revoked is a decision about a person, and a hundred at once
+// is a decision about the account. Collapsing them would lose the answer
+// an operator is asking for — "was that one, or was that all of them".
+type AuditLogEntryAction string
+
+// AuditLogPage One bounded page of the account's admin audit trail, newest first.
+type AuditLogPage struct {
+	// Entries Present and empty when there is nothing, rather than omitted: "no
+	// entries" and "the server left the field out" are different answers and
+	// a client that has to tell them apart will eventually get it wrong.
+	Entries []AuditLogEntry `json:"entries"`
+
+	// Next The opaque cursor for the following page, **absent on the last page**.
+	//
+	// It encodes the last row's `(occurred_at, id)` pair together and is
+	// passed back verbatim in `before`. It is not an offset, and it is not a
+	// bare timestamp: a timestamp-only cursor drops every record sharing the
+	// boundary instant, and this service's clock is a timestamp rather than a
+	// sequence, so two admin actions in the same second is the normal case.
+	Next *string `json:"next,omitempty"`
+}
+
+// BulkInvitationRevocation **Both fields are required, and neither is optional.** `confirm` is the
+// whole of the difference between this route and the single-revocation route,
+// and an array with no confirmation is exactly the request that revokes every
+// pending invitation by accident.
+//
+// An unknown field is a 422, so a client misspelling `confirm` is told rather
+// than proceeding.
+type BulkInvitationRevocation struct {
+	// Confirm Must be `true`. `false` is the same answer as absent — a 422 naming
+	// `confirm` — so a client cannot learn from the response which value it
+	// sent.
+	Confirm BulkInvitationRevocationConfirm `json:"confirm"`
+
+	// InvitationIds The pending invitations to revoke, as row ids. **At most 50** — a larger
+	// request is a 422 rather than a truncation, because a request naming a
+	// thousand invitations that silently revoked the first fifty is the outage
+	// this route exists to make harder.
+	//
+	// Ids that are already revoked, already accepted, or belong to another
+	// account are not an error: they change no rows and are not counted in
+	// `revoked`. That is why the response reports both counts.
+	InvitationIds []openapi_types.UUID `json:"invitation_ids"`
+}
+
+// BulkInvitationRevocationConfirm Must be `true`. `false` is the same answer as absent — a 422 naming
+// `confirm` — so a client cannot learn from the response which value it
+// sent.
+type BulkInvitationRevocationConfirm bool
+
+// BulkRevocationResult `requested` is what the request named and `revoked` is what the database
+// changed, and they are frequently different. Both are reported rather than
+// reconciled, because a client that cannot tell "you asked for four and four
+// went" from "you asked for four and two went" would report a completed task
+// over an incident.
+type BulkRevocationResult struct {
+	// Requested How many invitation ids the request named, after de-duplication.
+	Requested int `json:"requested"`
+
+	// Revoked How many pending invitations the database actually changed. **This is
+	// also the number in the audit record** — the one the mutation reported,
+	// not the length of the request.
+	Revoked int `json:"revoked"`
+}
 
 // CompleteSecondFactorRequest The second half of a login. `challenge` is optional here and required in
 // effect — omitting it entirely, with no challenge cookie either, is a 401.
@@ -1068,6 +1226,20 @@ type Unauthenticated = Problem
 // its own error body.
 type ValidationFailed = Problem
 
+// ListAccountAuditLogParams defines parameters for ListAccountAuditLog.
+type ListAccountAuditLogParams struct {
+	// Limit Rows to return. Defaults to 25; refused above 100. `0` means the
+	// default, so a generated client that sends its zero value still works.
+	Limit *int `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Before The opaque `next` cursor from the previous page. Empty means the
+	// newest page.
+	Before *string `form:"before,omitempty" json:"before,omitempty"`
+}
+
+// RevokeAccountInvitationsJSONRequestBody defines body for RevokeAccountInvitations for application/json ContentType.
+type RevokeAccountInvitationsJSONRequestBody = BulkInvitationRevocation
+
 // MintAPIKeyJSONRequestBody defines body for MintAPIKey for application/json ContentType.
 type MintAPIKeyJSONRequestBody = MintAPIKeyRequest
 
@@ -1196,6 +1368,218 @@ type ClientInterface interface {
 	//
 	// Corresponds with GET /readyz (the `Readiness` operationId).
 	Readiness(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ListAccountAuditLog Read an account's admin audit trail
+	//
+	// Every admin action taken on this account, newest first, and **append-only**:
+	// there is no operation in this API that edits or removes a record, and the
+	// table itself refuses `UPDATE` and `DELETE` at the database.
+	//
+	// ### Why the record cannot be edited, including by whoever performed it
+	//
+	// Three independent reasons, in the order a reviewer asks about them:
+	//
+	// 1. **No route mutates it.** `GET` is the only method mounted on this path,
+	//    and a test walks the router to hold that — a check inside the handler
+	//    would pass even with a `DELETE` registered beside it.
+	// 2. **No service method updates or deletes it.** The store has `Append` and
+	//    `List` and nothing else.
+	// 3. **The database refuses it**, with a `BEFORE UPDATE OR DELETE` trigger.
+	//    This is the one that actually settles it: the first two only describe
+	//    this codebase, and a repair script, an operator with `psql`, or a future
+	//    packet all bypass Go entirely.
+	//
+	// For the same reason the table carries **no foreign key to `accounts`**. A
+	// cascade is a `DELETE`, so a cascading account deletion would be blocked —
+	// and more to the point, allowing it would mean the shortest route from "an
+	// admin did something questionable" to "there is no record of it" is one
+	// request to `DELETE /v1/accounts/{account_id}`. The rows become unreachable
+	// through the API and are retained for an operator reading the table directly.
+	//
+	// ### An audit record names a credential, never a credential
+	//
+	// `actor_user_id` and `actor_key_id` are **row ids**. There is no field in
+	// the response that could hold a token, and that is structural rather than a
+	// convention — the api key's digest is a field on the struct a handler holds,
+	// and an audit log is exactly where a careless `fmt.Sprintf("%+v", …)` of it
+	// would end up. A test walks the types that reach this table and fails if any
+	// grows a field that could hold a value.
+	//
+	// ### The page is bounded, and the bound is refused rather than clamped
+	//
+	// `limit` defaults to 25 and is refused above 100. A request for more is a
+	// **422, not a silent truncation**: a client that asked for 500 rows and
+	// quietly received 100 has been told a lie about how much of the trail it has
+	// read, and an operator building an export would produce a short one without
+	// knowing.
+	//
+	// `before` is an **opaque cursor**, returned as `next`. It is not an offset
+	// and not a bare timestamp: it carries the row's `(occurred_at, id)` pair
+	// encoded together, because a timestamp-only cursor silently drops every row
+	// sharing the boundary instant — and this service's clock is a timestamp, not
+	// a sequence, so two actions in the same second is the normal case. An
+	// offset would be wrong the moment a row is appended between two requests,
+	// which here is the normal case too: somebody is performing admin actions
+	// while somebody else pages through the record of them.
+	//
+	// A cursor this build did not issue is a **422 naming `before`**, not a
+	// silent return to the first page — on a trail, "your token was wrong" and
+	// "the records are missing" are very different conclusions.
+	//
+	// Corresponds with GET /v1/accounts/{account_id}/admin/audit-log (the `ListAccountAuditLog` operationId).
+	ListAccountAuditLog(ctx context.Context, accountID AccountID, params *ListAccountAuditLogParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RevokeAccountInvitationsWithBody Revoke many pending invitations at once
+	//
+	// Withdraws up to 50 pending invitations in one transaction, and writes **one**
+	// audit record for the whole batch.
+	//
+	// ### This is a different shape from the single route, on purpose
+	//
+	// A bulk operation is where an off-by-one becomes an outage, so it does not
+	// look like the single one:
+	//
+	// | | single | bulk |
+	// | --- | --- | --- |
+	// | request | `DELETE …/invitations/{id}` | `POST …/invitation-revocations` with a body |
+	// | confirmation | none needed — the URL names the one row | **`confirm: true` is required** |
+	// | minimum role | admin | **owner** |
+	//
+	// The `confirm` field is in the **body**, not a query parameter, so that the
+	// request that performs the operation and the request that describes it are
+	// the same bytes — a `?confirm=true` is one link-builder's accident away from
+	// being sent without an operator reading it, and the array is exactly the thing
+	// that must not be sent by accident. Absent, `false`, and the wrong JSON type
+	// are all the same 422: a client that got a different answer for `false` than
+	// for absent would have learned which one it sent.
+	//
+	// **An unknown field is a 422**, so a client that misspells `confirm` as
+	// `confirm_all` is told, rather than proceeding on the assumption it was
+	// confirmed.
+	//
+	// ### Why owner and not admin
+	//
+	// Revoking one invitation is a decision about a person. Revoking every
+	// pending one is a decision about the account, it is the operation a
+	// departing employee's automation might fire on a schedule, and an owner is
+	// the whole of the argument. There are only two roles above `member`, and the
+	// smaller one already has the single-revocation route.
+	//
+	// ### The bound is refused, not clamped
+	//
+	// More than 50 ids is a **422**, not a truncation. A request naming a thousand
+	// invitations that revoked the first fifty and reported nothing would be the
+	// outage this route exists to make harder.
+	//
+	// ### `requested` and `revoked` are both returned, and they differ
+	//
+	// Ids that were already revoked, or that belong to another account, change no
+	// rows, so `revoked` is frequently smaller than `requested`. Both numbers are
+	// in the response because a client that cannot tell "you asked for four and
+	// four went" from "you asked for four and two went" would report a completed
+	// task over an incident.
+	//
+	// **The count in the audit record is the number the database reported**, not
+	// the length of the request — a request naming six ids where two were already
+	// revoked records six, because six is the truth.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/accounts/{account_id}/admin/invitation-revocations (the `RevokeAccountInvitations` operationId).
+	RevokeAccountInvitationsWithBody(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RevokeAccountInvitations Revoke many pending invitations at once
+	//
+	// Withdraws up to 50 pending invitations in one transaction, and writes **one**
+	// audit record for the whole batch.
+	//
+	// ### This is a different shape from the single route, on purpose
+	//
+	// A bulk operation is where an off-by-one becomes an outage, so it does not
+	// look like the single one:
+	//
+	// | | single | bulk |
+	// | --- | --- | --- |
+	// | request | `DELETE …/invitations/{id}` | `POST …/invitation-revocations` with a body |
+	// | confirmation | none needed — the URL names the one row | **`confirm: true` is required** |
+	// | minimum role | admin | **owner** |
+	//
+	// The `confirm` field is in the **body**, not a query parameter, so that the
+	// request that performs the operation and the request that describes it are
+	// the same bytes — a `?confirm=true` is one link-builder's accident away from
+	// being sent without an operator reading it, and the array is exactly the thing
+	// that must not be sent by accident. Absent, `false`, and the wrong JSON type
+	// are all the same 422: a client that got a different answer for `false` than
+	// for absent would have learned which one it sent.
+	//
+	// **An unknown field is a 422**, so a client that misspells `confirm` as
+	// `confirm_all` is told, rather than proceeding on the assumption it was
+	// confirmed.
+	//
+	// ### Why owner and not admin
+	//
+	// Revoking one invitation is a decision about a person. Revoking every
+	// pending one is a decision about the account, it is the operation a
+	// departing employee's automation might fire on a schedule, and an owner is
+	// the whole of the argument. There are only two roles above `member`, and the
+	// smaller one already has the single-revocation route.
+	//
+	// ### The bound is refused, not clamped
+	//
+	// More than 50 ids is a **422**, not a truncation. A request naming a thousand
+	// invitations that revoked the first fifty and reported nothing would be the
+	// outage this route exists to make harder.
+	//
+	// ### `requested` and `revoked` are both returned, and they differ
+	//
+	// Ids that were already revoked, or that belong to another account, change no
+	// rows, so `revoked` is frequently smaller than `requested`. Both numbers are
+	// in the response because a client that cannot tell "you asked for four and
+	// four went" from "you asked for four and two went" would report a completed
+	// task over an incident.
+	//
+	// **The count in the audit record is the number the database reported**, not
+	// the length of the request — a request naming six ids where two were already
+	// revoked records six, because six is the truth.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/accounts/{account_id}/admin/invitation-revocations (the `RevokeAccountInvitations` operationId).
+	RevokeAccountInvitations(ctx context.Context, accountID AccountID, body RevokeAccountInvitationsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RevokeAccountInvitation Revoke one pending invitation
+	//
+	// Withdraws one pending invitation. The token stops redeeming it immediately,
+	// and an audit record is written **in the same database transaction** as the
+	// revocation — either both exist or neither does.
+	//
+	// **Admin of the account, with `account_invitations:write`.**
+	//
+	// ### No confirmation field, and that is the design
+	//
+	// The URL names the one thing being changed, so the request is
+	// self-describing: there is nothing in it that could be misread as "and
+	// everything else". The bulk route requires `confirm: true` and a named
+	// array; this one requires neither, and adding a `confirm` field here would
+	// mean a client that forgot to send it gets a 422 on a safe, idempotent,
+	// single-row operation.
+	//
+	// ### Revoking is not deleting
+	//
+	// The row is kept with `revoked_at` set, which is what lets
+	// "was this revoked, or was it always broken?" be answered — the same support
+	// question that keeps revoked api keys and OIDC clients rather than deleting
+	// them. It also **frees the address to be invited again**, which is the point
+	// of the operation: an admin who sent an invitation to the wrong list revokes
+	// it and sends another, in two requests.
+	//
+	// A **409** means the invitation is not in a revocable state — already
+	// accepted (a membership already exists, and the question is where it came
+	// from) or already revoked. A **404** is every other case, including an id
+	// belonging to another account.
+	//
+	// Corresponds with DELETE /v1/accounts/{account_id}/admin/invitations/{invitation_id} (the `RevokeAccountInvitation` operationId).
+	RevokeAccountInvitation(ctx context.Context, accountID AccountID, invitationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ListAPIKeys List an account's API tokens
 	//
@@ -2008,6 +2392,258 @@ func (c *Client) Liveness(ctx context.Context, reqEditors ...RequestEditorFn) (*
 // Corresponds with GET /readyz (the `Readiness` operationId).
 func (c *Client) Readiness(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewReadinessRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ListAccountAuditLog Read an account's admin audit trail
+//
+// Every admin action taken on this account, newest first, and **append-only**:
+// there is no operation in this API that edits or removes a record, and the
+// table itself refuses `UPDATE` and `DELETE` at the database.
+//
+// ### Why the record cannot be edited, including by whoever performed it
+//
+// Three independent reasons, in the order a reviewer asks about them:
+//
+//  1. **No route mutates it.** `GET` is the only method mounted on this path,
+//     and a test walks the router to hold that — a check inside the handler
+//     would pass even with a `DELETE` registered beside it.
+//  2. **No service method updates or deletes it.** The store has `Append` and
+//     `List` and nothing else.
+//  3. **The database refuses it**, with a `BEFORE UPDATE OR DELETE` trigger.
+//     This is the one that actually settles it: the first two only describe
+//     this codebase, and a repair script, an operator with `psql`, or a future
+//     packet all bypass Go entirely.
+//
+// For the same reason the table carries **no foreign key to `accounts`**. A
+// cascade is a `DELETE`, so a cascading account deletion would be blocked —
+// and more to the point, allowing it would mean the shortest route from "an
+// admin did something questionable" to "there is no record of it" is one
+// request to `DELETE /v1/accounts/{account_id}`. The rows become unreachable
+// through the API and are retained for an operator reading the table directly.
+//
+// ### An audit record names a credential, never a credential
+//
+// `actor_user_id` and `actor_key_id` are **row ids**. There is no field in
+// the response that could hold a token, and that is structural rather than a
+// convention — the api key's digest is a field on the struct a handler holds,
+// and an audit log is exactly where a careless `fmt.Sprintf("%+v", …)` of it
+// would end up. A test walks the types that reach this table and fails if any
+// grows a field that could hold a value.
+//
+// ### The page is bounded, and the bound is refused rather than clamped
+//
+// `limit` defaults to 25 and is refused above 100. A request for more is a
+// **422, not a silent truncation**: a client that asked for 500 rows and
+// quietly received 100 has been told a lie about how much of the trail it has
+// read, and an operator building an export would produce a short one without
+// knowing.
+//
+// `before` is an **opaque cursor**, returned as `next`. It is not an offset
+// and not a bare timestamp: it carries the row's `(occurred_at, id)` pair
+// encoded together, because a timestamp-only cursor silently drops every row
+// sharing the boundary instant — and this service's clock is a timestamp, not
+// a sequence, so two actions in the same second is the normal case. An
+// offset would be wrong the moment a row is appended between two requests,
+// which here is the normal case too: somebody is performing admin actions
+// while somebody else pages through the record of them.
+//
+// A cursor this build did not issue is a **422 naming `before`**, not a
+// silent return to the first page — on a trail, "your token was wrong" and
+// "the records are missing" are very different conclusions.
+//
+// Corresponds with GET /v1/accounts/{account_id}/admin/audit-log (the `ListAccountAuditLog` operationId).
+func (c *Client) ListAccountAuditLog(ctx context.Context, accountID AccountID, params *ListAccountAuditLogParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewListAccountAuditLogRequest(c.Server, accountID, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RevokeAccountInvitationsWithBody Revoke many pending invitations at once
+//
+// Withdraws up to 50 pending invitations in one transaction, and writes **one**
+// audit record for the whole batch.
+//
+// ### This is a different shape from the single route, on purpose
+//
+// A bulk operation is where an off-by-one becomes an outage, so it does not
+// look like the single one:
+//
+// | | single | bulk |
+// | --- | --- | --- |
+// | request | `DELETE …/invitations/{id}` | `POST …/invitation-revocations` with a body |
+// | confirmation | none needed — the URL names the one row | **`confirm: true` is required** |
+// | minimum role | admin | **owner** |
+//
+// The `confirm` field is in the **body**, not a query parameter, so that the
+// request that performs the operation and the request that describes it are
+// the same bytes — a `?confirm=true` is one link-builder's accident away from
+// being sent without an operator reading it, and the array is exactly the thing
+// that must not be sent by accident. Absent, `false`, and the wrong JSON type
+// are all the same 422: a client that got a different answer for `false` than
+// for absent would have learned which one it sent.
+//
+// **An unknown field is a 422**, so a client that misspells `confirm` as
+// `confirm_all` is told, rather than proceeding on the assumption it was
+// confirmed.
+//
+// ### Why owner and not admin
+//
+// Revoking one invitation is a decision about a person. Revoking every
+// pending one is a decision about the account, it is the operation a
+// departing employee's automation might fire on a schedule, and an owner is
+// the whole of the argument. There are only two roles above `member`, and the
+// smaller one already has the single-revocation route.
+//
+// ### The bound is refused, not clamped
+//
+// More than 50 ids is a **422**, not a truncation. A request naming a thousand
+// invitations that revoked the first fifty and reported nothing would be the
+// outage this route exists to make harder.
+//
+// ### `requested` and `revoked` are both returned, and they differ
+//
+// Ids that were already revoked, or that belong to another account, change no
+// rows, so `revoked` is frequently smaller than `requested`. Both numbers are
+// in the response because a client that cannot tell "you asked for four and
+// four went" from "you asked for four and two went" would report a completed
+// task over an incident.
+//
+// **The count in the audit record is the number the database reported**, not
+// the length of the request — a request naming six ids where two were already
+// revoked records six, because six is the truth.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/accounts/{account_id}/admin/invitation-revocations (the `RevokeAccountInvitations` operationId).
+func (c *Client) RevokeAccountInvitationsWithBody(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRevokeAccountInvitationsRequestWithBody(c.Server, accountID, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RevokeAccountInvitations Revoke many pending invitations at once
+//
+// Withdraws up to 50 pending invitations in one transaction, and writes **one**
+// audit record for the whole batch.
+//
+// ### This is a different shape from the single route, on purpose
+//
+// A bulk operation is where an off-by-one becomes an outage, so it does not
+// look like the single one:
+//
+// | | single | bulk |
+// | --- | --- | --- |
+// | request | `DELETE …/invitations/{id}` | `POST …/invitation-revocations` with a body |
+// | confirmation | none needed — the URL names the one row | **`confirm: true` is required** |
+// | minimum role | admin | **owner** |
+//
+// The `confirm` field is in the **body**, not a query parameter, so that the
+// request that performs the operation and the request that describes it are
+// the same bytes — a `?confirm=true` is one link-builder's accident away from
+// being sent without an operator reading it, and the array is exactly the thing
+// that must not be sent by accident. Absent, `false`, and the wrong JSON type
+// are all the same 422: a client that got a different answer for `false` than
+// for absent would have learned which one it sent.
+//
+// **An unknown field is a 422**, so a client that misspells `confirm` as
+// `confirm_all` is told, rather than proceeding on the assumption it was
+// confirmed.
+//
+// ### Why owner and not admin
+//
+// Revoking one invitation is a decision about a person. Revoking every
+// pending one is a decision about the account, it is the operation a
+// departing employee's automation might fire on a schedule, and an owner is
+// the whole of the argument. There are only two roles above `member`, and the
+// smaller one already has the single-revocation route.
+//
+// ### The bound is refused, not clamped
+//
+// More than 50 ids is a **422**, not a truncation. A request naming a thousand
+// invitations that revoked the first fifty and reported nothing would be the
+// outage this route exists to make harder.
+//
+// ### `requested` and `revoked` are both returned, and they differ
+//
+// Ids that were already revoked, or that belong to another account, change no
+// rows, so `revoked` is frequently smaller than `requested`. Both numbers are
+// in the response because a client that cannot tell "you asked for four and
+// four went" from "you asked for four and two went" would report a completed
+// task over an incident.
+//
+// **The count in the audit record is the number the database reported**, not
+// the length of the request — a request naming six ids where two were already
+// revoked records six, because six is the truth.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/accounts/{account_id}/admin/invitation-revocations (the `RevokeAccountInvitations` operationId).
+func (c *Client) RevokeAccountInvitations(ctx context.Context, accountID AccountID, body RevokeAccountInvitationsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRevokeAccountInvitationsRequest(c.Server, accountID, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RevokeAccountInvitation Revoke one pending invitation
+//
+// Withdraws one pending invitation. The token stops redeeming it immediately,
+// and an audit record is written **in the same database transaction** as the
+// revocation — either both exist or neither does.
+//
+// **Admin of the account, with `account_invitations:write`.**
+//
+// ### No confirmation field, and that is the design
+//
+// The URL names the one thing being changed, so the request is
+// self-describing: there is nothing in it that could be misread as "and
+// everything else". The bulk route requires `confirm: true` and a named
+// array; this one requires neither, and adding a `confirm` field here would
+// mean a client that forgot to send it gets a 422 on a safe, idempotent,
+// single-row operation.
+//
+// ### Revoking is not deleting
+//
+// The row is kept with `revoked_at` set, which is what lets
+// "was this revoked, or was it always broken?" be answered — the same support
+// question that keeps revoked api keys and OIDC clients rather than deleting
+// them. It also **frees the address to be invited again**, which is the point
+// of the operation: an admin who sent an invitation to the wrong list revokes
+// it and sends another, in two requests.
+//
+// A **409** means the invitation is not in a revocable state — already
+// accepted (a membership already exists, and the question is where it came
+// from) or already revoked. A **404** is every other case, including an id
+// belonging to another account.
+//
+// Corresponds with DELETE /v1/accounts/{account_id}/admin/invitations/{invitation_id} (the `RevokeAccountInvitation` operationId).
+func (c *Client) RevokeAccountInvitation(ctx context.Context, accountID AccountID, invitationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRevokeAccountInvitationRequest(c.Server, accountID, invitationID)
 	if err != nil {
 		return nil, err
 	}
@@ -3140,6 +3776,167 @@ func NewReadinessRequest(server string) (*http.Request, error) {
 	return req, nil
 }
 
+// NewListAccountAuditLogRequest constructs an http.Request for the ListAccountAuditLog method
+func NewListAccountAuditLogRequest(server string, accountID AccountID, params *ListAccountAuditLogParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "account_id", accountID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts/%s/admin/audit-log", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if params.Limit != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.Before != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "before", *params.Before, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewRevokeAccountInvitationsRequest calls the generic RevokeAccountInvitations builder with application/json body
+func NewRevokeAccountInvitationsRequest(server string, accountID AccountID, body RevokeAccountInvitationsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRevokeAccountInvitationsRequestWithBody(server, accountID, "application/json", bodyReader)
+}
+
+// NewRevokeAccountInvitationsRequestWithBody constructs an http.Request for the RevokeAccountInvitations method, with any body, and a specified content type
+func NewRevokeAccountInvitationsRequestWithBody(server string, accountID AccountID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "account_id", accountID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts/%s/admin/invitation-revocations", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewRevokeAccountInvitationRequest constructs an http.Request for the RevokeAccountInvitation method
+func NewRevokeAccountInvitationRequest(server string, accountID AccountID, invitationID openapi_types.UUID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "account_id", accountID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "invitation_id", invitationID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts/%s/admin/invitations/%s", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewListAPIKeysRequest constructs an http.Request for the ListAPIKeys method
 func NewListAPIKeysRequest(server string, accountID AccountID) (*http.Request, error) {
 	var err error
@@ -3915,6 +4712,222 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with GET /readyz (the `Readiness` operationId).
 	ReadinessWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ReadinessResponse, error)
+
+	// ListAccountAuditLogWithResponse Read an account's admin audit trail
+	//
+	// Every admin action taken on this account, newest first, and **append-only**:
+	// there is no operation in this API that edits or removes a record, and the
+	// table itself refuses `UPDATE` and `DELETE` at the database.
+	//
+	// ### Why the record cannot be edited, including by whoever performed it
+	//
+	// Three independent reasons, in the order a reviewer asks about them:
+	//
+	// 1. **No route mutates it.** `GET` is the only method mounted on this path,
+	//    and a test walks the router to hold that — a check inside the handler
+	//    would pass even with a `DELETE` registered beside it.
+	// 2. **No service method updates or deletes it.** The store has `Append` and
+	//    `List` and nothing else.
+	// 3. **The database refuses it**, with a `BEFORE UPDATE OR DELETE` trigger.
+	//    This is the one that actually settles it: the first two only describe
+	//    this codebase, and a repair script, an operator with `psql`, or a future
+	//    packet all bypass Go entirely.
+	//
+	// For the same reason the table carries **no foreign key to `accounts`**. A
+	// cascade is a `DELETE`, so a cascading account deletion would be blocked —
+	// and more to the point, allowing it would mean the shortest route from "an
+	// admin did something questionable" to "there is no record of it" is one
+	// request to `DELETE /v1/accounts/{account_id}`. The rows become unreachable
+	// through the API and are retained for an operator reading the table directly.
+	//
+	// ### An audit record names a credential, never a credential
+	//
+	// `actor_user_id` and `actor_key_id` are **row ids**. There is no field in
+	// the response that could hold a token, and that is structural rather than a
+	// convention — the api key's digest is a field on the struct a handler holds,
+	// and an audit log is exactly where a careless `fmt.Sprintf("%+v", …)` of it
+	// would end up. A test walks the types that reach this table and fails if any
+	// grows a field that could hold a value.
+	//
+	// ### The page is bounded, and the bound is refused rather than clamped
+	//
+	// `limit` defaults to 25 and is refused above 100. A request for more is a
+	// **422, not a silent truncation**: a client that asked for 500 rows and
+	// quietly received 100 has been told a lie about how much of the trail it has
+	// read, and an operator building an export would produce a short one without
+	// knowing.
+	//
+	// `before` is an **opaque cursor**, returned as `next`. It is not an offset
+	// and not a bare timestamp: it carries the row's `(occurred_at, id)` pair
+	// encoded together, because a timestamp-only cursor silently drops every row
+	// sharing the boundary instant — and this service's clock is a timestamp, not
+	// a sequence, so two actions in the same second is the normal case. An
+	// offset would be wrong the moment a row is appended between two requests,
+	// which here is the normal case too: somebody is performing admin actions
+	// while somebody else pages through the record of them.
+	//
+	// A cursor this build did not issue is a **422 naming `before`**, not a
+	// silent return to the first page — on a trail, "your token was wrong" and
+	// "the records are missing" are very different conclusions.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /v1/accounts/{account_id}/admin/audit-log (the `ListAccountAuditLog` operationId).
+	ListAccountAuditLogWithResponse(ctx context.Context, accountID AccountID, params *ListAccountAuditLogParams, reqEditors ...RequestEditorFn) (*ListAccountAuditLogResponse, error)
+
+	// RevokeAccountInvitationsWithBodyWithResponse Revoke many pending invitations at once
+	//
+	// Withdraws up to 50 pending invitations in one transaction, and writes **one**
+	// audit record for the whole batch.
+	//
+	// ### This is a different shape from the single route, on purpose
+	//
+	// A bulk operation is where an off-by-one becomes an outage, so it does not
+	// look like the single one:
+	//
+	// | | single | bulk |
+	// | --- | --- | --- |
+	// | request | `DELETE …/invitations/{id}` | `POST …/invitation-revocations` with a body |
+	// | confirmation | none needed — the URL names the one row | **`confirm: true` is required** |
+	// | minimum role | admin | **owner** |
+	//
+	// The `confirm` field is in the **body**, not a query parameter, so that the
+	// request that performs the operation and the request that describes it are
+	// the same bytes — a `?confirm=true` is one link-builder's accident away from
+	// being sent without an operator reading it, and the array is exactly the thing
+	// that must not be sent by accident. Absent, `false`, and the wrong JSON type
+	// are all the same 422: a client that got a different answer for `false` than
+	// for absent would have learned which one it sent.
+	//
+	// **An unknown field is a 422**, so a client that misspells `confirm` as
+	// `confirm_all` is told, rather than proceeding on the assumption it was
+	// confirmed.
+	//
+	// ### Why owner and not admin
+	//
+	// Revoking one invitation is a decision about a person. Revoking every
+	// pending one is a decision about the account, it is the operation a
+	// departing employee's automation might fire on a schedule, and an owner is
+	// the whole of the argument. There are only two roles above `member`, and the
+	// smaller one already has the single-revocation route.
+	//
+	// ### The bound is refused, not clamped
+	//
+	// More than 50 ids is a **422**, not a truncation. A request naming a thousand
+	// invitations that revoked the first fifty and reported nothing would be the
+	// outage this route exists to make harder.
+	//
+	// ### `requested` and `revoked` are both returned, and they differ
+	//
+	// Ids that were already revoked, or that belong to another account, change no
+	// rows, so `revoked` is frequently smaller than `requested`. Both numbers are
+	// in the response because a client that cannot tell "you asked for four and
+	// four went" from "you asked for four and two went" would report a completed
+	// task over an incident.
+	//
+	// **The count in the audit record is the number the database reported**, not
+	// the length of the request — a request naming six ids where two were already
+	// revoked records six, because six is the truth.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/accounts/{account_id}/admin/invitation-revocations (the `RevokeAccountInvitations` operationId).
+	RevokeAccountInvitationsWithBodyWithResponse(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RevokeAccountInvitationsResponse, error)
+
+	// RevokeAccountInvitationsWithResponse Revoke many pending invitations at once
+	//
+	// Withdraws up to 50 pending invitations in one transaction, and writes **one**
+	// audit record for the whole batch.
+	//
+	// ### This is a different shape from the single route, on purpose
+	//
+	// A bulk operation is where an off-by-one becomes an outage, so it does not
+	// look like the single one:
+	//
+	// | | single | bulk |
+	// | --- | --- | --- |
+	// | request | `DELETE …/invitations/{id}` | `POST …/invitation-revocations` with a body |
+	// | confirmation | none needed — the URL names the one row | **`confirm: true` is required** |
+	// | minimum role | admin | **owner** |
+	//
+	// The `confirm` field is in the **body**, not a query parameter, so that the
+	// request that performs the operation and the request that describes it are
+	// the same bytes — a `?confirm=true` is one link-builder's accident away from
+	// being sent without an operator reading it, and the array is exactly the thing
+	// that must not be sent by accident. Absent, `false`, and the wrong JSON type
+	// are all the same 422: a client that got a different answer for `false` than
+	// for absent would have learned which one it sent.
+	//
+	// **An unknown field is a 422**, so a client that misspells `confirm` as
+	// `confirm_all` is told, rather than proceeding on the assumption it was
+	// confirmed.
+	//
+	// ### Why owner and not admin
+	//
+	// Revoking one invitation is a decision about a person. Revoking every
+	// pending one is a decision about the account, it is the operation a
+	// departing employee's automation might fire on a schedule, and an owner is
+	// the whole of the argument. There are only two roles above `member`, and the
+	// smaller one already has the single-revocation route.
+	//
+	// ### The bound is refused, not clamped
+	//
+	// More than 50 ids is a **422**, not a truncation. A request naming a thousand
+	// invitations that revoked the first fifty and reported nothing would be the
+	// outage this route exists to make harder.
+	//
+	// ### `requested` and `revoked` are both returned, and they differ
+	//
+	// Ids that were already revoked, or that belong to another account, change no
+	// rows, so `revoked` is frequently smaller than `requested`. Both numbers are
+	// in the response because a client that cannot tell "you asked for four and
+	// four went" from "you asked for four and two went" would report a completed
+	// task over an incident.
+	//
+	// **The count in the audit record is the number the database reported**, not
+	// the length of the request — a request naming six ids where two were already
+	// revoked records six, because six is the truth.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/accounts/{account_id}/admin/invitation-revocations (the `RevokeAccountInvitations` operationId).
+	RevokeAccountInvitationsWithResponse(ctx context.Context, accountID AccountID, body RevokeAccountInvitationsJSONRequestBody, reqEditors ...RequestEditorFn) (*RevokeAccountInvitationsResponse, error)
+
+	// RevokeAccountInvitationWithResponse Revoke one pending invitation
+	//
+	// Withdraws one pending invitation. The token stops redeeming it immediately,
+	// and an audit record is written **in the same database transaction** as the
+	// revocation — either both exist or neither does.
+	//
+	// **Admin of the account, with `account_invitations:write`.**
+	//
+	// ### No confirmation field, and that is the design
+	//
+	// The URL names the one thing being changed, so the request is
+	// self-describing: there is nothing in it that could be misread as "and
+	// everything else". The bulk route requires `confirm: true` and a named
+	// array; this one requires neither, and adding a `confirm` field here would
+	// mean a client that forgot to send it gets a 422 on a safe, idempotent,
+	// single-row operation.
+	//
+	// ### Revoking is not deleting
+	//
+	// The row is kept with `revoked_at` set, which is what lets
+	// "was this revoked, or was it always broken?" be answered — the same support
+	// question that keeps revoked api keys and OIDC clients rather than deleting
+	// them. It also **frees the address to be invited again**, which is the point
+	// of the operation: an admin who sent an invitation to the wrong list revokes
+	// it and sends another, in two requests.
+	//
+	// A **409** means the invitation is not in a revocable state — already
+	// accepted (a membership already exists, and the question is where it came
+	// from) or already revoked. A **404** is every other case, including an id
+	// belonging to another account.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with DELETE /v1/accounts/{account_id}/admin/invitations/{invitation_id} (the `RevokeAccountInvitation` operationId).
+	RevokeAccountInvitationWithResponse(ctx context.Context, accountID AccountID, invitationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*RevokeAccountInvitationResponse, error)
 
 	// ListAPIKeysWithResponse List an account's API tokens
 	//
@@ -4813,6 +5826,346 @@ func (r ReadinessResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r ReadinessResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// ListAccountAuditLogResponse200Headers the declared response headers of an HTTP 200 response for ListAccountAuditLog
+type ListAccountAuditLogResponse200Headers struct {
+	XTraceID string
+}
+
+// ListAccountAuditLogResponse401Headers the declared response headers of an HTTP 401 response for ListAccountAuditLog
+type ListAccountAuditLogResponse401Headers struct {
+	XTraceID string
+}
+
+// ListAccountAuditLogResponse403Headers the declared response headers of an HTTP 403 response for ListAccountAuditLog
+type ListAccountAuditLogResponse403Headers struct {
+	XTraceID string
+}
+
+// ListAccountAuditLogResponse404Headers the declared response headers of an HTTP 404 response for ListAccountAuditLog
+type ListAccountAuditLogResponse404Headers struct {
+	XTraceID string
+}
+
+// ListAccountAuditLogResponse422Headers the declared response headers of an HTTP 422 response for ListAccountAuditLog
+type ListAccountAuditLogResponse422Headers struct {
+	XTraceID string
+}
+
+// ListAccountAuditLogResponse500Headers the declared response headers of an HTTP 500 response for ListAccountAuditLog
+type ListAccountAuditLogResponse500Headers struct {
+	XTraceID string
+}
+
+type ListAccountAuditLogResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *AuditLogPage
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Problem
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *NotFound
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *ListAccountAuditLogResponse200Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *ListAccountAuditLogResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *ListAccountAuditLogResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *ListAccountAuditLogResponse404Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *ListAccountAuditLogResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *ListAccountAuditLogResponse500Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ListAccountAuditLogResponse) GetJSON200() *AuditLogPage {
+	return r.JSON200
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r ListAccountAuditLogResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r ListAccountAuditLogResponse) GetApplicationProblemJSON403() *Problem {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r ListAccountAuditLogResponse) GetApplicationProblemJSON404() *NotFound {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r ListAccountAuditLogResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r ListAccountAuditLogResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r ListAccountAuditLogResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ListAccountAuditLogResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ListAccountAuditLogResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ListAccountAuditLogResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// RevokeAccountInvitationsResponse200Headers the declared response headers of an HTTP 200 response for RevokeAccountInvitations
+type RevokeAccountInvitationsResponse200Headers struct {
+	XTraceID string
+}
+
+// RevokeAccountInvitationsResponse401Headers the declared response headers of an HTTP 401 response for RevokeAccountInvitations
+type RevokeAccountInvitationsResponse401Headers struct {
+	XTraceID string
+}
+
+// RevokeAccountInvitationsResponse403Headers the declared response headers of an HTTP 403 response for RevokeAccountInvitations
+type RevokeAccountInvitationsResponse403Headers struct {
+	XTraceID string
+}
+
+// RevokeAccountInvitationsResponse404Headers the declared response headers of an HTTP 404 response for RevokeAccountInvitations
+type RevokeAccountInvitationsResponse404Headers struct {
+	XTraceID string
+}
+
+// RevokeAccountInvitationsResponse422Headers the declared response headers of an HTTP 422 response for RevokeAccountInvitations
+type RevokeAccountInvitationsResponse422Headers struct {
+	XTraceID string
+}
+
+// RevokeAccountInvitationsResponse500Headers the declared response headers of an HTTP 500 response for RevokeAccountInvitations
+type RevokeAccountInvitationsResponse500Headers struct {
+	XTraceID string
+}
+
+type RevokeAccountInvitationsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *BulkRevocationResult
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Problem
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *NotFound
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *RevokeAccountInvitationsResponse200Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *RevokeAccountInvitationsResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *RevokeAccountInvitationsResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *RevokeAccountInvitationsResponse404Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *RevokeAccountInvitationsResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *RevokeAccountInvitationsResponse500Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r RevokeAccountInvitationsResponse) GetJSON200() *BulkRevocationResult {
+	return r.JSON200
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r RevokeAccountInvitationsResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r RevokeAccountInvitationsResponse) GetApplicationProblemJSON403() *Problem {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r RevokeAccountInvitationsResponse) GetApplicationProblemJSON404() *NotFound {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r RevokeAccountInvitationsResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r RevokeAccountInvitationsResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r RevokeAccountInvitationsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RevokeAccountInvitationsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RevokeAccountInvitationsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RevokeAccountInvitationsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// RevokeAccountInvitationResponse401Headers the declared response headers of an HTTP 401 response for RevokeAccountInvitation
+type RevokeAccountInvitationResponse401Headers struct {
+	XTraceID string
+}
+
+// RevokeAccountInvitationResponse403Headers the declared response headers of an HTTP 403 response for RevokeAccountInvitation
+type RevokeAccountInvitationResponse403Headers struct {
+	XTraceID string
+}
+
+// RevokeAccountInvitationResponse404Headers the declared response headers of an HTTP 404 response for RevokeAccountInvitation
+type RevokeAccountInvitationResponse404Headers struct {
+	XTraceID string
+}
+
+// RevokeAccountInvitationResponse409Headers the declared response headers of an HTTP 409 response for RevokeAccountInvitation
+type RevokeAccountInvitationResponse409Headers struct {
+	XTraceID string
+}
+
+// RevokeAccountInvitationResponse500Headers the declared response headers of an HTTP 500 response for RevokeAccountInvitation
+type RevokeAccountInvitationResponse500Headers struct {
+	XTraceID string
+}
+
+type RevokeAccountInvitationResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Problem
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *NotFound
+	// ApplicationProblemJSON409 the response for an HTTP 409 `application/problem+json` response
+	ApplicationProblemJSON409 *Problem
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *RevokeAccountInvitationResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *RevokeAccountInvitationResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *RevokeAccountInvitationResponse404Headers
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *RevokeAccountInvitationResponse409Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *RevokeAccountInvitationResponse500Headers
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r RevokeAccountInvitationResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r RevokeAccountInvitationResponse) GetApplicationProblemJSON403() *Problem {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r RevokeAccountInvitationResponse) GetApplicationProblemJSON404() *NotFound {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON409 returns the response for an HTTP 409 `application/problem+json` response
+func (r RevokeAccountInvitationResponse) GetApplicationProblemJSON409() *Problem {
+	return r.ApplicationProblemJSON409
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r RevokeAccountInvitationResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r RevokeAccountInvitationResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RevokeAccountInvitationResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RevokeAccountInvitationResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RevokeAccountInvitationResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -6971,6 +8324,246 @@ func (c *ClientWithResponses) ReadinessWithResponse(ctx context.Context, reqEdit
 	return ParseReadinessResponse(rsp)
 }
 
+// ListAccountAuditLogWithResponse Read an account's admin audit trail
+//
+// Every admin action taken on this account, newest first, and **append-only**:
+// there is no operation in this API that edits or removes a record, and the
+// table itself refuses `UPDATE` and `DELETE` at the database.
+//
+// ### Why the record cannot be edited, including by whoever performed it
+//
+// Three independent reasons, in the order a reviewer asks about them:
+//
+//  1. **No route mutates it.** `GET` is the only method mounted on this path,
+//     and a test walks the router to hold that — a check inside the handler
+//     would pass even with a `DELETE` registered beside it.
+//  2. **No service method updates or deletes it.** The store has `Append` and
+//     `List` and nothing else.
+//  3. **The database refuses it**, with a `BEFORE UPDATE OR DELETE` trigger.
+//     This is the one that actually settles it: the first two only describe
+//     this codebase, and a repair script, an operator with `psql`, or a future
+//     packet all bypass Go entirely.
+//
+// For the same reason the table carries **no foreign key to `accounts`**. A
+// cascade is a `DELETE`, so a cascading account deletion would be blocked —
+// and more to the point, allowing it would mean the shortest route from "an
+// admin did something questionable" to "there is no record of it" is one
+// request to `DELETE /v1/accounts/{account_id}`. The rows become unreachable
+// through the API and are retained for an operator reading the table directly.
+//
+// ### An audit record names a credential, never a credential
+//
+// `actor_user_id` and `actor_key_id` are **row ids**. There is no field in
+// the response that could hold a token, and that is structural rather than a
+// convention — the api key's digest is a field on the struct a handler holds,
+// and an audit log is exactly where a careless `fmt.Sprintf("%+v", …)` of it
+// would end up. A test walks the types that reach this table and fails if any
+// grows a field that could hold a value.
+//
+// ### The page is bounded, and the bound is refused rather than clamped
+//
+// `limit` defaults to 25 and is refused above 100. A request for more is a
+// **422, not a silent truncation**: a client that asked for 500 rows and
+// quietly received 100 has been told a lie about how much of the trail it has
+// read, and an operator building an export would produce a short one without
+// knowing.
+//
+// `before` is an **opaque cursor**, returned as `next`. It is not an offset
+// and not a bare timestamp: it carries the row's `(occurred_at, id)` pair
+// encoded together, because a timestamp-only cursor silently drops every row
+// sharing the boundary instant — and this service's clock is a timestamp, not
+// a sequence, so two actions in the same second is the normal case. An
+// offset would be wrong the moment a row is appended between two requests,
+// which here is the normal case too: somebody is performing admin actions
+// while somebody else pages through the record of them.
+//
+// A cursor this build did not issue is a **422 naming `before`**, not a
+// silent return to the first page — on a trail, "your token was wrong" and
+// "the records are missing" are very different conclusions.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /v1/accounts/{account_id}/admin/audit-log (the `ListAccountAuditLog` operationId).
+func (c *ClientWithResponses) ListAccountAuditLogWithResponse(ctx context.Context, accountID AccountID, params *ListAccountAuditLogParams, reqEditors ...RequestEditorFn) (*ListAccountAuditLogResponse, error) {
+	rsp, err := c.ListAccountAuditLog(ctx, accountID, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseListAccountAuditLogResponse(rsp)
+}
+
+// RevokeAccountInvitationsWithBodyWithResponse Revoke many pending invitations at once
+//
+// Withdraws up to 50 pending invitations in one transaction, and writes **one**
+// audit record for the whole batch.
+//
+// ### This is a different shape from the single route, on purpose
+//
+// A bulk operation is where an off-by-one becomes an outage, so it does not
+// look like the single one:
+//
+// | | single | bulk |
+// | --- | --- | --- |
+// | request | `DELETE …/invitations/{id}` | `POST …/invitation-revocations` with a body |
+// | confirmation | none needed — the URL names the one row | **`confirm: true` is required** |
+// | minimum role | admin | **owner** |
+//
+// The `confirm` field is in the **body**, not a query parameter, so that the
+// request that performs the operation and the request that describes it are
+// the same bytes — a `?confirm=true` is one link-builder's accident away from
+// being sent without an operator reading it, and the array is exactly the thing
+// that must not be sent by accident. Absent, `false`, and the wrong JSON type
+// are all the same 422: a client that got a different answer for `false` than
+// for absent would have learned which one it sent.
+//
+// **An unknown field is a 422**, so a client that misspells `confirm` as
+// `confirm_all` is told, rather than proceeding on the assumption it was
+// confirmed.
+//
+// ### Why owner and not admin
+//
+// Revoking one invitation is a decision about a person. Revoking every
+// pending one is a decision about the account, it is the operation a
+// departing employee's automation might fire on a schedule, and an owner is
+// the whole of the argument. There are only two roles above `member`, and the
+// smaller one already has the single-revocation route.
+//
+// ### The bound is refused, not clamped
+//
+// More than 50 ids is a **422**, not a truncation. A request naming a thousand
+// invitations that revoked the first fifty and reported nothing would be the
+// outage this route exists to make harder.
+//
+// ### `requested` and `revoked` are both returned, and they differ
+//
+// Ids that were already revoked, or that belong to another account, change no
+// rows, so `revoked` is frequently smaller than `requested`. Both numbers are
+// in the response because a client that cannot tell "you asked for four and
+// four went" from "you asked for four and two went" would report a completed
+// task over an incident.
+//
+// **The count in the audit record is the number the database reported**, not
+// the length of the request — a request naming six ids where two were already
+// revoked records six, because six is the truth.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/accounts/{account_id}/admin/invitation-revocations (the `RevokeAccountInvitations` operationId).
+func (c *ClientWithResponses) RevokeAccountInvitationsWithBodyWithResponse(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RevokeAccountInvitationsResponse, error) {
+	rsp, err := c.RevokeAccountInvitationsWithBody(ctx, accountID, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRevokeAccountInvitationsResponse(rsp)
+}
+
+// RevokeAccountInvitationsWithResponse Revoke many pending invitations at once
+//
+// Withdraws up to 50 pending invitations in one transaction, and writes **one**
+// audit record for the whole batch.
+//
+// ### This is a different shape from the single route, on purpose
+//
+// A bulk operation is where an off-by-one becomes an outage, so it does not
+// look like the single one:
+//
+// | | single | bulk |
+// | --- | --- | --- |
+// | request | `DELETE …/invitations/{id}` | `POST …/invitation-revocations` with a body |
+// | confirmation | none needed — the URL names the one row | **`confirm: true` is required** |
+// | minimum role | admin | **owner** |
+//
+// The `confirm` field is in the **body**, not a query parameter, so that the
+// request that performs the operation and the request that describes it are
+// the same bytes — a `?confirm=true` is one link-builder's accident away from
+// being sent without an operator reading it, and the array is exactly the thing
+// that must not be sent by accident. Absent, `false`, and the wrong JSON type
+// are all the same 422: a client that got a different answer for `false` than
+// for absent would have learned which one it sent.
+//
+// **An unknown field is a 422**, so a client that misspells `confirm` as
+// `confirm_all` is told, rather than proceeding on the assumption it was
+// confirmed.
+//
+// ### Why owner and not admin
+//
+// Revoking one invitation is a decision about a person. Revoking every
+// pending one is a decision about the account, it is the operation a
+// departing employee's automation might fire on a schedule, and an owner is
+// the whole of the argument. There are only two roles above `member`, and the
+// smaller one already has the single-revocation route.
+//
+// ### The bound is refused, not clamped
+//
+// More than 50 ids is a **422**, not a truncation. A request naming a thousand
+// invitations that revoked the first fifty and reported nothing would be the
+// outage this route exists to make harder.
+//
+// ### `requested` and `revoked` are both returned, and they differ
+//
+// Ids that were already revoked, or that belong to another account, change no
+// rows, so `revoked` is frequently smaller than `requested`. Both numbers are
+// in the response because a client that cannot tell "you asked for four and
+// four went" from "you asked for four and two went" would report a completed
+// task over an incident.
+//
+// **The count in the audit record is the number the database reported**, not
+// the length of the request — a request naming six ids where two were already
+// revoked records six, because six is the truth.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/accounts/{account_id}/admin/invitation-revocations (the `RevokeAccountInvitations` operationId).
+func (c *ClientWithResponses) RevokeAccountInvitationsWithResponse(ctx context.Context, accountID AccountID, body RevokeAccountInvitationsJSONRequestBody, reqEditors ...RequestEditorFn) (*RevokeAccountInvitationsResponse, error) {
+	rsp, err := c.RevokeAccountInvitations(ctx, accountID, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRevokeAccountInvitationsResponse(rsp)
+}
+
+// RevokeAccountInvitationWithResponse Revoke one pending invitation
+//
+// Withdraws one pending invitation. The token stops redeeming it immediately,
+// and an audit record is written **in the same database transaction** as the
+// revocation — either both exist or neither does.
+//
+// **Admin of the account, with `account_invitations:write`.**
+//
+// ### No confirmation field, and that is the design
+//
+// The URL names the one thing being changed, so the request is
+// self-describing: there is nothing in it that could be misread as "and
+// everything else". The bulk route requires `confirm: true` and a named
+// array; this one requires neither, and adding a `confirm` field here would
+// mean a client that forgot to send it gets a 422 on a safe, idempotent,
+// single-row operation.
+//
+// ### Revoking is not deleting
+//
+// The row is kept with `revoked_at` set, which is what lets
+// "was this revoked, or was it always broken?" be answered — the same support
+// question that keeps revoked api keys and OIDC clients rather than deleting
+// them. It also **frees the address to be invited again**, which is the point
+// of the operation: an admin who sent an invitation to the wrong list revokes
+// it and sends another, in two requests.
+//
+// A **409** means the invitation is not in a revocable state — already
+// accepted (a membership already exists, and the question is where it came
+// from) or already revoked. A **404** is every other case, including an id
+// belonging to another account.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with DELETE /v1/accounts/{account_id}/admin/invitations/{invitation_id} (the `RevokeAccountInvitation` operationId).
+func (c *ClientWithResponses) RevokeAccountInvitationWithResponse(ctx context.Context, accountID AccountID, invitationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*RevokeAccountInvitationResponse, error) {
+	rsp, err := c.RevokeAccountInvitation(ctx, accountID, invitationID, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRevokeAccountInvitationResponse(rsp)
+}
+
 // ListAPIKeysWithResponse List an account's API tokens
 //
 // Every credential this account holds, newest first, **revoked ones
@@ -8027,6 +9620,364 @@ func ParseReadinessResponse(rsp *http.Response) (*ReadinessResponse, error) {
 			headers.XTraceID = value
 		}
 		response.Headers503 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseListAccountAuditLogResponse parses an HTTP response from a ListAccountAuditLogWithResponse call
+func ParseListAccountAuditLogResponse(rsp *http.Response) (*ListAccountAuditLogResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ListAccountAuditLogResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest AuditLogPage
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers ListAccountAuditLogResponse200Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 401:
+		var headers ListAccountAuditLogResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers ListAccountAuditLogResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers ListAccountAuditLogResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 422:
+		var headers ListAccountAuditLogResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers ListAccountAuditLogResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseRevokeAccountInvitationsResponse parses an HTTP response from a RevokeAccountInvitationsWithResponse call
+func ParseRevokeAccountInvitationsResponse(rsp *http.Response) (*RevokeAccountInvitationsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RevokeAccountInvitationsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest BulkRevocationResult
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers RevokeAccountInvitationsResponse200Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 401:
+		var headers RevokeAccountInvitationsResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers RevokeAccountInvitationsResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers RevokeAccountInvitationsResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 422:
+		var headers RevokeAccountInvitationsResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers RevokeAccountInvitationsResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseRevokeAccountInvitationResponse parses an HTTP response from a RevokeAccountInvitationWithResponse call
+func ParseRevokeAccountInvitationResponse(rsp *http.Response) (*RevokeAccountInvitationResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RevokeAccountInvitationResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 401:
+		var headers RevokeAccountInvitationResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers RevokeAccountInvitationResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers RevokeAccountInvitationResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 409:
+		var headers RevokeAccountInvitationResponse409Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers409 = &headers
+	case rsp.StatusCode == 500:
+		var headers RevokeAccountInvitationResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
 	}
 
 	return response, nil

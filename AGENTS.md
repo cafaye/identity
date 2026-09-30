@@ -26,6 +26,8 @@ internal/platform/db/  the pgx pool, and the readiness ping
 migrations/            goose SQL files
 client/                THE GO CLIENT: a generated transport and the hand-written wrapper
 bin/prime              the gate: go mod download && go build ./... && go test ./...
+bin/coverage-floor     the coverage floor, over the profile minus coverage-exclusions
+coverage-exclusions    DECLARED paths left out of that measurement: reason, owner, dates
 ```
 
 `client/` is deliberately NOT under `internal/`, and that is the only reason it is
@@ -251,6 +253,37 @@ tested by nothing, which is the failure mode this repository treats as a false c
 The cost of that choice is recorded in [DECISIONS.md](DECISIONS.md) D6: three extra
 modules in `go.mod` and a coverage number that moves.
 
+**The generated code is also excluded from the coverage floor — declared, and
+coarser than the lint one.** `coverage-exclusions` at the repository root declares
+`client/generated`; `bin/coverage-floor` reads it, filters the profile, and compares
+what is left against `COVERAGE_FAIL_UNDER`. Three rules are not negotiable here:
+
+- **It is DECLARED, never inferred.** An exclusion derived from a
+  `// Code generated … DO NOT EDIT.` header fails toward LESS coverage — a generator
+  that stops writing the header silently un-excludes a quarter of the module while the
+  floor stays at 70. An inferred exclusion that fails toward MORE coverage is safe;
+  one that fails toward less is not, so the path is written down and reviewed.
+- **It is a DIRECTORY, because Go's coverage step takes a package pattern and not a
+  file.** That makes it coarser than the anchored regex above, and the coarseness is
+  paid for by `TestTheCoverageExclusionIsOnlyGeneratedCode`: it enumerates every `.go`
+  file under the excluded directory and fails if one is not itself generated.
+  **`client/` would be a legal declaration and it would exempt `baseurl.go`,
+  `credentials.go`, `errors.go`, `redact.go` and every test in the package** — code a
+  reviewer is responsible for, in exchange for exempting code nobody is.
+- **The floor did not move, and no test was added to the generated code.** A test
+  written against `api.gen.go` is deleted by the next `go generate`. A floor is a
+  decrease detector, and 70 was measured against hand-written code; lowering it to
+  the number a generated file produces admits a real regression permanently, because
+  the generated code's weight in the denominator never changes.
+
+The entry carries a **reason, an owner, a `since`, an `until`, the `files=` and
+`lines=` it covers, and the floor**, and **an entry matching nothing is a failure**
+(kit's rule 4, ESLint's `reportUnusedDisableDirectives`). `files=`/`lines=` are what
+make a change of the excluded set a red build rather than a silent change of
+denominator. `bin/coverage-floor` prints the measured number, the excluded set and
+the floor in one block on every run, **including a green one** — "coverage 73.6%
+(floor 70%)" on its own is decoration, and a reader cannot tell 70% of what.
+
 **A credential must reach no string a human reads, and that is structural.** The
 client holds the token for its whole life and `err.Error()` is the single most likely
 thing in a process to end up in a log. So the rule is not care: every string the
@@ -311,6 +344,22 @@ go test -race ./...
 
 All four before a commit lands. `bin/prime` is the kit Go template; if kit
 changes it, follow kit.
+
+**The coverage floor is not one of the four, and it is not `bin/prime`'s job.**
+`bin/coverage-floor <profile>` is what enforces it, and it is only run in CI
+because it needs a profile, which needs the whole suite with a database applied.
+Running it locally is the way to see what the number is over before you commit:
+
+```sh
+go test -count=1 -coverprofile=/tmp/cov.out ./...
+bin/coverage-floor /tmp/cov.out
+```
+
+**Never lower the floor to make it pass, and never add a test to generated code
+to raise it.** `internal/platform/ci/coverage_exclusions_test.go` drives
+`bin/coverage-floor` through twenty-one deliberately broken declarations and
+profiles — including 69.9%, which is red, and 70.1%, which is green — so the floor
+is known to bite rather than assumed to.
 
 CI runs the same four, in the same order, plus `goose up` above them — see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml). A CI-only variant of

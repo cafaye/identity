@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# The coverage floor, over the profile the suite produced, minus the paths
+# coverage-exclusions declares.
+#
+#   bin/coverage-floor <coverage.out> [coverage-exclusions]
+#
+# This is not a second gate and it is not a variant of bin/prime. bin/prime is
+# kit's and is untouched; this is the implementation of the one check that used
+# to be an inline `go tool cover … | awk` inside .github/workflows/ci.yml, where
+# no test could reach it. The `coverage` step calls this, and
+# `TestTheCoverageStepRunsTheCheckedInFilter` fails if it ever stops calling it,
+# so the tested filter and the enforcing filter cannot be two programs.
+#
+# WHY A SCRIPT AND NOT A `go tool cover` PIPE
+#
+# `go tool cover -func` computes `total:` over every entry in the profile and
+# there is no flag to leave entries out. The only way to exclude a path is to
+# take it out of the profile first, and doing that with a shell pipe inside a
+# workflow step means the exclusion is a regular expression written in a YAML
+# block that nothing executes but CI. Everything below is a program with a
+# documented exit code, and TestTheCoverageFilterCanFail drives it.
+#
+# EXIT CODES
+#   0  at or above the floor, every entry validated
+#   1  below the floor, or a declaration that does not parse / is expired / is
+#      missing a field / names a path with no Go file in it (kit's rule 4)
+#   2  usage, or the profile is unreadable
+#
+# Any non-zero is a red build. There is no mode in which this exits 0 having
+# measured nothing: an unreadable declaration, a declaration with no entries, a
+# profile with no `total:` line and a profile whose filtered result has no
+# statements are all failures, because a floor that cannot be computed is not a
+# floor that is satisfied.
+set -o pipefail
+
+profile="${1:-}"
+declarations="${2:-coverage-exclusions}"
+# The floor the CALLER asserts, when it has one. `.github/workflows/ci.yml` sets
+# COVERAGE_FAIL_UNDER in its `env:` block, so that copy and the declaration's are
+# two statements of one number and the script compares them here rather than
+# letting whichever ran first win.
+asserted_floor="${3:-}"
+
+if [ -z "$profile" ]; then
+  echo "usage: bin/coverage-floor <coverage.out> [coverage-exclusions]" >&2
+  exit 2
+fi
+if [ ! -f "$profile" ]; then
+  echo "::error::no coverage profile at $profile; nothing was measured" >&2
+  exit 2
+fi
+if [ ! -f "$declarations" ]; then
+  echo "::error::no exclusion declaration at $declarations." >&2
+  echo "::error::A coverage floor with no declaration is still a floor, but this" >&2
+  echo "::error::script would be measuring a set nobody wrote down." >&2
+  exit 2
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+records="$work/records"
+
+# ---------------------------------------------------------------------------
+# READ THE DECLARATION
+#
+# One entry per line:
+#
+#   excluded coverage <prefix> files=N lines=N coverage-fail-under=N \
+#       reason="…" owner=… since=YYYY-MM-DD until=YYYY-MM-DD
+#
+# Parsed here rather than in the workflow step so that a malformed declaration
+# fails with a message naming the line, and fails identically on a developer
+# machine, in CI, and in TestTheCoverageFilterCanFail. kit's field rules are the
+# rules here: reason, owner, since and until are all required, `until` is read
+# against the clock, and an entry matching nothing is a failure.
+#
+# The grammar is deliberately small and it fails CLOSED. A line this does not
+# recognise is an error, never a skip: the failure mode of a permissive reader
+# is a file that has quietly stopped excluding anything while still reading as a
+# declaration. A quoted value is read as one token, so a reason is a sentence
+# rather than a word — a field parser that splits on spaces is a field parser
+# that cannot be given a real reason.
+#
+# Records come out tab-separated on `records`; the reason is checked for tabs
+# first, because a tab is the one character that would silently split a record.
+# ---------------------------------------------------------------------------
+awk -v file="$declarations" -v out="$records" -v today="$(date -u +%Y-%m-%d)" '
+  function fail(line_no, message) {
+    printf "  - %s:%d: %s\n", file, line_no, message > "/dev/stderr"
+    failed = 1
+  }
+  function iso_date(value) {
+    return value ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/
+  }
+  function read_fields(tail, line_no,   rest, pair, key, value, parts, i, n, tok) {
+    rest = tail
+    while (match(rest, /[a-z][a-z-]*="[^"]*"/)) {
+      pair = substr(rest, RSTART, RLENGTH)
+      key = substr(pair, 1, index(pair, "=") - 1)
+      value = substr(pair, index(pair, "=") + 2, length(pair) - index(pair, "=") - 2)
+      if (!(key in ALLOWED)) {
+        fail(line_no, "unknown field \"" key "\". An entry is either read in full or not at all")
+        next_field = 0
+      }
+      if (key in seen_field) fail(line_no, "field " key " appears twice")
+      seen_field[key] = 1
+      field[key] = value
+      rest = substr(rest, 1, RSTART - 1) " " substr(rest, RSTART + RLENGTH)
+    }
+    if (index(rest, "\"") > 0) {
+      fail(line_no, "an unbalanced quote. A quoted value must open and close on one line")
+      return
+    }
+    n = split(rest, parts, " ")
+    for (i = 1; i <= n; i++) {
+      tok = parts[i]
+      if (tok == "") continue
+      if (tok ~ /^[a-z][a-z-]*=/) {
+        key = substr(tok, 1, index(tok, "=") - 1)
+        value = substr(tok, index(tok, "=") + 1)
+      } else if (tok ~ /^[a-z][a-z-]*$/) {
+        key = tok; value = ""
+      } else {
+        fail(line_no, "cannot read \"" tok "\". Every field is key=value or key=\"value\"")
+        continue
+      }
+      if (!(key in ALLOWED)) {
+        fail(line_no, "unknown field \"" key "\". An entry is either read in full or not at all")
+        continue
+      }
+      if (key in seen_field) fail(line_no, "field " key " appears twice")
+      seen_field[key] = 1
+      field[key] = value
+    }
+  }
+  BEGIN {
+    entries = 0; failed = 0
+    ALLOWED["reason"] = 1; ALLOWED["owner"] = 1; ALLOWED["since"] = 1
+    ALLOWED["until"] = 1; ALLOWED["files"] = 1; ALLOWED["lines"] = 1
+    ALLOWED["coverage-fail-under"] = 1
+  }
+  {
+    line = $0
+    sub(/\r$/, "", line)
+    if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) next
+
+    delete seen_field
+    delete field
+
+    if (line !~ /^excluded[ \t]+/) {
+      fail(NR, "not an entry. Expected \x27excluded coverage <path-prefix> files=N lines=N " \
+               "coverage-fail-under=N reason=\"...\" owner=... since=YYYY-MM-DD until=YYYY-MM-DD\x27 " \
+               "on ONE line — a wrapped reason is two entries, one of which is a parse error")
+      next
+    }
+
+    tool = $2
+    prefix = $3
+    if (tool != "coverage") {
+      fail(NR, "unknown tool \"" tool "\". This file declares exclusions for the coverage floor only")
+      next
+    }
+    if (prefix == "" || prefix ~ /^\.\// || prefix ~ /\/$/) {
+      fail(NR, "\"" prefix "\" is not a repository-relative directory: no leading ./ and no trailing slash")
+      next
+    }
+
+    rest = line
+    sub(/^excluded[ \t]+coverage[ \t]+[^ \t]+[ \t]*/, "", rest)
+    read_fields(rest, NR)
+
+    if (field["reason"] == "") fail(NR, "entry names no reason — without one, \"generated\" becomes the reason for everything, including the hand-written file somebody put in a generated directory")
+    if (field["owner"] == "") fail(NR, "entry names no owner — an exclusion nobody owns is an exclusion nobody will ever remove")
+    if (field["since"] == "") fail(NR, "entry names no since — the ratchet needs the date the decision was taken")
+    if (field["until"] == "") fail(NR, "entry names no until — an exclusion that cannot expire has stopped being a decision")
+    if (field["files"] == "") fail(NR, "entry names no files= count, so a change to the excluded set would change the denominator silently")
+    if (field["lines"] == "") fail(NR, "entry names no lines= count, for the same reason")
+    if (field["coverage-fail-under"] == "") fail(NR, "entry names no coverage-fail-under=, so the floor and the excluded set are two facts that can drift apart")
+
+    if (!iso_date(field["since"])) fail(NR, "since=" field["since"] " is not an ISO date (YYYY-MM-DD)")
+    if (!iso_date(field["until"])) fail(NR, "until=" field["until"] " is not an ISO date (YYYY-MM-DD)")
+    if (iso_date(field["until"]) && field["until"] < today) {
+      fail(NR, "EXPIRED on " field["until"] " (today is " today "). Delete the entry, or move the date and write a new reason — a date that rolls forward by itself is not a ratchet")
+    }
+
+    if (prefix in seen_prefix) {
+      fail(NR, "duplicate entry; " prefix " is already listed on line " seen_prefix[prefix] ". Two lines for one path means one of them is no longer being read")
+    }
+    seen_prefix[prefix] = NR
+
+    reason = field["reason"]
+    if (index(reason, "\t") > 0) {
+      fail(NR, "the reason contains a tab, which is the record separator. Rewrite it without one")
+      next
+    }
+
+    entries++
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+      prefix, field["files"], field["lines"], field["coverage-fail-under"], \
+      reason, field["owner"], field["since"], field["until"] > out
+  }
+  END {
+    if (!failed && entries == 0) {
+      print "  - " file ": declares no entry. Every .go file in this module is measured, " \
+            "which is the right default — but a declaration with nothing in it is a " \
+            "declaration nobody decided to write, and the next one gets added by whoever " \
+            "is under pressure." > "/dev/stderr"
+      failed = 1
+    }
+    if (failed) exit 3
+    printf "%d\n", entries > (out ".count")
+  }
+' "$declarations"
+
+if [ ! -f "$records.count" ]; then
+  echo "::error::$declarations is not a declaration this filter can read." >&2
+  echo "::error::Fix it in the same commit. The alternative is a floor measured over" >&2
+  echo "::error::a set nobody wrote down, which is the failure this file exists for." >&2
+  exit 1
+fi
+entries="$(cat "$records.count")"
+
+# ---------------------------------------------------------------------------
+# THE FLOOR IS ONE NUMBER, AND EVERY ENTRY MUST NAME THE SAME ONE
+#
+# A second entry naming a different floor is two floors, and a floor that depends
+# on which line you read is not a floor. Checked here, and against
+# .github/workflows/ci.yml in TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor.
+# ---------------------------------------------------------------------------
+floor=""
+while IFS=$'\t' read -r prefix files lines entry_floor reason owner since until; do
+  if [ "$floor" = "" ]; then
+    floor="$entry_floor"
+  elif [ "$entry_floor" != "$floor" ]; then
+    echo "::error::$prefix names coverage-fail-under=$entry_floor and another entry names" \
+         "$floor. One floor, or none: a floor that depends on which line you read is not" \
+         "a floor." >&2
+    exit 1
+  fi
+done < "$records"
+
+if ! printf '%s' "$floor" | grep -Eq '^[0-9]+$' || [ "$floor" = "0" ]; then
+  echo "::error::coverage-fail-under=$floor is not a positive number — a gate that cannot" \
+       "fail is not a gate, and kit's default of 0 exists so adoption does not block day one." >&2
+  exit 1
+fi
+
+if [ -n "$asserted_floor" ] && [ "$asserted_floor" != "$floor" ]; then
+  echo "::error::the caller asserts a floor of $asserted_floor and $declarations says $floor." >&2
+  echo "::error::Those are two statements of one number, and they disagree, so \"70%\" means" >&2
+  echo "::error::two different things depending on which file a reader opened." >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# FILTER THE PROFILE
+#
+# A profile line is `file.go:startLine.startCol,endLine.endCol numStmts count`.
+# The path is everything before the first `:`, which is unambiguous because the
+# only colons after it are in the line/column range.
+#
+# The exclusion is a PATH PREFIX matched at a DIRECTORY boundary: the needle is
+# `/<prefix>/`, so it can only align on a whole segment. `client/generated`
+# excludes `…/client/generated/api.gen.go` and does NOT exclude
+# `…/client/generat/foo.go`, `…/client/generated_extra/…` or
+# `…/other/client/generated/…`. A bare string prefix on the directory name would
+# exempt all three, which is the broad-exclusion failure the lint exclusion in
+# .golangci.yml exists to refuse — and this one is already coarser than that one,
+# because Go's coverage step takes a package pattern and not a file.
+# ---------------------------------------------------------------------------
+filtered="$work/filtered.out"
+
+# Pass 1 — every entry must match at least one block. kit's rule 4, and the
+# reason it is a separate pass from the filtering: the failure has to name the
+# entry, and a filter that reports "you excluded everything" cannot.
+needles=""
+while IFS=$'\t' read -r prefix files lines entry_floor reason owner since until; do
+  count="$(awk -v dir="/$prefix/" '
+    NR == 1 { next }
+    {
+      path = substr($1, 1, index($1, ":") - 1)
+      if (index(path, dir) > 0) n++
+    }
+    END { print n + 0 }
+  ' "$profile")"
+
+  if [ "$count" -eq 0 ]; then
+    echo "::error::$prefix is excluded and matches NOTHING in $profile." >&2
+    echo "::error::The generator moved, the directory has no Go file in it, or it was" >&2
+    echo "::error::deleted. Either way this entry is dead weight, and dead entries" >&2
+    echo "::error::are how an allowlist becomes a list of everything (kit's rule 4," >&2
+    echo "::error::reportUnusedDisableDirectives)." >&2
+    exit 1
+  fi
+  needles="$needles /$prefix/"
+done < "$records"
+
+# Pass 2 — ONE pass that removes every line matching ANY entry.
+#
+# Cumulative on purpose, and the first version of this script got it wrong: it
+# filtered once per entry and appended each pass, so each pass re-admitted the
+# lines the previous pass had removed and only the LAST entry's exclusion was
+# real. Two entries excluding two directories measured the whole module twice
+# over and excluded one of them. The arithmetic only ever moved in the safe
+# direction — more statements in the denominator, lower percentage — which is
+# exactly why a filter's failure direction is not a substitute for it being
+# right.
+excluded_blocks="$(awk -v dirs="$needles" '
+  NR == 1 { next }
+  {
+    path = substr($1, 1, index($1, ":") - 1)
+    split(dirs, needles, " ")
+    for (i = 1; i <= length(needles); i++) {
+      if (needles[i] != "" && index(path, needles[i]) > 0) { n++; next }
+    }
+    print
+  }
+  END { print n + 0 > "/dev/stderr" }
+' "$profile" 2>"$work/excluded.count" > "$work/kept.out")"
+excluded_blocks="$(cat "$work/excluded.count")"
+
+head -1 "$profile" > "$filtered"
+cat "$work/kept.out" >> "$filtered"
+
+# ---------------------------------------------------------------------------
+# MEASURE
+#
+# covered statements divided by total statements, weighted by the statement
+# count each block carries. That IS the definition `go tool cover -func` prints
+# as its `total:` line, and it is spelled out here rather than borrowed for a
+# reason that is not elegance: `go tool cover -func` LOADS every package named in
+# the profile so it can attribute blocks to functions, so it needs the module to
+# compile and it cannot be driven by a profile a test wrote by hand. A floor whose
+# proofs need a full suite run is a floor whose proofs rot.
+#
+# The agreement between this arithmetic and the tool's own `total:` is measured,
+# not assumed: on this repository's 5,581-block profile both read 44.6% over the
+# whole module and 73.6% with `client/generated` excluded. The comparison is in
+# REPORT-identity-12-coverage.md rather than in a comment here, because a comment
+# stating a measurement is the one kind of number that goes stale quietly.
+# ---------------------------------------------------------------------------
+read -r statements covered <<<"$(awk '
+  NR == 1 { next }
+  {
+    total += $2
+    if ($3 + 0 > 0) { hit += $2 }
+  }
+  END { printf "%d %d\n", total + 0, hit + 0 }
+' "$filtered")"
+
+if [ "${statements:-0}" -eq 0 ]; then
+  echo "::error::the filtered profile has no statements. Either every package is" \
+       "excluded, or the profile is not a coverage profile." >&2
+  exit 2
+fi
+
+measured="$(awk -v c="${covered:-0}" -v t="$statements" \
+  'BEGIN { printf "%.1f", 100 * c / t }')"
+
+# ---------------------------------------------------------------------------
+# PRINT THE THREE FACTS TOGETHER, THEN COMPARE
+#
+# The measured number, the excluded set and the floor are ONE output block, and
+# they are printed BEFORE the comparison, so a reader of a green run can see what
+# the number is over. A green line that says only "coverage 73.6% (floor 70%)" is
+# decoration: 70% of what?
+#
+# The total count of entries is on the first line, on PASS as well as on FAIL,
+# for kit's reason: every entry individually looks justified, and the aggregate
+# is the problem.
+# ---------------------------------------------------------------------------
+echo "coverage ${measured}% of ${statements} statements, over the profile minus" \
+     "${excluded_blocks} block(s) this file excludes"
+echo "excluded — ${entries} declared entry/entries in $declarations:"
+while IFS=$'\t' read -r prefix files lines entry_floor reason owner since until; do
+  echo "  $prefix  files=$files lines=$lines  owner=$owner since=$since until=$until"
+  echo "      reason: $reason"
+done < "$records"
+echo "floor ${floor}%  (coverage-fail-under, restated here so the measured number, the" \
+     "excluded set and the floor are read together rather than one at a time)"
+
+if [ "$(awk -v a="$measured" -v b="$floor" 'BEGIN { print (a + 0 < b + 0) ? 1 : 0 }')" != 0 ]; then
+  echo "::error::coverage ${measured}% is below the ${floor}% floor, measured over every" \
+       "statement NOT excluded above." >&2
+  exit 1
+fi
+echo "coverage ${measured}% at or above the ${floor}% floor"
