@@ -49,7 +49,12 @@ const generatorVersion = "v2.8.0"
 const generatorModule = "github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen"
 
 // generatedFile is the committed output, relative to this package.
-const generatedFile = "api.gen.go"
+//
+// It names the SUBDIRECTORY because the generated code is its own package — the
+// header on this file's sibling, transport.go, explains why — and because a path
+// that is wrong about its directory produces a failure that reads like a missing
+// file rather than a stale constant.
+const generatedFile = "generated/api.gen.go"
 
 // generateTimeout bounds a generator run.
 //
@@ -227,17 +232,22 @@ func TestTheGateFailsWhenTheCommittedFileIsWrong(t *testing.T) {
 		t.Fatal("the committed generated file is empty, so there is nothing to perturb")
 	}
 
-	// One line, chosen as the first `package ` declaration because it is present
-	// in every possible generated output, so the fault cannot be a no-op caused
-	// by a pattern that has moved.
-	perturbed := bytes.Replace(committed,
-		[]byte("\npackage client\n"),
-		[]byte("\npackage client // perturbed by the red proof\n"),
-		1)
+	// One line, chosen as the `package` CLAUSE rather than the package name.
+	//
+	// The name is not written into the pattern: the generated code is its own
+	// subpackage, so a perturbation that assumed `package client` silently became a
+	// no-op when the output moved, and the red proof started failing for the wrong
+	// reason — a hard failure, which is better than a silent pass but still a failure
+	// about the harness rather than about the gate. Matching the clause means the
+	// perturbation survives a package rename, which is exactly the event most likely
+	// to need re-reading.
+	clause := regexp.MustCompile(`(?m)^package \w+$`)
+	perturbed := clause.ReplaceAll(committed, []byte("package perturbedbypoof"))
+
 	if bytes.Equal(perturbed, committed) {
 		t.Fatal("the red proof could not perturb the generated file: it carries no " +
-			"`package client` declaration to change. The gate is comparing a file this " +
-			"test cannot modify, so the red proof below would pass for the wrong reason.")
+			"`package <name>` clause to change. The gate is comparing a file this test " +
+			"cannot modify, so the red proof below would pass for the wrong reason.")
 	}
 
 	if bytes.Equal(committed, perturbed) {
@@ -364,7 +374,7 @@ func rewriteConfigFor(t *testing.T, root, out string) string {
 		t.Fatalf("reading %s: %v", path, err)
 	}
 
-	const key = "output: api.gen.go"
+	const key = "output: generated/api.gen.go"
 	lines := strings.Split(string(raw), "\n")
 
 	rewritten, replaced := 0, -1

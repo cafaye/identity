@@ -9,7 +9,11 @@ package client
 
 import (
 	"context"
-	"strconv"
+	"errors"
+
+	uuidlib "github.com/google/uuid"
+
+	openapiTypes "github.com/oapi-codegen/runtime/types"
 	"time"
 )
 
@@ -19,14 +23,22 @@ func contextWithTimeout(d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), d)
 }
 
-func itoa(n int) string { return strconv.Itoa(n) }
+// errorsAs is `errors.As`, named once so the credential-leak test reads as a list
+// of surfaces to sweep rather than a list of import statements.
+func errorsAs(err error, target any) bool { return errors.As(err, target) }
 
-// truncate keeps a diff line readable. A generated line can be a 400-character
-// struct tag, and four of them in a failure message is a wall rather than a
-// diagnosis.
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
+// uuidOf builds a `types.UUID` from its canonical text form, and fails the test if
+// the string is not one — which keeps a typo in a fixture from becoming a UUID that
+// silently differs from the one the test means.
+func uuidOf(s string) openapiTypes.UUID {
+	parsed, err := uuidlib.Parse(s)
+	if err != nil {
+		panic("fixture uuid " + s + ": " + err.Error())
 	}
-	return s[:max] + "…"
+	return openapiTypes.UUID(parsed)
 }
+
+// ptr is a fixture convenience: the generated structs distinguish an absent field
+// from an empty one, and a fixture that has to write `&fakeToken` for every optional
+// field is a fixture nobody keeps up to date.
+func ptr[T any](value T) *T { return &value }
