@@ -143,6 +143,54 @@ var knownDrift = map[operationKey]string{
 	{Method: "POST", Path: "/oidc/userinfo"}:  "openid.yaml declares GET only; the POST is deliberate in registerOIDCRoutes",
 }
 
+// drift is the symmetric difference between what the documents declare and what
+// the router serves, split by direction.
+//
+// It is a value and a function rather than assertions inside a test so the
+// comparison can be pointed at an injected fault: a checker that cannot be shown
+// to fail has not been shown to work, and a fault test that reimplements the
+// comparison proves nothing about the comparison.
+type drift struct {
+	// DocumentedNotServed is the forward direction: the document has it, the
+	// router does not. This is the direction that 404s a client.
+	DocumentedNotServed []string
+	// ServedNotDocumented is every operation the router serves that neither
+	// document describes.
+	ServedNotDocumented []string
+	// Unexplained is the ones knownDrift does not account for. This is what the
+	// check fails on, and the difference between it and ServedNotDocumented is a
+	// declared admission rather than an oversight.
+	Unexplained []string
+}
+
+// diff classifies the two sets. `served` is valued by the pattern the router
+// spells it with, so a failure can name a path as written — chi's `{accountID}`
+// beside the document's `{account_id}` is the thing a reader needs to see.
+func diff(contract map[operationKey]documentedOperation, served map[operationKey]string, known map[operationKey]string) drift {
+	var out drift
+
+	for key := range contract {
+		if _, ok := served[key]; !ok {
+			out.DocumentedNotServed = append(out.DocumentedNotServed, key.String())
+		}
+	}
+	for key := range served {
+		if _, ok := contract[key]; ok {
+			continue
+		}
+		label := key.String()
+		out.ServedNotDocumented = append(out.ServedNotDocumented, label)
+		if _, admitted := known[key]; !admitted {
+			out.Unexplained = append(out.Unexplained, label)
+		}
+	}
+
+	sort.Strings(out.DocumentedNotServed)
+	sort.Strings(out.ServedNotDocumented)
+	sort.Strings(out.Unexplained)
+	return out
+}
+
 // readTheContract is everything the two documents declare, keyed by the
 // normalised {method, path}. A failure to read either is a failure, not an empty
 // contract: two readers that both find nothing agree, and that is how a check
@@ -225,19 +273,7 @@ func servedRoutes(t *testing.T) map[operationKey]string {
 // review asks about first: an endpoint with no documented authentication story,
 // in a document nobody generated a client from.
 func TestEveryServedRouteIsDocumentedOrNamed(t *testing.T) {
-	contract := readTheContract(t)
-	served := servedRoutes(t)
-
-	var unexplained []string
-	for key := range served {
-		if _, documented := contract[key]; documented {
-			continue
-		}
-		if _, drift := knownDrift[key]; drift {
-			continue
-		}
-		unexplained = append(unexplained, key.String())
-	}
+	unexplained := diff(readTheContract(t), servedRoutes(t), knownDrift).Unexplained
 
 	// Every offender in one failure, not the first. A packet that fixes this
 	// should see the whole list from a single run; reporting one at a time turns
@@ -272,13 +308,7 @@ func TestEveryServedRouteIsDocumentedOrNamed(t *testing.T) {
 func TestEveryDocumentedOperationIsServed(t *testing.T) {
 	contract := readTheContract(t)
 	served := servedRoutes(t)
-
-	var unserved []string
-	for key := range contract {
-		if _, ok := served[key]; !ok {
-			unserved = append(unserved, key.String())
-		}
-	}
+	unserved := diff(contract, served, knownDrift).DocumentedNotServed
 
 	if len(unserved) > 0 {
 		sort.Strings(unserved)
