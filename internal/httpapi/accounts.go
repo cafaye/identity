@@ -353,6 +353,15 @@ func (o options) registerTenancyRoutes(r chiRouter) {
 	r.Post("/v1/accounts/{accountID}/invitations", o.requireAccountRole(accounts.RoleAdmin, o.handleInvite))
 	r.Patch("/v1/accounts/{accountID}/members/{userID}", o.requireAccountRole(accounts.RoleOwner, o.handleChangeRole))
 	r.Delete("/v1/accounts/{accountID}/members/{userID}", o.requireAccountRole(accounts.RoleAdmin, o.handleRemoveMember))
+
+	// The OIDC registrations hang off the account because a registration is
+	// scoped to one: an account's owner decides which products may sign users in
+	// to it, and the minimum for all four routes is owner. They are mounted here
+	// rather than beside the protocol routes because the authorization decision
+	// is RequireAccountRole's, and it is the same decision it makes for every
+	// other row of the matrix. Absent without WithOIDCClients, for the reason
+	// every other route is: a misconfiguration is a 404, not a 500.
+	o.registerOIDCClientRoutes(r)
 }
 
 // handleCreateAccount provisions an account and makes the caller its owner.

@@ -40,7 +40,7 @@ func newTestProvider(t *testing.T) *Provider {
 func TestDiscoveryCarriesEveryRequiredField(t *testing.T) {
 	t.Parallel()
 
-	doc := newTestProvider(t).Discovery(contextWithIssuer(t, "https://identity.test"))
+	doc := newTestProvider(t).DiscoveryFor(contextWithIssuer(t, "https://identity.test"))
 
 	// OpenID Connect Discovery 1.0 section 3 lists these as REQUIRED, and RFC 8414
 	// section 2 adds grant_types_supported and response_modes. Each is asserted by
@@ -83,7 +83,7 @@ func TestDiscoveryIssuerMatchesTheConfiguredOne(t *testing.T) {
 	t.Parallel()
 
 	const issuer = "https://identity.test"
-	doc := newTestProvider(t).Discovery(contextWithIssuer(t, issuer))
+	doc := newTestProvider(t).DiscoveryFor(contextWithIssuer(t, issuer))
 
 	if doc.Issuer != issuer {
 		t.Errorf("issuer = %q, want %q", doc.Issuer, issuer)
@@ -107,7 +107,7 @@ func TestDiscoveryIssuerMatchesTheConfiguredOne(t *testing.T) {
 func TestDiscoveryPointsAtThePathGuardHardcodes(t *testing.T) {
 	t.Parallel()
 
-	doc := newTestProvider(t).Discovery(contextWithIssuer(t, "https://identity.test"))
+	doc := newTestProvider(t).DiscoveryFor(contextWithIssuer(t, "https://identity.test"))
 
 	if want := "https://identity.test" + PathJWKS; doc.JwksURI != want {
 		t.Errorf("jwks_uri = %q, want %q; guard appends %q to its issuer and never reads this field",
@@ -121,7 +121,7 @@ func TestDiscoveryPointsAtThePathGuardHardcodes(t *testing.T) {
 func TestDiscoveryOmitsWhatThisServiceDoesNotServe(t *testing.T) {
 	t.Parallel()
 
-	doc := newTestProvider(t).Discovery(contextWithIssuer(t, "https://identity.test"))
+	doc := newTestProvider(t).DiscoveryFor(contextWithIssuer(t, "https://identity.test"))
 
 	omitted := map[string]string{
 		"introspection_endpoint":           doc.IntrospectionEndpoint,
@@ -144,7 +144,7 @@ func TestDiscoveryOmitsWhatThisServiceDoesNotServe(t *testing.T) {
 func TestDiscoveryAdvertisesOnlyWhatIsImplemented(t *testing.T) {
 	t.Parallel()
 
-	doc := newTestProvider(t).Discovery(contextWithIssuer(t, "https://identity.test"))
+	doc := newTestProvider(t).DiscoveryFor(contextWithIssuer(t, "https://identity.test"))
 
 	if !slices.Equal(doc.ResponseTypesSupported, []string{"code"}) {
 		t.Errorf("response_types_supported = %v, want [code]; there is no implicit flow", doc.ResponseTypesSupported)
@@ -174,7 +174,7 @@ func TestDiscoveryAdvertisesOnlyWhatIsImplemented(t *testing.T) {
 func TestDiscoveryClaimsAreClaimsThisServiceAsserts(t *testing.T) {
 	t.Parallel()
 
-	doc := newTestProvider(t).Discovery(contextWithIssuer(t, "https://identity.test"))
+	doc := newTestProvider(t).DiscoveryFor(contextWithIssuer(t, "https://identity.test"))
 
 	advertised := map[string]bool{}
 	for _, claim := range doc.ClaimsSupported {
@@ -244,7 +244,7 @@ func TestNewProviderAcceptsATrailingSlash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProvider with a trailing slash: %v", err)
 	}
-	doc := provider.Discovery(contextWithIssuer(t, "https://identity.test/"))
+	doc := provider.DiscoveryFor(contextWithIssuer(t, "https://identity.test/"))
 	if want := "https://identity.test" + PathToken; doc.TokenEndpoint != want {
 		t.Errorf("token_endpoint = %q, want %q with no doubled slash", doc.TokenEndpoint, want)
 	}

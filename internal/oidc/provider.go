@@ -11,6 +11,8 @@ import (
 
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
+
+	"github.com/cafaye/identity/internal/platform/id"
 )
 
 // The provider: the library's state machine, pointed at this service's storage,
@@ -178,6 +180,41 @@ func (p *Provider) Storage() *Storage { return p.storage }
 // this service verifies.
 func (p *Provider) Issuer() string { return p.issuer }
 
+// Discovery is the document for one request.
+//
+// The issuer is put into the context here rather than read out of it, because the
+// interceptor that would normally do that lives inside the library's router and
+// this document is served by this service's own router. p.issuer is the same
+// static value that interceptor would have installed, so the two paths cannot
+// disagree.
+func (p *Provider) Discovery(r *http.Request) any {
+	return p.discovery(op.ContextWithIssuer(r.Context(), p.issuer))
+}
+
+// DiscoveryFor is the document for an explicit context, which is what the tests
+// use so they can assert on it without a request in hand.
+func (p *Provider) DiscoveryFor(ctx context.Context) *oidc.DiscoveryConfiguration {
+	return p.discovery(ctx)
+}
+
+// JWKS is the published key set.
+//
+// It is rendered once per request rather than cached, and the cost is a
+// base64url encoding of a 256-byte modulus — a few microseconds, against a
+// document that a caching verifier may ask for every five minutes. Caching it
+// would be a second place for the key to live.
+func (p *Provider) JWKS() ([]byte, error) { return p.op.Storage().(*Storage).key.JWKS() }
+
+// LoginBanner is what the login page renders.
+func (p *Provider) LoginBanner(ctx context.Context, requestID string) (LoginBanner, error) {
+	return p.storage.LoginBanner(ctx, requestID)
+}
+
+// CompleteLogin records that a user authenticated against a request.
+func (p *Provider) CompleteLogin(ctx context.Context, requestID string, subject id.UUID) error {
+	return p.storage.CompleteLogin(ctx, requestID, subject)
+}
+
 // validateIssuer refuses an issuer a verifier could not reproduce.
 //
 // Two rules, both from RFC 8414 §3.3 and both of which produce a provider whose
@@ -269,7 +306,7 @@ func supportedClaims() []string {
 // Built from the library's own configuration and then narrowed, so the endpoint
 // URLs, the issuer and the algorithms come from the same place the router does
 // and cannot describe a route this service does not mount.
-func (p *Provider) Discovery(ctx context.Context) *oidc.DiscoveryConfiguration {
+func (p *Provider) discovery(ctx context.Context) *oidc.DiscoveryConfiguration {
 	doc := op.CreateDiscoveryConfig(ctx, p.op, p.op.Storage())
 
 	// The four endpoints this service mounts.
