@@ -1,0 +1,65 @@
+# oapi-codegen's configuration for the cafaye Go client.
+#
+# THE GENERATOR IS PINNED AT v2.8.0 by the `//go:generate` line in generate.go, not
+# by this file, and that split is deliberate: `go run <module>@<version>` resolves
+# in module-aware mode and ignores this module's go.mod entirely, so the GENERATOR
+# never becomes a dependency of this repository. What does become one is
+# `github.com/oapi-codegen/runtime`, which the generated code imports. See
+# client/doc.go and DECISIONS.md D2 for that finding.
+#
+# The whole configuration, because it is short enough that a reader should not
+# have to check a second file to know what this produces:
+#
+#   models: true   typed structs for every schema in openapi/v1.yaml
+#   client: true   a Client interface, one method per operationId
+#   everything else false. There is no `chi-server`, no `server`, no `spec` and
+#   no `strict-server`: this repository is the SERVICE, and this package is what
+#   calls it.
+#
+# Three options are set because each one changes the generated output, and a
+# config that only records defaults is a config nobody can tell apart from an
+# absent one.
+#
+#   name-normalizer: ToCamelCaseWithInitialisms
+#       `account_id` becomes `AccountId` rather than `AccountID`, and `oidc_clients`
+#       becomes `OidcClients`. The generator's own identifiers follow Go's
+#       initialism convention (`APIKeyScope`, `IntrospectRequest`), and a fleet
+#       where `cafaye-ts` exports `OIDCClient` and the Go client exported
+#       `OidcClient` would be a divergence in three clients for one platform,
+#       which the fleet treats as a defect. This is the DEFAULT, written down
+#       because the alternative is silent: the next person to add
+#       `name-normalizer: ToCamelCase` gets `AccountID` on every operation and a
+#       diff touching every line of the generated file.
+#
+#   skip-prune: false
+#       The default, stated because pruning is what makes a regenerated file
+#       small. `true` keeps every schema in the document whether or not any
+#       operation references it, and this document has schemas an operation does
+#       not name.
+#
+#   nullable-type: false
+#       The default. `true` would wrap `nullable: true` members in a
+#       `Nullable[T]` wrapper type rather than a pointer, and this document uses
+#       the keyword ZERO times — so the option would be a claim about a shape the
+#       contract does not have. Verified with `grep -c nullable openapi/v1.yaml`
+#       at the time of writing, and if that number is ever above zero this option
+#       is the thing to revisit.
+package: client
+
+# Relative to THIS FILE's directory, not to the directory `go generate` runs in.
+# `go generate ./client/` runs with `client/` as its working directory, so
+# `output: api.gen.go` is correct and `output: client/api.gen.go` writes to
+# `client/client/api.gen.go`. Measured, not assumed: the first version of this
+# config had the latter and produced a nested package directory that does not
+# build. If a future oapi-codegen changes this, regeneration_test.go fails on the
+# file not existing rather than on a silently misplaced tree.
+output: api.gen.go
+
+generate:
+  models: true
+  client: true
+
+output-options:
+  name-normalizer: ToCamelCaseWithInitialisms
+  skip-prune: false
+  nullable-type: false
