@@ -11,11 +11,18 @@ openapi: 3.1.0
 
 info:
   title: cafaye identity
-  # Bumped for the OIDC registration routes. No path prefix moved and no existing
-  # response shape changed, so core's sync rule asks for exactly this: a
-  # non-breaking change bumps only the document version.
-  version: 1.1.0
-  summary: Authentication, sessions, accounts, tenancy and OIDC registrations.
+  # Bumped for the OIDC registration routes and again for the multi-factor
+  # routes. No path prefix moved and no existing response shape changed, so
+  # core's sync rule asks for exactly this: a non-breaking change bumps only the
+  # document version.
+  #
+  # The 202 on POST /v1/session is the exception worth reading twice. It is a new
+  # response on an existing operation, and an existing 200 client is unaffected by
+  # it because 200 is still what an account with no second factor gets. A client
+  # that only accepts 200 is broken the moment a user enrolls, which is precisely
+  # the moment the client has to change.
+  version: 1.2.0
+  summary: Authentication, sessions, multi-factor authentication, accounts, tenancy and OIDC registrations.
   description: |
     `identity` is the cafaye platform's security boundary: it is what every other
     service asks to identify a caller.
@@ -39,6 +46,24 @@ info:
     `GET /v1/me` accepts either. An `Authorization: Bearer` header is preferred
     over the cookie when both are present, because a client holding both has said
     which one it means.
+
+    ## An account with a second factor gets a 202 and no session
+
+    `POST /v1/session` has a second success shape. When the password is correct
+    and the account has a confirmed second factor, the response is **202** with a
+    challenge and **no session at all** — no `token` field, and no session cookie.
+    The challenge authenticates nothing until it is presented with a code at
+    `POST /v1/session/mfa`, which is where the session is minted.
+
+    There is no way to get a session out of this service without answering a
+    second factor on an account that has one. That is enforced in the use case,
+    not in a middleware, so no route, no error path and no future handler can
+    arrange around it.
+
+    A `200` is still what an account with no second factor gets, and the two are
+    told apart by the status code rather than by a field: a client that only
+    accepts 200 is broken the moment a user enrolls, which is the moment it has to
+    change anyway.
 
     ## Errors
 
@@ -107,6 +132,17 @@ tags:
     description: Registration. Creating the credential is the only way to obtain one.
   - name: sessions
     description: Logging in, resolving a session, and revoking it.
+  - name: mfa
+    description: |
+      The second factor: TOTP enrollment, the login's second step, recovery codes,
+      and turning it off.
+
+      Absent entirely when `MFA_ENCRYPTION_KEY` is not configured. The management
+      routes are not mounted in that deployment, and the login's second step IS,
+      so a user who enrolled elsewhere is refused rather than let in on their
+      password. The absence of these routes says nothing about whether a second
+      factor is still required — `POST /v1/session/mfa` rides on the sessions
+      surface and answers 503 when it cannot verify a code.
   - name: oidc-clients
     description: |
       OpenID Connect client registrations: the credentials products present at
@@ -214,6 +250,19 @@ paths:
         Login does not accept an `Idempotency-Key`. A login is not safely
         repeatable — retrying it mints another session rather than returning the
         first one — so honouring the header would be a lie. See "Known gaps".
+
+        **AN ACCOUNT WITH A SECOND FACTOR GETS 202 AND NO SESSION.** The password
+        is correct and the authentication is not finished, which is what 202
+        means. The `202` body carries **no `token` key at all** — not an empty
+        one — so a client that reads `token` finds nothing and is unambiguous
+        about it. The `challenge` in that body is the token for
+        `POST /v1/session/mfa`, and it authenticates nothing until a code is
+        presented against it.
+
+        Five consecutive wrong CODES lock the second factor for fifteen minutes,
+        with `423` and `Retry-After`, and that counter is **separate from the
+        password's**: five TOTP guesses have not spent five password guesses, and
+        five wrong passwords have not moved the second factor's.
       security: []
       requestBody:
         required: true
@@ -272,6 +321,37 @@ paths:
                     instance: /v1/session
                     code: unauthorized
                     trace_id: 0af7651916cd43dd8448eb211c80319c
+        '202':
+          description: |
+            The password was correct and this account has a second factor. **No
+            session exists** and no session cookie is set.
+
+            The `challenge` is a one-time credential for `POST /v1/session/mfa`,
+            valid for ten minutes and single-use. It is also set as the
+            `__Host-mfa-challenge` cookie, which is the browser's copy and carries
+            the same value.
+
+            There is no `token` field in this schema, and that is deliberate: a
+            client that looks for one must handle its absence rather than treat an
+            empty string as a value.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Set-Cookie:
+              description: The `__Host-mfa-challenge` cookie. No `__Host-session` cookie is set.
+              schema:
+                type: string
+              example: '__Host-mfa-challenge=...; Path=/; Secure; HttpOnly; SameSite=Lax'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MFAChallenge'
+              examples:
+                default:
+                  value:
+                    mfa_required: true
+                    challenge: 1M3g7KhUlTycennyoeYRSwdey3Erdn2BfafBYTXpqxY
+                    expires_at: '2026-09-30T12:10:00Z'
         '413':
           $ref: '#/components/responses/BodyTooLarge'
         '422':
@@ -348,6 +428,475 @@ paths:
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/session/mfa:
+    post:
+      tags: [mfa]
+      operationId: completeSecondFactor
+      summary: Answer a second factor and start the session
+      description: |
+        The second half of a login for an account with a second factor, and **the
+        only route in this service that turns a second factor into a session**.
+
+        The session is created inside the same transaction that consumes the
+        challenge, so a challenge cannot be answered twice and a code cannot buy two
+        sessions.
+
+        **The challenge is accepted in the cookie or in the body**, and both are
+        supported on purpose: cafaye's conventions say "no cookies for API traffic",
+        and `POST /v1/session` returns the session token in the body as well as in
+        the cookie precisely so a non-browser client has a way in. The explicit body
+        value wins when both are present, for the reason `GET /v1/me` prefers the
+        `Authorization` header over the cookie.
+
+        A code is accepted within **one step either side** of the current one, so a
+        TOTP code is live for 90 seconds rather than 30. Zero skew would refuse any
+        code typed near a step boundary, which is when a user is most likely to be
+        reading digits off a screen, and a second factor with a visible failure rate
+        gets turned off rather than retried. Two steps or more would be ninety more
+        seconds during which a phished code still works.
+
+        **A code cannot be accepted twice.** Replay is the standard attack against
+        TOTP, and this service records the exact steps consumed: a code already used
+        is refused for the whole window, and refusing it costs nothing to the user
+        beyond the next 30-second period.
+
+        Five consecutive wrong codes lock the second factor for fifteen minutes, and
+        that counter is **separate from the password's**.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteSecondFactorRequest'
+            examples:
+              totp:
+                value:
+                  challenge: 0aO1B_UdLdgx40iTjWfNXQR0naZbS9BiM-4f50PkXR0
+                  code: '482913'
+              recovery:
+                value:
+                  challenge: 0aO1B_UdLdgx40iTjWfNXQR0naZbS9BiM-4f50PkXR0
+                  code: 7KQF-4W2X-5DTR-M3HN
+      responses:
+        '200':
+          description: |
+            The second factor was accepted and a session now exists. The same token
+            is in the body and in the cookie, and the challenge cookie is cleared.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Set-Cookie:
+              description: The `__Host-session` cookie, and the `__Host-mfa-challenge` cookie cleared.
+              schema:
+                type: string
+              example: '__Host-session=...; Path=/; Secure; HttpOnly; SameSite=Lax'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          description: |
+            The factor was refused, or no challenge was presented. The body is the
+            same for a wrong code, a recovery code that was already spent, a TOTP
+            code whose step has been used, and a value that is neither shape: five
+            different facts, and an attacker who can tell them apart learns which to
+            keep trying.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '423':
+          description: |
+            The second factor is locked after too many consecutive failures. The
+            `Retry-After` header carries the remaining window in whole seconds.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Retry-After:
+              description: Seconds until the second factor may be tried again.
+              required: true
+              schema:
+                type: integer
+                minimum: 0
+              example: '900'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          description: |
+            This deployment cannot verify a second factor, because
+            `MFA_ENCRYPTION_KEY` is not configured. It is a 503 and not a 404 on
+            purpose: a 404 would say the service has never heard of MFA, and a
+            client that believed that would be free to treat the absence of a
+            challenge as the absence of a requirement.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /v1/mfa:
+    get:
+      tags: [mfa]
+      operationId: getMFAStatus
+      summary: Whether the caller has a second factor
+      description: |
+        Returns whether this account has a confirmed second factor, when it was
+        enrolled, and how many recovery codes are left.
+
+        `recovery_codes_remaining` is here so a client can say "2 left — print a new
+        set" while there are still two. A user with zero recovery codes and a lost
+        phone is a support ticket, and the honest thing is to say so beforehand.
+
+        A `200` with `{"enabled": false}` and **not** a 404 when there is no
+        credential: the question has an answer for every signed-in user, and a
+        settings page should not have to distinguish "you have none" from "this is
+        not your account".
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: The caller's second-factor status.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MFAStatus'
+              examples:
+                enabled:
+                  value:
+                    enabled: true
+                    method: totp
+                    enrolled_at: '2026-09-30T12:04:11Z'
+                    recovery_codes_remaining: 8
+                notEnabled:
+                  value:
+                    enabled: false
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags: [mfa]
+      operationId: disableMFA
+      summary: Turn the second factor off
+      description: |
+        Requires a second factor, and a password is **not** accepted: there is no
+        route to this operation without one. Re-authentication for a destructive
+        security action is the whole reason it exists, and a user whose phone is
+        elsewhere must use a recovery code — which is why recovery codes exist.
+
+        Revokes **every session the user holds**, and emits `identity.mfa.disabled`.
+        A user who turns MFA off has very often had it turned off *for* them, and
+        every session in existence was minted under a two-factor policy.
+
+        The caller's own session is revoked by this call, so a browser is left
+        signed out. That is the honest outcome rather than an exception.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FactorRequest'
+            examples:
+              totp:
+                value:
+                  code: '482913'
+              recovery:
+                value:
+                  code: 7KQF-4W2X-5DTR-M3HN
+      responses:
+        '204':
+          description: MFA is off, every session is revoked, and the cookie is cleared.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Set-Cookie:
+              description: The `__Host-session` cookie, cleared.
+              schema:
+                type: string
+              example: '__Host-session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          description: |
+            This account has no second factor, so there was nothing to turn off.
+            A 409 rather than a 404: the caller is asking to change something that
+            does not exist, which is a different question from "is this yours".
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '423':
+          description: The second factor is locked after too many consecutive failures.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Retry-After:
+              description: Seconds until the second factor may be tried again.
+              required: true
+              schema:
+                type: integer
+                minimum: 0
+              example: '900'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/mfa/enrollments:
+    post:
+      tags: [mfa]
+      operationId: startMFAEnrollment
+      summary: Generate a TOTP secret
+      description: |
+        Generates a secret with `crypto/rand`, stores it **unconfirmed**, and returns
+        it once with its `otpauth://` provisioning URI.
+
+        `secret` and `provisioning_uri` are returned here and **never again**: there
+        is no endpoint that re-reads them, so a client that loses this response
+        starts a new enrollment, which mints a new secret. The reasoning is the one
+        an OIDC `client_secret` follows: a secret this service can produce again is a
+        secret this service is storing, and a stored TOTP secret is a second factor
+        for whoever reads the database.
+
+        **A pending enrollment is not MFA.** It expires in ten minutes, the login
+        path reads only confirmed rows, and no session is issued until
+        `/confirm`. A stored-but-never-confirmed secret is exactly the state that
+        locks somebody out of their own account.
+
+        On an account that **already** has a credential this starts a **rotation**,
+        and `code` is then required. The existing secret stays live until the
+        replacement is confirmed, so an abandoned rotation costs nothing; on
+        confirmation the old credential is deleted, which is how its codes stop being
+        accepted.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartEnrollmentRequest'
+      responses:
+        '201':
+          description: A pending enrollment, and its one-time values.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartedEnrollment'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '423':
+          description: The second factor is locked, so a rotation cannot be authorised.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Retry-After:
+              description: Seconds until the second factor may be tried again.
+              required: true
+              schema:
+                type: integer
+                minimum: 0
+              example: '900'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/mfa/enrollments/{enrollmentId}/confirm:
+    post:
+      tags: [mfa]
+      operationId: confirmMFAEnrollment
+      summary: Prove you can produce a code, and make MFA live
+      description: |
+        Verifies a code against the pending secret and, on success, makes MFA live in
+        one transaction: confirm the pending row, delete the credential it replaced
+        if any, write ten recovery codes, revoke every session the user holds, and
+        announce `identity.mfa.enabled`.
+
+        **Every session is revoked, including the caller's own.** A session minted
+        under a one-factor policy was minted on a password alone, and leaving it
+        alive means the attacker holding it does not have to solve the new problem.
+
+        The recovery codes are returned here and **never again** — no endpoint
+        re-reads them and no column stores them, only a SHA-256 digest per code.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      parameters:
+        - name: enrollmentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: |
+            The pending enrollment's own id. Another user's, an expired one's, and
+            one that has already been confirmed are all `404`, so the id is not a
+            way to learn which enrollments exist.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmEnrollmentRequest'
+      responses:
+        '200':
+          description: MFA is live, and the recovery codes are returned once.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfirmedEnrollment'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          description: |
+            The code was refused. One sentence for every way it can fail: wrong,
+            already spent, malformed, or produced by a secret this rotation has
+            already replaced.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/mfa/recovery-codes:
+    post:
+      tags: [mfa]
+      operationId: regenerateMFARecoveryCodes
+      summary: Issue a new set of recovery codes
+      description: |
+        Deletes the old set and writes the new one **in one transaction**, and
+        requires a second factor: handing out ten fresh codes is handing out ten
+        fresh ways into the account.
+
+        The atomicity is the requirement. A partial write leaves a user with two
+        live sets, which is a second recovery path through codes nobody audited and
+        nobody will ever see in a log.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FactorRequest'
+      responses:
+        '200':
+          description: A new set, returned once, and the count that replaced the old one.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryCodesResponse'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          description: |
+            The factor was refused, or this account has no second factor.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: This account has no second factor, so there are no codes to replace.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '423':
+          description: The second factor is locked after too many consecutive failures.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Retry-After:
+              description: Seconds until the second factor may be tried again.
+              required: true
+              schema:
+                type: integer
+                minimum: 0
+              example: '900'
           content:
             application/problem+json:
               schema:
@@ -937,6 +1486,342 @@ components:
             would like and the operator curates what it gets. The authorization
             endpoint, where a caller asks for a token right now, refuses.
 
+    # -----------------------------------------------------------------------
+    # the second factor
+    #
+    # The three that matter most are read in this order: MFAChallenge is what a
+    # login hands back instead of a session, FactorRequest is the one field every
+    # destructive second-factor route carries, and StartedEnrollment is the only
+    # place a TOTP secret ever appears.
+    # -----------------------------------------------------------------------
+
+    MFAChallenge:
+      type: object
+      description: |
+        The 202 from `POST /v1/session`: a correct password, an unfinished
+        authentication, and nothing else.
+
+        There is no `token` property here and adding one would be the bug this
+        document exists to prevent. The `challenge` is what `POST /v1/session/mfa`
+        is answered with, and it is worthless on its own.
+      additionalProperties: false
+      required: [mfa_required, challenge, expires_at]
+      properties:
+        mfa_required:
+          type: boolean
+          description: |
+            Always `true` in this body. It is here so a client that keys off a
+            field rather than the status code has one to key off, and a client
+            that keys off the 202 does not need to read it.
+        challenge:
+          type: string
+          minLength: 43
+          maxLength: 43
+          description: |
+            256 bits from crypto/rand, base64url without padding, presented to
+            `POST /v1/session/mfa` as `challenge` or as the
+            `__Host-mfa-challenge` cookie. Single-use and short-lived: the
+            challenge row is deleted in the same transaction that creates the
+            session, so it cannot be answered twice.
+
+            Only its SHA-256 is stored, so a database dump yields no usable
+            challenge.
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            Ten minutes, judged against the service's clock. Shorter than the
+            fifteen-minute factor lockout, deliberately: a lockout outlives its
+            own challenge, so a user who trips it can answer a fresh code against
+            a fresh challenge as soon as the window ends rather than waiting for
+            the stuck challenge to expire.
+
+    MFAStatus:
+      type: object
+      description: |
+        Whether the caller has a second factor.
+
+        A `200` with `enabled: false`, not a 404, when there is none: the question
+        has an answer for every signed-in user, and a settings page should not
+        have to distinguish "you have none" from "this is not your account".
+      additionalProperties: false
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+        method:
+          type: string
+          enum: [totp]
+          description: |
+            Absent when `enabled` is false. `"totp"` and "no method yet" are
+            different answers, which is why this is `omitempty` rather than an
+            empty string.
+        enrolled_at:
+          type: string
+          format: date-time
+          description: When the credential was confirmed. Absent when `enabled` is false.
+        recovery_codes_remaining:
+          type: integer
+          minimum: 0
+          description: |
+            How many unused recovery codes are left. Absent when `enabled` is
+            false.
+
+            It is here so a client can say "2 left — print a new set" while there
+            are still two. A user with zero codes and a lost phone is a support
+            ticket, and the honest thing is to say so beforehand.
+
+    FactorRequest:
+      type: object
+      description: |
+        The body of every route that changes or relies on an existing second
+        factor.
+
+        **One field, not `code` and `recovery_code`.** The consequence of getting
+        this wrong is identical either way, and two fields would let a client put
+        a recovery code in the TOTP field and be told the code was malformed rather
+        than not accepted, which is a worse error to act on. This service decides
+        which shape it is and then answers the same way for both.
+      additionalProperties: false
+      required: [code]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: |
+            A six-digit TOTP code, or a recovery code in the form
+            `XXXX-XXXX-XXXX-XXXX`. Surrounding whitespace is ignored; nothing else
+            is.
+
+            A code is not echoed back in any response, and never appears in a log
+            line or a problem body.
+
+    CompleteSecondFactorRequest:
+      type: object
+      description: |
+        The second half of a login. `challenge` is optional here and required in
+        effect — omitting it entirely, with no challenge cookie either, is a 401.
+      additionalProperties: false
+      required: [code]
+      properties:
+        challenge:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: |
+            The challenge from the 202. **Optional, because the
+            `__Host-mfa-challenge` cookie is accepted instead** — the cookie is the
+            browser's route and this field is the API client's, exactly as
+            `POST /v1/session` returns the session token in the body as well as in
+            the cookie so a non-browser client has a way in.
+
+            When both are present the body wins. A client holding both has said
+            which one it means, and answering from ambient browser state would
+            make the result depend on invisible cookies.
+        code:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: A six-digit TOTP code, or a recovery code. Same shapes as `FactorRequest.code`.
+
+    StartEnrollmentRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: |
+            Required **only** when this account already has a credential, where
+            the request is a rotation.
+
+            The service decides which case it is from the rows, so sending a code
+            for a first enrollment is not wrong, only redundant — which is why
+            this is optional in the schema and required in prose. Refusing the
+            redundant one would be a 422 that teaches a client nothing.
+
+    StartedEnrollment:
+      type: object
+      description: |
+        A pending TOTP enrollment, and the only response in this document that
+        contains a TOTP secret.
+
+        **The secret is here and nowhere else.** There is no endpoint that
+        re-reads it, so a client that loses this body starts a new enrollment,
+        which mints a new secret. The reasoning is the one an OIDC
+        `client_secret` follows: a secret this service can produce again is a
+        secret this service is storing, and a stored TOTP secret is a second
+        factor for whoever reads the database.
+
+        Nothing here is a session, and nothing here is MFA. A pending enrollment
+        is unread by the login path, so until `/confirm` is called this account
+        has no second factor.
+      additionalProperties: false
+      required: [enrollment_id, secret, provisioning_uri, method, digits, period_seconds, algorithm, expires_at, replaced]
+      properties:
+        enrollment_id:
+          type: string
+          format: uuid
+          description: |
+            The id to confirm. It is the pending row's own id, and another user's,
+            an expired one's and an already-confirmed one's are all 404 — so it is
+            not a way to learn which enrollments exist.
+        secret:
+          type: string
+          description: |
+            base32, no padding, 160 bits from crypto/rand. The shared secret for
+            `HMAC-SHA1`, and the half of the factor the phone holds.
+
+            Stored **encrypted**, not hashed: verifying a code means computing an
+            HMAC with this value, so a hash would be useless. At rest it is
+            AES-256-GCM ciphertext under `MFA_ENCRYPTION_KEY`, with the user's id
+            as additional authenticated data.
+        provisioning_uri:
+          type: string
+          format: uri
+          description: |
+            An `otpauth://totp/…` URI, which is what a QR code encodes. Contains
+            `secret`, so it is not shareable and not cacheable.
+        method:
+          type: string
+          enum: [totp]
+        digits:
+          type: integer
+          enum: [6]
+          description: The code length. Fixed, and 6 because that is what authenticator apps display.
+        period_seconds:
+          type: integer
+          enum: [30]
+          description: |
+            The step, 30 seconds. Returned rather than assumed so a client can
+            render a countdown without hard-coding it.
+        algorithm:
+          type: string
+          enum: [SHA1]
+          description: |
+            `SHA1`, and not a preference: it is the only HMAC every authenticator
+            app implements. A user whose app rejected SHA1 has no app.
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            Ten minutes. An unconfirmed enrollment is deleted after this, because
+            a stored-but-never-confirmed secret is exactly the state that locks
+            somebody out of their own account.
+        replaced:
+          type: boolean
+          description: |
+            `true` when this enrollment is replacing an existing credential.
+
+            The old secret is **still live** until this one is confirmed, so an
+            abandoned rotation costs nothing and the user is not left with a dead
+            phone. `replaced` is what lets a client say so out loud rather than
+            leave them to discover it.
+
+    ConfirmEnrollmentRequest:
+      type: object
+      additionalProperties: false
+      required: [code]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: |
+            A six-digit code computed from this enrollment's `secret`.
+
+            Required always, and an absent one is the only 422 on this surface:
+            the code is required rather than wrong, and telling those apart saves
+            a user staring at a six-digit box wondering what they did.
+
+            Wrong, already spent, malformed, and produced by a secret this
+            rotation has already replaced are all the same 401. They are four
+            different facts and a client that can tell them apart learns which to
+            keep trying.
+
+    ConfirmedEnrollment:
+      type: object
+      description: |
+        MFA is live, and here are the recovery codes, once.
+
+        **Every session this account holds was revoked to produce this response**,
+        including the caller's. A session minted under a one-factor policy was
+        minted on a password alone, and leaving it alive means whoever holds it
+        does not have to solve the new problem.
+
+        The response is therefore `200` and not `204`: there is real content, and
+        that content exists exactly once.
+      additionalProperties: false
+      required: [enabled, method, enrolled_at, recovery_codes, replaced_existing_secret]
+      properties:
+        enabled:
+          type: boolean
+          enum: [true]
+        method:
+          type: string
+          enum: [totp]
+        enrolled_at:
+          type: string
+          format: date-time
+        recovery_codes:
+          type: array
+          minItems: 10
+          maxItems: 10
+          items:
+            type: string
+            pattern: '^[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}$'
+          description: |
+            Ten codes, 80 bits each, and **never readable again**: no endpoint
+            re-reads them and no column stores them, only a SHA-256 digest per
+            code. Each is accepted exactly once and is destroyed by use.
+
+            80 bits is a floor, not a style choice. A six-digit TOTP code is 20
+            bits and is only safe because it changes every 30 seconds and cannot
+            be retried; a recovery code does not change, so a short one would be
+            guessable at leisure.
+        replaced_existing_secret:
+          type: boolean
+          description: |
+            `true` when this confirmation replaced a credential. The old one is
+            deleted by this call, which is what makes its codes stop being
+            accepted — the old phone stops working at the moment of confirmation,
+            not at the moment the rotation started.
+
+    RecoveryCodesResponse:
+      type: object
+      description: |
+        A fresh set of recovery codes. The old set is destroyed by this call, in
+        the same transaction that writes the new one.
+
+        A partial write would leave a user with two live sets, which is a second
+        recovery path through codes nobody audited and nobody will ever see in a
+        log. That is the requirement this route exists to satisfy.
+      additionalProperties: false
+      required: [recovery_codes, issued_at, recovery_codes_remaining]
+      properties:
+        recovery_codes:
+          type: array
+          minItems: 10
+          maxItems: 10
+          items:
+            type: string
+            pattern: '^[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}$'
+          description: |
+            The new set, returned once and never again. Same 80-bit value as
+            `ConfirmedEnrollment.recovery_codes`, and the same one-shot guarantee.
+        issued_at:
+          type: string
+          format: date-time
+        recovery_codes_remaining:
+          type: integer
+          enum: [10]
+          description: |
+            Always 10. It is the count of the set just issued rather than a read
+            back from storage, because a client rendering "you now have N codes"
+            wants N and not a round trip to learn it.
+
     Problem:
       type: object
       description: |
@@ -985,6 +1870,7 @@ components:
             - method_not_allowed
             - invalid_json
             - payload_too_large
+            - service_unavailable
         trace_id:
           type: string
           description: Always present, always equal to the `X-Trace-Id` response header.
@@ -1196,21 +2082,37 @@ components:
 #    safely repeatable, since retrying it mints a second session rather than
 #    returning the first.
 #
-# 2. Three error codes are not in core's reserved list.
+# 2. Four error codes are not in core's reserved list.
 #
 #    `account_locked` (423) is required by the brute-force lockout this packet
-#    specifies, and core's list has no entry for a locked account. The other two,
-#    `invalid_json` (400) and `payload_too_large` (413), are the honest answers
-#    for a syntactically broken and an oversized body; folding them into
+#    specifies, and core's list has no entry for a locked account. `invalid_json`
+#    (400) and `payload_too_large` (413) are the honest answers for a
+#    syntactically broken and an oversized body; folding them into
 #    `validation_failed` would have reported both as semantic failures, and 400
 #    for malformed syntax is exactly what core's own status conventions reserve.
 #
-#    Proposal for core, not a fait accompli: add `account_locked` mapped to 423
-#    and `payload_too_large` mapped to 413 to the reserved list. `invalid_json`
-#    may be better folded into `validation_failed` at 400, since core's list is
-#    keyed by slug and one slug cannot carry two statuses.
+#    `service_unavailable` (503) is the newest and the narrowest. It appears on
+#    exactly one condition: `MFA_ENCRYPTION_KEY` is not configured, so the login's
+#    second step exists, is reached, and cannot verify a code. It is a 503 and not
+#    a 404 on purpose — a 404 would say this service has never heard of MFA, and
+#    a client that believed that would be free to read the absence of a challenge
+#    as the absence of a requirement and fall back to the password.
 #
-# 3. `info.version: 1.0.0` is set.
+#    Note that core's list does carry a `unavailable` slug, and folding this into
+#    it was the obvious option. It was rejected because `unavailable` is this
+#    service's readiness-probe answer — the whole of its meaning is "a dependency
+#    is down" — and one slug cannot also mean "this deployment is not configured to
+#    do a thing it advertises". A client that wants to retry with backoff can key
+#    on the status alone; a client that wants to tell the user "ask your
+#    administrator" can key on this code, and that is the difference.
+#
+#    Proposal for core, not a fait accompli: add `account_locked` mapped to 423,
+#    `service_unavailable` mapped to 503 and `payload_too_large` mapped to 413 to
+#    the reserved list. `invalid_json` may be better folded into
+#    `validation_failed` at 400, since core's list is keyed by slug and one slug
+#    cannot carry two statuses.
+#
+# 3. `info.version` is set, and it is at 1.2.0.
 #
 #    core's versioning section carries an open decision (D4) about whether a
 #    document version is required alongside the `/v1` path prefix, precisely
@@ -1242,8 +2144,16 @@ components:
 #
 #  * The `bearerToken` scheme is `http`/`bearer` with an opaque token, not a JWT.
 #    core's auth section describes JWTs for service-to-service traffic verified
-#    against identity's JWKS. These are server-side session tokens, and the OIDC
-#    provider that issues JWTs is a later packet.
+#    against identity's JWKS. These are server-side session tokens: revocation is a
+#    row delete that takes effect on the next request, which a self-contained JWT
+#    cannot do. The OIDC provider DOES issue JWTs, and those are verified against
+#    the JWKS in `openid/openid.yaml`.
+#  * `POST /v1/session/mfa` is on the `sessions` tag, not the `mfa` one, and it is
+#    mounted even in a deployment with no `MFA_ENCRYPTION_KEY`. It is the rest of
+#    the login, it lives with the login, and it answers `503` rather than being
+#    absent. A client must therefore not infer "MFA is off" from a 404 on a
+#    management route — the only statement that MFA is off is a `200` from
+#    `GET /v1/mfa` with `enabled: false`.
 #  * There is no CSRF token on the cookie surface. `SameSite=Lax` plus a
 #    state-changing surface that is POST/DELETE only and carries no ambient
 #    authority covers the ordinary case; the explicit double-submit token belongs
