@@ -6,6 +6,56 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed (packet identity-14-rename)
+
+- **`core: ^0.1.0` → `^0.2.0`, and it is the whole of what the contract checker
+  had to say about this service's version.** The bump and the rename travel in
+  one commit because core 0.2.0's changelog requires it, and a rename that left
+  the range at `^0.1.0` would be a rename nobody is allowed to ship. Before it,
+  `harness/bin/cafaye-contract` reported `core.constraint-unmet`: core publishes
+  0.2.0 and this service declared a range that does not contain it. After it,
+  that finding is gone. Nothing about this service's behaviour changed — it has
+  published three-segment, service-prefixed event types from the beginning, so
+  the declaration was the stale half, not the code.
+
+- **The two-segment `account.created` is gone from the repository, and it was
+  never a published type.** The packet for this work said identity "publishes
+  `account.created`, two segments, the forbidden form". It does not, and it
+  never did: all twelve published event types in `internal/outbox` are
+  three-segment and carry the `identity.` prefix, and `core`'s own
+  `REPORT-core-17.md` measured and reported the same thing before this packet
+  started. The bare string survived only in prose — two comments and the short
+  labels of one test's map — and those are now written in the three-segment
+  form, so `grep '\baccount\.created\b'` over the tree returns nothing outside a
+  qualified `identity.account.created`.
+
+- **`exposes.events` is checked against what the code emits, which no core rule
+  does.** Every rule in core's `harness/rules.json` reads a declaration; none
+  reads a service's source. So an event the code emits and the manifest never
+  names is invisible to all of them at once — and in this repository five are:
+  `identity.account.created`, `identity.member.invited`, `identity.member.accepted`,
+  `identity.member.role_changed` and `identity.member.removed`, all emitted from
+  `internal/accounts/service.go` and declared nowhere.
+  `TestTheManifestDeclaresEveryEmittedEvent` compares the two as sets, which is
+  how a single declare-and-drop pair is caught: a count would not move.
+  `knownUndeclaredEvents` pins the current five, and **it can neither grow nor
+  empty quietly** — a new undeclared event is red, and a declared event whose pin
+  was left behind is red, so the list only shrinks by a packet declaring the
+  event. The five are not declared because declaring them is blocked on **core**,
+  not here: `event.payload-schema-missing` reads `schemas/events/…` out of the
+  core checkout, and core ships one identity payload schema for twelve published
+  types. Declaring them today would trade a silent gap for five loud reds.
+  Each of the four rules is proved red, not assumed — see the report.
+
+- **A stale claim about core in `cafaye.yml` is corrected.** The comment on
+  `identity.user.created` said core's catalog "currently disagrees" and spells
+  the event `user.created`, and recorded it as open decision D1. core 0.2.0
+  closed D1, froze three segments with no exceptions, and its catalog row now
+  reads `identity.user.created` — so the two halves of that disagreement now say
+  the same thing, and the reason they do is this release's `core: ^0.2.0`. The
+  note is kept because the failure it describes is still live for the OIDC types
+  below it, where core's catalog has no row at all.
+
 ### Added (packet identity-12-coverage)
 
 - **The coverage floor has an exclusion mechanism, declared, and the floor did not

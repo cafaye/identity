@@ -33,7 +33,17 @@ language: go
 
 # The range of the core spec this service was written against. Service CI pins
 # core to a release inside it.
-core: ^0.1.0
+#
+# ^0.2.0, bumped with identity-14. This service has published three-segment,
+# service-prefixed event types from the beginning, so nothing about its own
+# behaviour changed with the bump — it is the DECLARATION that was stale. Core
+# froze the grammar in 0.2.0 and `harness/bin/cafaye-contract` resolves this
+# field, so a `^0.1.0` line against a 0.2.0 core is a red build
+# (`core.constraint-unmet`) that says the service is compiling against a core it
+# said it would not. The two travel in one commit on purpose: 0.2.0's changelog
+# requires the rename and the bump together, and a rename that leaves the range
+# at ^0.1.0 is a rename nobody is allowed to ship.
+core: ^0.2.0
 
 exposes:
   # The repository-relative path to the OpenAPI 3.1 document describing the HTTP
@@ -44,23 +54,23 @@ exposes:
   events:
     # Emitted by POST /v1/users, in the same transaction as the user row.
     #
-    # THIS IS THE THREE-SEGMENT FORM, AS SPECIFIED BY THE PACKET FOR THIS
-    # SERVICE — and core's catalog currently disagrees. core's
-    # docs/event-naming.md spells this event `user.created` in two places: the
-    # catalog row, and examples/valid/go-api.cafaye.yml. The same document's rule
-    # 2 requires the service prefix only when the bare entity name is generic
-    # (key, token, event, file, job, config, webhook, asset, secret); `user` is
-    # not on that list.
+    # THIS IS THE THREE-SEGMENT FORM, AND CORE NOW AGREES. It used not to:
+    # this line and the constant in internal/outbox/envelope.go were the two
+    # halves of a recorded disagreement, because core's docs/event-naming.md
+    # spelled this event `user.created` and its rule 2 then required the service
+    # prefix only for a generic entity name (key, token, event, file, job,
+    # config, webhook, asset, secret) — and `user` is not on that list. core
+    # recorded it as open decision D1 and named the three-segment form as the
+    # alternative it was not using.
     #
-    # core records this as an open decision (D1) and names the three-segment form
-    # as the alternative it is not currently using. This service follows the
-    # packet, which specified it twice.
+    # core 0.2.0 settled it the other way: D1 is closed, every type is three
+    # segments and always prefixed with no exceptions, and the catalog row reads
+    # `identity.user.created`. So the two halves now say the same thing and the
+    # reason they say the same thing is this file's `core: ^0.2.0`.
     #
-    # The disagreement is one line here and one constant in
-    # internal/outbox/envelope.go. A manager ruling the other way is a one-line
-    # change — but it MUST be both lines at once, or the service will emit one
-    # spelling and advertise the other, which is the only genuinely bad outcome
-    # available here.
+    # A note for whoever reads the old version of this comment: it is kept
+    # because the failure it describes is still the live one for the OIDC types
+    # below, where core's catalog has no row at all.
     - identity.user.created
 
     # The OIDC registrations. Emitted by POST /v1/accounts/{account_id}/oidc-clients
@@ -115,14 +125,39 @@ exposes:
     - identity.api_key.created
     - identity.api_key.revoked
 
-    # Not yet emitted, and deliberately absent rather than declared and unimplemented:
-    #   user.email_verified   the email-verification packet
-    #   account.created       the accounts and tenancy packet
-    #   member.invited        the accounts and tenancy packet
-    #   member.joined         the accounts and tenancy packet
-    #   member.removed        the accounts and tenancy packet
-    #   member.role_changed   the accounts and tenancy packet
-    #   session.revoked       a later packet; DELETE /v1/session does not emit it yet
+    # Every name below is written in core's 0.2 three-segment form, because that
+    # is the form the schema accepts and the form `event.own-prefix` reads. The
+    # two-segment spellings this list used to carry are the v0.1 grammar core
+    # froze away, and a reader copying one out of a comment gets a type the
+    # pattern refuses.
+    #
+    # NOT EMITTED, and deliberately absent rather than declared and unimplemented:
+    #   identity.user.email_verified   the email-verification packet
+    #   identity.member.joined         see the note on identity.member.accepted
+    #   identity.session.revoked       a later packet; DELETE /v1/session does
+    #                                  not emit it yet
+    #
+    # EMITTED BUT NOT DECLARED HERE, which is a real gap and not an oversight:
+    #   identity.account.created       internal/accounts/service.go
+    #   identity.member.invited        internal/accounts/service.go
+    #   identity.member.accepted       internal/accounts/service.go
+    #   identity.member.role_changed   internal/accounts/service.go
+    #   identity.member.removed        internal/accounts/service.go
+    #
+    # The code emits all five; this list does not name them, and that is why
+    # core's contract checker stays quiet about them. Declaring them is blocked
+    # on core, not on this file: `event.payload-schema-missing` reads
+    # `schemas/events/…` out of the CORE checkout, and core ships one identity
+    # payload schema (user/created) for twelve published types. Declaring these
+    # five today would trade a silent gap for five loud reds. So they stay
+    # undeclared, the gap is written down here, and
+    # `TestTheManifestDeclaresEveryEmittedEvent` in internal/platform/ci pins the
+    # exact set so it cannot grow unnoticed.
+    #
+    #   identity.member.accepted is the one with no catalog row at all: core's
+    #   docs/event-naming.md calls this fact `identity.member.joined`, and the
+    #   divergence is a recorded manager decision, not a typo. See the constant
+    #   in internal/outbox/tenancy.go.
     #
     # Also absent, and the omission is deliberate rather than pending: the OIDC and
     # MFA packets land in THIS file's `events` list above rather than in this
