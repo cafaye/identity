@@ -1,8 +1,26 @@
+#!/bin/sh
 # The gate for a Go repository in the cafaye org. Download, build, test.
 #
 #   bin/prime
 #
 # This is the kit Go template; if kit changes it, follow kit.
+#
+# The shebang is load-bearing and it was MISSING from this file until
+# gate.yml (packet identity-13-gate). This file has the executable bit and no
+# interpreter line, so execve(2) on it fails with ENOEXEC. A shell running
+# `./bin/prime` never notices — bash and zsh both fall back to interpreting a
+# shebang-less file themselves — which is why a developer and CI were both green
+# while `core`'s `harness/gate_check.py`, which runs the declared gate with
+# subprocess and NO shell, could not start it at all:
+#
+#     FAIL gate.command-missing: gate.command could not be started:
+#          [Errno 8] Exec format error: 'bin/prime'
+#
+# Every other bin/prime in the fleet carries an interpreter line (kit's own Go
+# template ships `#!/bin/sh`); this one lost it at scaffold time in identity-01
+# and nothing noticed for twelve packets. `#!/bin/sh` and not `bash`: the body
+# is three commands and `set -eu`, which is POSIX, and the fleet's Go template
+# pins the more portable of the two.
 set -eu
 
 go mod download
