@@ -311,8 +311,8 @@ type ConfirmedEnrollment struct {
 //
 // FOUR WRITES IN ONE TRANSACTION, and the order is the argument:
 //
-//  1. confirm the pending row          (conditional: one winner)
-//  2. delete the credential it replaced, if any
+//  1. delete the credential it replaces, if any  (first — see the note below)
+//  2. confirm the pending row                     (conditional: one winner)
 //  3. delete the old recovery codes and write the new set
 //  4. revoke every session the user holds
 //  5. append identity.mfa.enabled
@@ -326,9 +326,14 @@ type ConfirmedEnrollment struct {
 // every other device they were signed in on, which is a real price, and it is
 // the price of the change actually meaning something.
 //
-// The same revocation is why a rotation replaces the old row in step 2 rather
-// than keeping it: after a secret rotation the old secret's codes must be refused,
-// and the way to refuse them is not to have the secret any more.
+// STEP ONE IS FIRST because the unique index mfa_credentials_one_live_per_user
+// refuses a second confirmed row for a user, so the replacement cannot be confirmed
+// until the original is gone. The ordering is safe because both statements share
+// this transaction: a confirmation that then loses its race rolls the deletion back
+// with it, leaving the user with the factor they had. It is also how a rotation
+// invalidates the old secret — after it, the old secret is not merely unconfirmed,
+// it is not stored, which is the only reliable way to stop its codes being
+// accepted.
 func (s *Service) Confirm(ctx context.Context, in ConfirmInput) (ConfirmedEnrollment, error) {
 	now := s.clk.Now()
 	q := s.read.Queryer()
@@ -368,6 +373,21 @@ func (s *Service) Confirm(ctx context.Context, in ConfirmInput) (ConfirmedEnroll
 
 	var out ConfirmedEnrollment
 	err = s.uow.Do(ctx, func(ctx context.Context, q db.Querier) error {
+		// THE OLD CREDENTIAL GOES FIRST, and the order is not cosmetic. The unique
+		// index mfa_credentials_one_live_per_user refuses a second confirmed row
+		// for a user, so confirming the replacement before deleting the original
+		// would trip the very constraint that makes "at most one live credential"
+		// true. Deleting first is safe precisely because both statements share this
+		// transaction: a confirm that then loses its race returns an error, and the
+		// deletion rolls back with it, so the user is left with the factor they had
+		// rather than with none.
+		if isRotation {
+			if err := s.store.DeleteCredential(ctx, q, previous.ID); err != nil {
+				return err
+			}
+			out.ReplacedCredentialID = previous.ID
+		}
+
 		confirmed, won, err := s.store.ConfirmCredential(ctx, q, pending.ID, now)
 		if err != nil {
 			return err
@@ -376,18 +396,8 @@ func (s *Service) Confirm(ctx context.Context, in ConfirmInput) (ConfirmedEnroll
 			// Somebody confirmed it between the read and here. Refusing is the
 			// honest answer: this caller cannot produce a second set of recovery
 			// codes for a credential that is already live, because it does not
-			// know the first set.
+			// know the first set. The rollback above restores whatever was deleted.
 			return ErrEnrollmentNotFound
-		}
-
-		if isRotation {
-			// The old secret stops being stored, which is how its codes stop
-			// being accepted. The unique index mfa_credentials_one_live_per_user
-			// is what proves the two could never have been live at the same time.
-			if err := s.store.DeleteCredential(ctx, q, previous.ID); err != nil {
-				return err
-			}
-			out.ReplacedCredentialID = previous.ID
 		}
 
 		if err := s.replaceRecoveryCodes(ctx, q, confirmed.ID, codes, now); err != nil {
@@ -568,21 +578,33 @@ func (c Claim) RecoveryCodesRemaining() int { return c.recoveryCodesRemaining }
 //     enrollment is not one.
 //  2. If the second factor's own counter has locked, refuse before verifying
 //     anything — there is no reason to spend work on a credential nobody may use,
-//     and it means a locked factor cannot be probed.
+//     and it means a locked factor cannot be probed with a correct code.
 //  3. Decrypt the secret. A deployment with no key refuses here, closed.
 //  4. Check the shape of the code, and match it: TOTP first, recovery second.
-//  5. Claim the step, or find the unused recovery code. Either may come back
-//     false, which is a replay and a loss of a race respectively, and both are
-//     ErrInvalidFactor.
+//  5. CLAIM what matched — the step, or the recovery code. Each claim is a single
+//     conditional statement, so two requests carrying the same code resolve to one
+//     winner here and one refusal.
 //  6. On any failure, count it and persist the count, on its OWN querier. A
 //     lockout that is not written down is not a lockout.
 //
-// Step 5 is deliberately a CLAIM and not a check. It runs outside the
-// transaction that will mint the session, so a claim that succeeds is one the
-// service will honour; Commit then re-does it conditionally inside the
-// transaction, and if another request got there first Commit's conditional
-// statement returns false and the whole thing rolls back. Two claims, one winner,
-// no lock held across the session write.
+// STEP 5 IS THE CLAIM, AND Commit DOES NOT REPEAT IT. That is a decision with a
+// cost and both halves are worth stating:
+//
+//   - The claim IS the single-use guarantee. Once it succeeds, exactly one request
+//     in the world holds this Claim, and only that request goes on to mint a
+//     session. Claiming again inside the session's transaction would buy nothing —
+//     a conditional claim cannot succeed twice.
+//   - The cost is a burnt window on a 500. The claim commits before the session
+//     exists, so a database failure between the two leaves the step spent and the
+//     user waiting for the next one: thirty seconds, no session, one 500. The
+//     alternative, claiming only inside the transaction, means a replayed code
+//     never reaches the failure counter at all, because the claim and the refusal
+//     would roll back together — and a code that cannot be counted is a code an
+//     attacker may present without limit.
+//
+// The failure counter is written through the pool rather than a transaction for the
+// reason auth.Login writes it there: a counter rolled back along with the refusal
+// it provoked is not a counter.
 func (s *Service) VerifyFactor(ctx context.Context, userID id.UUID, code string, now time.Time) (Claim, error) {
 	q := s.read.Queryer()
 
@@ -723,41 +745,29 @@ func (s *Service) matchFactor(ctx context.Context, credential Credential, code s
 	}
 }
 
-// Commit spends a claim, inside the caller's transaction.
+// Commit finishes an accepted factor, inside the caller's transaction.
 //
-// Every statement here is conditional, and each one returning false is a lost
-// race that rolls the whole transaction back — including the session write the
-// caller has already done. That is the point: two requests carrying the same
-// code resolve to one session, not two.
+// WHAT IT DOES: consume the challenge, prune the spent steps, and clear the second
+// factor's failure run. Each of those is conditional where it can be, and a lost
+// race returns an error that rolls the caller's whole transaction back — including
+// the session write the caller has already done. That is the point: two requests
+// carrying the same challenge resolve to one session, not two.
 //
-// Commit also clears the second factor's failure run, because "this factor was
-// accepted" and "the run against this factor is over" are one fact and the
+// WHAT IT DELIBERATELY DOES NOT DO: claim the step or the recovery code again.
+// VerifyFactor already claimed them, atomically, in a statement of its own — see
+// its comment for why the claim is not repeated here and what that costs.
+//
+// Clearing the failure run belongs in the caller's transaction because "this factor
+// was accepted" and "the run against this factor is over" are one fact, and the
 // mirror of what auth does for the password on the same transaction.
 func (s *Service) Commit(ctx context.Context, q db.Querier, claim Claim, now time.Time) error {
 	if claim.step > 0 {
-		spent, err := s.store.ClaimStep(ctx, q, claim.credentialID, claim.step, now)
-		if err != nil {
-			return err
-		}
-		if !spent {
-			return ErrInvalidFactor
-		}
 		// Bounded by construction: everything below the oldest step still inside
 		// the window can no longer be presented, so it goes now. This is the whole
 		// of the table's housekeeping, and it needs no sweeper.
 		oldest := StepAt(now, Period) - int64(SkewSteps+1)
 		if err := s.store.PruneSteps(ctx, q, claim.credentialID, oldest); err != nil {
 			return err
-		}
-	}
-
-	if !claim.recoveryCodeID.IsZero() {
-		spent, err := s.store.ConsumeRecoveryCode(ctx, q, claim.recoveryCodeID, now)
-		if err != nil {
-			return err
-		}
-		if !spent {
-			return ErrInvalidFactor
 		}
 	}
 
