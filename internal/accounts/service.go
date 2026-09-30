@@ -139,7 +139,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Created, error) {
 	return out, nil
 }
 
-// ProvisionPersonal creates the account a registration gives its user, and
+// Provision creates the account a registration gives its user, and
 // AddOwner gives that user the owner role in it.
 //
 // Neither opens a transaction and neither may: they run inside the
@@ -151,7 +151,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Created, error) {
 // The slug is derived from the user id rather than the name, because two people
 // can share an email local part and the second must still be able to sign up.
 // See PersonalSlug.
-func (s *Service) ProvisionPersonal(ctx context.Context, q db.Querier, userID id.UUID, email string) (Account, error) {
+func (s *Service) Provision(ctx context.Context, q db.Querier, userID id.UUID, email string) (Account, error) {
 	if userID.IsZero() {
 		return Account{}, ErrNotAMember
 	}
@@ -177,7 +177,7 @@ func (s *Service) ProvisionPersonal(ctx context.Context, q db.Querier, userID id
 }
 
 // AddOwner creates an owner's membership and announces the account. It pairs
-// with ProvisionPersonal inside a registration's transaction.
+// with Provision inside a registration's transaction.
 func (s *Service) AddOwner(ctx context.Context, q db.Querier, accountID, userID id.UUID) (Membership, error) {
 	account, err := s.store.ByID(ctx, q, accountID)
 	if err != nil {
@@ -189,7 +189,7 @@ func (s *Service) AddOwner(ctx context.Context, q db.Querier, accountID, userID 
 	}
 	// The event belongs to the registration, not to the membership: there is one
 	// account.created for the account, and writing it here rather than in
-	// ProvisionPersonal is what keeps it next to the row it announces.
+	// Provision is what keeps it next to the row it announces.
 	event, err := outbox.NewAccountCreated(s.clock.Now(), account.ID, account.Name, account.Slug, account.Personal, userID)
 	if err != nil {
 		return Membership{}, err

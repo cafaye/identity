@@ -815,10 +815,10 @@ func TestDelete(t *testing.T) {
 	}
 }
 
-// ProvisionPersonal and AddOwner do not open their own transactions: they run
+// Provision and AddOwner do not open their own transactions: they run
 // inside the registration's, which is the whole point of the packet's "same
 // transaction" requirement.
-func TestProvisionPersonal(t *testing.T) {
+func TestProvision(t *testing.T) {
 	h := newHarness(t)
 	email := dbtest.UniqueEmail(t)
 	userID := addUserWithEmail(t, h.q, email)
@@ -828,7 +828,7 @@ func TestProvisionPersonal(t *testing.T) {
 	runner := db.TxRunner{Pool: h.q.(db.Pool)}
 
 	err := runner.Do(t.Context(), func(ctx context.Context, tx db.Querier) error {
-		created, err := h.svc.ProvisionPersonal(ctx, tx, userID, email)
+		created, err := h.svc.Provision(ctx, tx, userID, email)
 		if err != nil {
 			return err
 		}
@@ -842,11 +842,11 @@ func TestProvisionPersonal(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("ProvisionPersonal: %v", err)
+		t.Fatalf("Provision: %v", err)
 	}
 
 	if !account.Personal {
-		t.Error("ProvisionPersonal made a team account")
+		t.Error("Provision made a team account")
 	}
 	if want := PersonalName(email); account.Name != want {
 		t.Errorf("name = %q, want the email local part %q", account.Name, want)
@@ -871,7 +871,7 @@ func TestTwoPeopleWithTheSameLocalPartBothRegister(t *testing.T) {
 		email := "kaka-" + dbtest.UniqueEmail(t)[len("kaka-"):]
 		uid := addUserWithEmail(t, h.q, email)
 		if err := runner.Do(t.Context(), func(ctx context.Context, tx db.Querier) error {
-			created, err := h.svc.ProvisionPersonal(ctx, tx, uid, email)
+			created, err := h.svc.Provision(ctx, tx, uid, email)
 			if err != nil {
 				return err
 			}

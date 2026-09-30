@@ -11,6 +11,7 @@ import (
 	"github.com/alexedwards/argon2id"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/cafaye/identity/internal/accounts"
 	"github.com/cafaye/identity/internal/auth"
 	"github.com/cafaye/identity/internal/outbox"
 	"github.com/cafaye/identity/internal/platform/clock"
@@ -36,6 +37,7 @@ func newTestServer(t *testing.T) (http.Handler, *pgxpool.Pool, *clock.Fake) {
 		users.NewStore(pool),
 		sessions.NewStore(pool),
 		outbox.NewStore(pool),
+		realTenancy(pool, clk),
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),
@@ -43,7 +45,7 @@ func newTestServer(t *testing.T) (http.Handler, *pgxpool.Pool, *clock.Fake) {
 		24*time.Hour,
 	)
 
-	return New(nil, WithAuth(svc)), pool, clk
+	return New(nil, WithAuth(svc), WithTenancy(realTenancy(pool, clk))), pool, clk
 }
 
 const validPassword = "correct horse battery staple"
@@ -521,13 +523,14 @@ func TestEndToEndWriteFailureIs500AndLeaksNothing(t *testing.T) {
 		users.NewStore(pool),
 		sessions.NewStore(pool),
 		outbox.NewStore(pool),
+		realTenancy(pool, clk),
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),
 		clk,
 		24*time.Hour,
 	)
-	h := New(nil, WithAuth(svc), WithLogger(slogLogger(logs)))
+	h := New(nil, WithAuth(svc), WithTenancy(realTenancy(pool, clk)), WithLogger(slogLogger(logs)))
 
 	if _, err := pool.Exec(t.Context(), `DROP TABLE outbox_events`); err != nil {
 		t.Fatalf("dropping outbox_events: %v", err)
@@ -631,4 +634,17 @@ func cookieValue(t *testing.T, rec *httptest.ResponseRecorder) string {
 		return ""
 	}
 	return cookies[0].Value
+}
+
+// realTenancy is the production accounts.Service over the real store. It lives in
+// a _test.go file so the wiring here and the wiring in cmd/identity are the same
+// five lines and cannot drift.
+func realTenancy(pool *pgxpool.Pool, clk clock.Clock) *accounts.Service {
+	return accounts.NewService(
+		db.TxRunner{Pool: pool},
+		accounts.NewStore(pool),
+		outbox.NewStore(pool),
+		clk,
+		db.Direct{Pool: pool},
+	)
 }

@@ -215,6 +215,7 @@ type fixture struct {
 	users    *fakeUsers
 	sessions *fakeSessions
 	events   *fakeEvents
+	tenancy  *fakeTenancy
 	uow      *fakeUnitOfWork
 	reader   *fakeReader
 	clock    *clock.Fake
@@ -246,6 +247,7 @@ func newFixture() *fixture {
 		users:    newFakeUsers(),
 		sessions: newFakeSessions(),
 		events:   &fakeEvents{},
+		tenancy:  &fakeTenancy{},
 		clock:    clock.NewFake(start),
 	}
 	// A marker querier, so a test can tell the transaction from the pool.
@@ -260,6 +262,7 @@ func newFixture() *fixture {
 		f.users,
 		f.sessions,
 		f.events,
+		f.tenancy,
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),

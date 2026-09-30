@@ -31,6 +31,7 @@ type options struct {
 	logger           *slog.Logger
 	readinessTimeout time.Duration
 	auth             Auth
+	tenancy          Tenancy
 }
 
 // Option customises the handler built by New.

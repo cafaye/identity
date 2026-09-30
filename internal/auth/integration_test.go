@@ -38,6 +38,7 @@ func newIntegrationService(t *testing.T) (*Service, *pgxpool.Pool, *clock.Fake) 
 		users.NewStore(pool),
 		sessions.NewStore(pool),
 		outbox.NewStore(pool),
+		realTenancy(pool, clk),
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),
@@ -256,6 +257,7 @@ func TestIntegrationLockIsVisibleToAnotherServiceInstance(t *testing.T) {
 		users.NewStore(pool),
 		sessions.NewStore(pool),
 		outbox.NewStore(pool),
+		realTenancy(pool, clock.NewFake(start)),
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),
@@ -293,7 +295,11 @@ func TestIntegrationRegisterIsAtomicWhenTheEventIsRejected(t *testing.T) {
 		db.Direct{Pool: pool},
 		userStore,
 		sessions.NewStore(pool),
+		// The event appender is broken and the tenancy is real, so this test now
+		// covers the whole transaction: the user, the account, the membership and
+		// both events have to disappear together.
 		failingEvents,
+		realTenancy(pool, clock.NewFake(start)),
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),
@@ -310,6 +316,11 @@ func TestIntegrationRegisterIsAtomicWhenTheEventIsRejected(t *testing.T) {
 	}
 	if n := countEvents(t, pool); n != 0 {
 		t.Errorf("outbox_events has %d rows, want 0", n)
+	}
+	// The tenancy rolled back with it: a user with no personal account is the
+	// half-written state this packet is about.
+	if n := countRows(t, pool, "accounts"); n != 0 {
+		t.Errorf("accounts has %d rows after a failed registration, want 0", n)
 	}
 }
 
@@ -333,10 +344,19 @@ func ptrAddr(s string) *netip.Addr {
 // that a rejected registration wrote none.
 func countEvents(t *testing.T, pool *pgxpool.Pool) int {
 	t.Helper()
+	return countRows(t, pool, "outbox_events")
+}
+
+// countRows counts one of the service's tables, so a test can assert that a
+// failed transaction left nothing behind. The table name is a test constant, not
+// a caller-supplied string.
+func countRows(t *testing.T, pool *pgxpool.Pool, table string) int {
+	t.Helper()
 
 	var n int
-	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM outbox_events`).Scan(&n); err != nil {
-		t.Fatalf("counting outbox_events: %v", err)
+	query := `SELECT count(*) FROM ` + table
+	if err := pool.QueryRow(context.Background(), query).Scan(&n); err != nil {
+		t.Fatalf("counting %s: %v", table, err)
 	}
 	return n
 }
