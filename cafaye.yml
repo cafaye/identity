@@ -26,7 +26,7 @@
 # changing all five.
 name: identity
 
-description: Authentication, sessions, MFA, OAuth, accounts and tenancy, and the OIDC provider.
+description: Authentication, sessions, MFA, OAuth, accounts and tenancy, scoped API tokens, and the OIDC provider.
 
 # Implementation language. One binary, no other runtime dependency.
 language: go
@@ -93,6 +93,27 @@ exposes:
     # and the device they carry.
     - identity.mfa.enabled
     - identity.mfa.disabled
+    # The scoped API tokens. Emitted by POST /v1/accounts/{account_id}/api-keys
+    # and DELETE on the same, each inside the transaction that wrote the row.
+    #
+    # BOTH ARE CORE'S CATALOG ROWS UNDER THESE EXACT NAMES
+    # (docs/event-naming.md, "the api key"), so there is no divergence to record
+    # here the way there is for the tenancy events. They are also the second piece
+    # of evidence for the table being named `api_keys` rather than `api_tokens`:
+    # the published vocabulary is the one thing in the schema another repository
+    # has already committed to.
+    #
+    # The subject is the credential's own row id. A consumer that has to stop
+    # trusting a credential correlates on the credential; a consumer auditing an
+    # account's credentials correlates on data.account_id, which is in every
+    # payload for exactly that reason.
+    #
+    # `identity.api_key.revoked` is ALSO THE EVENT FOR AN EXPIRY, which is core's
+    # own wording for the row ("A scoped API token is revoked or expired"). This
+    # service has no sweeper, so nothing emits that second case yet — see
+    # README.md, "Not built yet".
+    - identity.api_key.created
+    - identity.api_key.revoked
 
     # Not yet emitted, and deliberately absent rather than declared and unimplemented:
     #   user.email_verified   the email-verification packet
@@ -102,8 +123,6 @@ exposes:
     #   member.removed        the accounts and tenancy packet
     #   member.role_changed   the accounts and tenancy packet
     #   session.revoked       a later packet; DELETE /v1/session does not emit it yet
-    #   identity.api_key.created  the scoped API tokens packet
-    #   identity.api_key.revoked  the scoped API tokens packet
     #
     # Also absent, and the omission is deliberate rather than pending: the OIDC and
     # MFA packets land in THIS file's `events` list above rather than in this
@@ -151,4 +170,46 @@ owner:
 #       `caf dev`. It is not part of the service's published contract, and a
 #       manifest that described the dev stack would be a manifest that churns
 #       every time somebody adds a container.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# DECISION NEEDED — the scope claim has two names in the fleet, and this service
+# publishes both.
+#
+# Recorded here rather than only in a changelog because `cafaye.yml` is the file a
+# consumer and a reviewer both read, and because a client integrating against
+# POST /v1/introspections needs to know that one of the two names is going away.
+#
+# WHAT DISAGREES, verified against the code rather than a reading of it:
+#
+#   core/docs/openapi-conventions.md:134 requires a claim named `scopes`.
+#   guard/src/middleware/jwt.ts:32 reads `scope`, splits it on whitespace, and
+#   treats an absent claim as an empty set.
+#
+# The question is open as MD7 in the manager's DECISIONS.md. It has been recorded
+# twice before, by `guard-02` and by `cafaye-rb-01`, and answered neither time.
+# This service does NOT pick a side.
+#
+# WHAT IT DOES INSTEAD: POST /v1/introspections emits the capability set twice —
+# as `scopes` and as `scope`, byte for byte identical, both space-separated
+# strings — so that whichever name wins, no credential already in a customer's hand
+# stops working and the flip is a one-line removal from internal/apikeys/claims.go
+# rather than a rotation. internal/apikeys/claims_test.go holds the two together
+# in a struct and internal/httpapi/introspection_test.go holds them together on the
+# wire, which is the only place a consumer sees them.
+#
+# THE SHAPE IS A STRING, NOT AN ARRAY, and that is not a third opinion: it is the
+# one shape both sides can read. guard's verifier does `raw.split(/\s+/)` and
+# REFUSES a non-string claim, so an array is a token the gateway will not parse at
+# all, and core's own example is a capability string.
+#
+# TWO NAMES IS NOT A CONTRACT. It is the cost of not rotating credentials over an
+# unanswered question, and it is a deliberate interim rather than an oversight.
+#
+# RELATED AND NOT DECIDED HERE: core requires `account_id` and guard treats it as
+# optional with a fallback to `sub`. That is a separate and more serious question
+# (proposed as MD8) and this packet does not rule on it. What it does is never
+# produce a token that needs the fallback: an api key's claim document always
+# carries `account_id`, and one with no account is answered `{"active": false}`
+# rather than being issued a subject to guess a tenancy key from.
 # ---------------------------------------------------------------------------
