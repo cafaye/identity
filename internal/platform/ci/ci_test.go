@@ -211,8 +211,9 @@ func TestTelemetryIsAQuotedString(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestTheGateRunsBinPrimeItself. kit's Go job runs `go mod download`,
-// `go build ./...` and `go test ./...` as three steps of its own. That is not the
-// command a developer runs, so this repository runs the command a developer runs.
+// `go build ./...` and `go test -count=1 ./...` as three steps of its own. That
+// is not the command a developer runs, so this repository runs the command a
+// developer runs.
 func TestTheGateRunsBinPrimeItself(t *testing.T) {
 	scripts := stepScripts(t, "gate")
 	invocations := 0

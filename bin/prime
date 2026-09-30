@@ -3,7 +3,15 @@
 #
 #   bin/prime
 #
-# This is the kit Go template; if kit changes it, follow kit.
+# This began as a copy of kit's Go template and has since DIVERGED from it in
+# ways worth stating rather than leaving to be discovered. kit's
+# templates/bin-prime/go.sh is `#!/usr/bin/env bash` with `set -euo pipefail`,
+# a `--fast` argument, `require go`/`require git` preflight checks, `go vet`,
+# and a closing `prime ok` line. This file is POSIX `/bin/sh`, takes no
+# arguments, and runs three commands. That is a deliberate narrowing — the
+# service needs none of kit's extras — EXCEPT that it also lost `-count=1`, which
+# was not a narrowing but a hole, and which is restored below. `if kit changes
+# it, follow kit` still holds, and this file is now closer to kit than it was.
 #
 # The shebang is load-bearing and it was MISSING from this file until
 # gate.yml (packet identity-13-gate). This file has the executable bit and no
@@ -16,13 +24,28 @@
 #     FAIL gate.command-missing: gate.command could not be started:
 #          [Errno 8] Exec format error: 'bin/prime'
 #
-# Every other bin/prime in the fleet carries an interpreter line (kit's own Go
-# template ships `#!/bin/sh`); this one lost it at scaffold time in identity-01
-# and nothing noticed for twelve packets. `#!/bin/sh` and not `bash`: the body
-# is three commands and `set -eu`, which is POSIX, and the fleet's Go template
-# pins the more portable of the two.
+# Every other bin/prime in the fleet carries an interpreter line, and so does
+# kit's Go template (`#!/usr/bin/env bash`); this one lost its own at scaffold
+# time in identity-01 and nothing noticed for twelve packets. `/bin/sh` and not
+# bash: the body is three POSIX commands and `set -eu`, so the more portable
+# interpreter is the honest one, and the divergence is recorded above.
 set -eu
 
 go mod download
 go build ./...
-go test ./...
+
+# -count=1 defeats Go's test cache, and without it THIS GATE CAN BE GREEN
+# WITHOUT RUNNING ANYTHING. Measured on this tree: with the cache warm, a plain
+# `go test ./...` printed 18 `ok` package lines in 8 seconds and executed 2 of
+# them — 16 read `(cached)`. Exit 0, every proof satisfied, a developer who had
+# just run the gate had verified nothing. With -count=1 the same command runs
+# all 18 packages, 0 cached, in 126s.
+#
+# This is not a local preference. kit's Go template ships
+# `go test -count=1 ./...` (templates/bin-prime/go.sh:73) and says why in the
+# line above it: "a prime must prove the tests run now, not that they ran at
+# some point today". kit's validator REQUIRES the flag —
+# `tests/validate.sh:3014` fails a Go CI step that omits it — and kit's reusable
+# workflow passes it. This file was the fleet's Go gate without it, so identity's
+# gate was the one place the rule did not hold.
+go test -count=1 ./...

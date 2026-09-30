@@ -24,17 +24,21 @@
 #               `bin/coverage-floor`, and a boot test that starts the real
 #               binary five times.
 #
-#   THE DIFFERENCE THAT MATTERS, and it is one flag. CI's counted run carries
-#   `-count=1`. `bin/prime` does not, and `go test ./...` without it is served
-#   from Go's test cache. Measured on the green run this declaration was written
-#   from: **13 of bin/prime's 18 `ok` package lines read `(cached)` and five
-#   packages actually executed.** So a developer who runs `bin/prime` twice
-#   with nothing changed gets a second green gate that ran nothing at all.
+#   THE DIFFERENCE THAT MATTERED WAS ONE FLAG, AND IT IS NOW GONE. `bin/prime`
+#   used to run `go test ./...` with no `-count=1`, which Go serves from its test
+#   cache. Measured on this tree with the cache warm: **exit 0, 18 `ok` package
+#   lines, 8 seconds wall, and 16 of the 18 packages read `(cached)` — two
+#   packages actually executed.** A developer who ran the gate twice with nothing
+#   changed got a second green gate that verified nothing at all. `-count=1` is
+#   now in `bin/prime`, so the developer's command and CI's counted command agree
+#   on the one thing that decides whether a green result is a fact. kit's Go
+#   template already passed the flag and kit's validator (`tests/validate.sh`)
+#   fails a Go CI step that omits it; see bin/prime for the long form.
 #
-#   That is why every proof below is matched against the package line rather
-#   than a test name: a `(cached)` line satisfies a package-line proof, and no
-#   proof written against this gate's output can do better. It is stated here
-#   rather than left for the next reader to discover.
+#   Every proof below is matched against a package line rather than a test name,
+#   and that is a property of the runner rather than a preference: see the note
+#   above the proof list. A `(cached)` line satisfies a package-line proof, and
+#   now that `-count=1` is in place no line in a green run is cached.
 version: 1
 name: identity
 
@@ -44,10 +48,11 @@ gate:
   # under zsh, where `$?` is `tail`'s and `tail` is always 0. An argv has no
   # pipeline in it to lose an exit code.
   #
-  # `bin/prime` is the kit Go template, unmodified, and that is deliberate:
-  # AGENTS.md and ci.yml both make "the CI gate is the same command, not a CI
-  # variant of it" a rule, and a declaration that pointed at a stricter command
-  # would make this file the second gate it exists to prevent.
+  # `bin/prime`, unmodified as the COMMAND — AGENTS.md and ci.yml both make "the
+  # CI gate is the same command, not a CI variant of it" a rule, and a
+  # declaration pointing at a stricter command would make this file the second
+  # gate it exists to prevent. What the command CONTAINS was corrected, once, in
+  # this packet; see bin/prime and REPORT-identity-13-gate.md.
   command: [bin/prime]
   # The fleet's spelling, nine of thirteen repositories. It already resolves to
   # the entrypoint below with no edit: mise.toml says
@@ -75,18 +80,27 @@ gate:
     # `898 passed`, minitest's `228 runs`, npm's `# pass 187`, cargo's
     # `test result: ok. 7 passed`, and `go tool cover`'s `total:`.
     #
-    # **Go's `go test` prints no test count. Not with `-v`, not without it, in
-    # any Go release.** `go test ./...` prints one line per PACKAGE —
+    # **Go's `go test` prints no test count, and this was MEASURED on this tree
+    # rather than recalled.** `go test ./...` prints one line per PACKAGE —
     #
     #     ok  	github.com/cafaye/identity/internal/mfa	0.531s
     #     ?   	github.com/cafaye/identity/internal/platform/dbtest	[no test files]
     #
-    # — and the only number on the line is a DURATION. There is no line in this
-    # gate's output that carries a test count, so there is no capture group for
-    # `minimum` to read. Writing `minimum` against the duration would be a
-    # number that means nothing; writing one against the count of matching lines
-    # is not expressible, because the checker reads the LAST match rather than
-    # the number of matches.
+    # — and the only number on the line is a DURATION. Verified against a
+    # complete 5225-line `go test -v -count=1 ./...` run: every candidate
+    # single-capture-group pattern over that output captures either a package
+    # path or a duration, never a count, and a search for any line of the form
+    # `<integer> passed|tests` returns nothing. The one capture group that IS an
+    # integer on an `ok` line is the duration, and a floor on a duration is a
+    # number that means nothing. A floor on the COUNT OF MATCHING LINES is not
+    # expressible either: the checker reads the LAST match, not the number of
+    # matches.
+    #
+    # The schema sanctions exactly this. `gate.proof[].minimum` is documented as
+    # "omit it only for a proof that reports nothing countable (a step that must
+    # appear in the log, a tier that must not say it skipped)", and a Go package
+    # line is a step that must appear in the log. So this is the schema's
+    # designed case, not a gap worked around in it.
     #
     # So the expected counts are written down here as MEASURED FACTS instead of
     # as a floor, and the actual decrease-detector lives where it can see a
@@ -99,7 +113,9 @@ gate:
     #
     # measured with `go test -v -count=1 ./...` against the pinned
     # postgres:17.11-alpine, and cross-checked with ci.yml's own awk, which
-    # reports the same two totals. The skip count is reported separately and on
+    # reports the same two totals. The 1789 is 809 top-level `--- PASS:` lines
+    # plus 980 indented subtest ones; both counts are in the report. The skip
+    # count is reported separately and on
     # purpose: it is zero, and a zero written next to the pass count is the only
     # way a reader learns the number was looked for.
     #
@@ -185,9 +201,37 @@ gate:
 
     # ---------------------------------------------------------------------
     # THIS GATE HAS BEEN OBSERVED RED. A declaration that has only ever been
-    # observed green is a claim about a gate nobody has tested. Both runs below
-    # were produced by breaking something on purpose on this tree, and both are
+    # observed green is a claim about a gate nobody has tested. Every run below
+    # was produced by breaking something on purpose on this tree, and each is
     # quoted from the checker's own output rather than described.
+    #
+    # RED 0 — THE FALSE GREEN, and the one this packet exists to rule out. The
+    # packet's premise is that "a checker replaced by a function that
+    # unconditionally exits 0 would leave this repository green", so that is
+    # what was tried: a copy of this tree with `bin/prime` replaced by
+    #
+    #     #!/bin/sh
+    #     exit 0
+    #
+    # The gate exits 0. The checker does not believe it:
+    #
+    #   FAIL gate.proof-missing: proof 'mfa-tier-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'apikeys-tier-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'admin-tests-passed' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'httpapi-matrix-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'ci-guard-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'client-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'cmd-identity-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'generated-excluded' never appeared; ...
+    #   FAIL ...: 8 failure(s), 2 warning(s)
+    #
+    # Checked in bash under `set -o pipefail`; the checker's own exit code was
+    # captured directly and was 1. All eight proofs went red, and note WHAT DID
+    # NOT: there is no `gate.nonzero` here, because the exit code really was 0.
+    # The exit code was never the thing catching this one — the proofs are. That
+    # is the whole difference between a gate and a command that exits zero, and
+    # it is why a declaration with no proofs could not be trusted even if its
+    # command were perfect.
     #
     # RED 1 — the database tier silently absent. `bin/prime` re-run with
     # TEST_DATABASE_URL unset, which is the exact configuration that produced
@@ -225,6 +269,21 @@ gate:
     # database at all. See the three-copies note above. It stays red in RED 1
     # and is reported in REPORT-identity-13-gate.md; changing it would mean
     # editing a test assertion, which is the one thing this packet does not do.
+    #
+    # RED 3 — THE FALSE GREEN THAT WAS LIVE IN THIS REPOSITORY, reproduced and
+    # then fixed. Not a hypothetical breakage: this is what `bin/prime` did on
+    # the tree this declaration was written from, because it ran `go test ./...`
+    # with no `-count=1` and Go served the suite from its test cache. Measured,
+    # warm cache, same command, against the migrated database:
+    #
+    #     exit 0   wall 8s   18 `ok` package lines   16 read `(cached)`
+    #
+    # Two of eighteen packages executed. Every proof in this list was satisfied
+    # by a `(cached)` line, the exit code was 0, and a developer who had just run
+    # the gate had verified nothing about this tree. That is the packet's premise
+    # happening inside the repository the packet is about, and it is why the flag
+    # is now in `bin/prime` — measured after the fix: exit 0, 126s, 18 packages,
+    # 0 cached.
     # ---------------------------------------------------------------------
 
 external:
