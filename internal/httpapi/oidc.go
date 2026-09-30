@@ -14,9 +14,11 @@ import (
 
 	"github.com/cafaye/identity/internal/accounts"
 	"github.com/cafaye/identity/internal/auth"
+	"github.com/cafaye/identity/internal/mfa"
 	"github.com/cafaye/identity/internal/oauth"
 	"github.com/cafaye/identity/internal/oidc"
 	"github.com/cafaye/identity/internal/platform/id"
+	"github.com/cafaye/identity/internal/sessions"
 	"github.com/cafaye/identity/internal/users"
 )
 
@@ -357,6 +359,26 @@ func (o options) completeOIDCLogin(w http.ResponseWriter, r *http.Request, reque
 	// match even before the state check runs.
 	clearOIDCStateCookie(w, requestID)
 
+	// THE CHALLENGE STEP. The state has already been spent above, so this is a
+	// second request of its own and NOT a re-render of the form: it carries a code,
+	// not an email and a password.
+	//
+	// IT IS DISCRIMINATED BY THE PRESENCE OF THE `code` FIELD, and not by the
+	// presence of a challenge cookie. A cookie is AMBIENT: a browser can easily
+	// arrive at this POST holding a challenge from an earlier attempt — a user who
+	// mistyped a code, went back to the product and started again — and a password
+	// submission carrying a stale challenge cookie must still be a password
+	// submission. Keying off the cookie sends it down the challenge path with an
+	// empty code and answers 401 to a perfectly good password, which is a bug that
+	// only appears on the second attempt and looks like a wrong password.
+	//
+	// Presence rather than non-emptiness, so a hand-written POST with an empty code
+	// is answered as a refused code rather than as a request for an email address.
+	if _, isChallenge := r.Form["code"]; isChallenge {
+		o.completeOIDCChallenge(w, r, requestID)
+		return
+	}
+
 	email, password := r.Form.Get("email"), r.Form.Get("password")
 	if email == "" || password == "" {
 		// A 422 with the field, not a login attempt: there is nothing to check, and
@@ -385,6 +407,18 @@ func (o options) completeOIDCLogin(w http.ResponseWriter, r *http.Request, reque
 		return
 	}
 
+	// A CORRECT PASSWORD IS NOT A SIGNED-IN USER. A user whose account has a second
+	// factor gets the code form here exactly as they would through POST /v1/session,
+	// and no authorization code is minted, because CompleteLogin is never called on
+	// this branch. A page that quietly completed the flow for such a user would be
+	// the single worst bug this service could have: it would be invisible, it would
+	// affect every MFA user of every product, and MFA would be off in practice while
+	// being on in the database.
+	if result.MFARequired {
+		o.renderOIDCChallenge(w, r, requestID, result)
+		return
+	}
+
 	// The user the session belongs to. Login returned a token rather than a user
 	// because the /v1 login response has no use for one, and re-reading the
 	// session the service just wrote is one indexed query on a path that happens
@@ -400,6 +434,164 @@ func (o options) completeOIDCLogin(w http.ResponseWriter, r *http.Request, reque
 	// mid-write is still signed in rather than holding a token nobody recorded.
 	o.setSessionCookie(w, result.Token, result.ExpiresAt)
 	o.finishOIDCLogin(w, r, requestID, user.ID)
+}
+
+// OIDCChallengeCookiePrefix is where the challenge token waits between the login
+// page's two forms.
+//
+// __Host- and per-request-id, for the same reasons as the state cookie above and
+// with the same reasoning about two tabs: the request id is in the NAME, because
+// one cookie for the whole service means two login tabs clobber each other's
+// challenge and the first to submit fails — a real bug in the one page whose entire
+// job is to work.
+const OIDCChallengeCookiePrefix = "__Host-oidc-mfa-"
+
+// oidcChallengeCookieName is the challenge cookie for one authorization request.
+func oidcChallengeCookieName(requestID string) string {
+	return OIDCChallengeCookiePrefix + requestID
+}
+
+// renderOIDCChallenge draws the code form.
+//
+// The state is re-minted because the first one was SPENT by the password POST: a
+// sealed value that is still in the cookie after it has been used would be a CSRF
+// token that works twice, and the whole point of sealing it is that it does not.
+func (o options) renderOIDCChallenge(w http.ResponseWriter, r *http.Request, requestID string, result auth.LoginResult) {
+	if result.Challenge == nil || result.Challenge.Token == "" {
+		unexpected(w, r, o.logger, errNoChallengeToken)
+		return
+	}
+
+	state, err := oauth.NewState(OIDCStateProvider)
+	if err != nil {
+		unexpected(w, r, o.logger, err)
+		return
+	}
+
+	http.SetCookie(w, oidcChallengeCookie(requestID, result.Challenge.Token, result.Challenge.ExpiresAt))
+	http.SetCookie(w, oidcStateCookie(requestID, state))
+	writeHTML(w, http.StatusOK, renderLoginPage(loginPageData{
+		ClientName: o.oidcClientName(r, requestID),
+		State:      state,
+		Action:     requestID,
+		Step:       oidcStepChallenge,
+	}))
+}
+
+// completeOIDCChallenge is the second POST: check the code, and only then set the
+// session and hand back to the library.
+//
+// It goes through auth.CompleteSecondFactor, the same call POST /v1/session/mfa
+// makes, because there is exactly one place in this service that turns a second
+// factor into a session and having two would be the bug this packet exists to
+// prevent.
+func (o options) completeOIDCChallenge(w http.ResponseWriter, r *http.Request, requestID string) {
+	cookie, err := r.Cookie(oidcChallengeCookieName(requestID))
+	if err != nil || cookie.Value == "" {
+		problemFor(w, r, http.StatusUnauthorized, CodeUnauthorized,
+			"this sign-in has expired or was never started in this browser; start again from the application")
+		return
+	}
+
+	result, err := o.auth.CompleteSecondFactor(r.Context(), auth.CompleteSecondFactorInput{
+		ChallengeToken: cookie.Value,
+		Code:           r.Form.Get("code"),
+	})
+	if err != nil {
+		// A wrong code re-renders the form with an error rather than redirecting, so
+		// the user can type the next one. Every refusal is the same sentence whatever
+		// went wrong, for the same reason as everywhere else on this surface.
+		o.renderOIDCChallengeError(w, r, requestID, err)
+		return
+	}
+
+	// Spent, so a replayed POST finds nothing.
+	clearOIDCChallengeCookie(w, requestID)
+
+	user, err := o.auth.Authenticate(r.Context(), result.Token)
+	if err != nil {
+		unexpected(w, r, o.logger, fmt.Errorf("resolving the user behind a session this request just created: %w", err))
+		return
+	}
+	o.setSessionCookie(w, result.Token, result.ExpiresAt)
+	o.finishOIDCLogin(w, r, requestID, user.ID)
+}
+
+// renderOIDCChallengeError redraws the code form with a message, and it NEVER says
+// which part was wrong. A user who mistyped a code and a user replaying a code get
+// the same sentence, because they are the same answer.
+func (o options) renderOIDCChallengeError(w http.ResponseWriter, r *http.Request, requestID string, err error) {
+	var locked *sessions.LockedError
+
+	state, stateErr := oauth.NewState(OIDCStateProvider)
+	if stateErr != nil {
+		o.writeOIDCError(w, r, err)
+		return
+	}
+
+	switch {
+	case errors.As(err, &locked):
+		writeHTML(w, http.StatusLocked, renderLoginPage(loginPageData{
+			ClientName: o.oidcClientName(r, requestID),
+			State:      state,
+			Action:     requestID,
+			Step:       oidcStepChallenge,
+			Error: fmt.Sprintf("Too many attempts. Try again in %s.",
+				locked.RetryAfter.Round(time.Minute)),
+		}))
+	case errors.Is(err, mfa.ErrInvalidFactor), errors.Is(err, auth.ErrInvalidCredentials),
+		errors.Is(err, auth.ErrUnauthenticated):
+		// ONE SENTENCE for every way a code can fail, and it does not say which. The
+		// most common real cause is a code already used, and a user who has just
+		// pasted the same digits twice needs the next code, not a diagnosis.
+		writeHTML(w, http.StatusUnauthorized, renderLoginPage(loginPageData{
+			ClientName: o.oidcClientName(r, requestID),
+			State:      state,
+			Action:     requestID,
+			Step:       oidcStepChallenge,
+			Error:      "That code was not accepted. Codes change every 30 seconds — use the current one, or a recovery code.",
+		}))
+	default:
+		o.writeMFAError(w, r, err)
+	}
+}
+
+// oidcClientName is the application's name for the challenge form. It is re-read
+// from the auth request rather than carried in the cookie, because a cookie holding
+// a product's name is a cookie an attacker can set.
+func (o options) oidcClientName(r *http.Request, requestID string) string {
+	banner, err := o.oidc.LoginBanner(r.Context(), requestID)
+	if err != nil {
+		return "this application"
+	}
+	return banner.ClientName
+}
+
+// oidcChallengeCookie writes the challenge token where completeOIDCChallenge finds
+// it.
+func oidcChallengeCookie(requestID, token string, expiresAt time.Time) *http.Cookie {
+	return &http.Cookie{
+		Name:     oidcChallengeCookieName(requestID),
+		Value:    token,
+		Path:     "/", // required by the __Host- prefix
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  expiresAt,
+	}
+}
+
+func clearOIDCChallengeCookie(w http.ResponseWriter, requestID string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     oidcChallengeCookieName(requestID),
+		Value:    "",
+		Path:     "/",
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+	})
 }
 
 // finishOIDCLogin completes the request and hands the browser to the library's
@@ -511,9 +703,19 @@ type loginPageData struct {
 	State      string
 	Action     string
 	Error      string
+	// Step is "password" or "challenge". It is a field rather than a second template
+	// because the two forms share a page, a layout, four security headers and a
+	// cache policy, and two templates would be two places for one of those to drift.
+	Step string
 }
 
-// loginTemplate is the whole login page.
+// The two steps of the page.
+const (
+	oidcStepPassword  = "password"
+	oidcStepChallenge = "challenge"
+)
+
+// loginTemplate is the whole login page: the password step and the challenge step.
 //
 // An inline template rather than a file because there is one page and it is
 // thirty lines, and html/template rather than string concatenation because
@@ -526,6 +728,12 @@ type loginPageData struct {
 // There is no branding, no "forgot your password" link and no consent screen.
 // The first two belong with the pages this service does not have yet, and the
 // third would be a screen that says nothing.
+//
+// THE CHALLENGE STEP'S INPUT IS autocomplete="one-time-code" so a platform's
+// passkey manager offers the current TOTP, and inputmode="numeric" so a phone
+// keypad is what comes up. Both are usability, and both are worth having: a user
+// who has to switch apps to read a code is a user who will eventually read the
+// wrong one.
 var loginTemplate = template.Must(template.New("oidc-login").Parse(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -539,34 +747,52 @@ var loginTemplate = template.Must(template.New("oidc-login").Parse(`<!DOCTYPE ht
 {{if .Error}}<p role="alert">{{.Error}}</p>{{end}}
 <form method="post" action="{{.Action}}">
 <input type="hidden" name="state" value="{{.State}}">
+{{if eq .Step "challenge"}}
+<p>Enter the code from your authenticator app, or a recovery code.</p>
+<p><label for="code">Code</label>
+<input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+       autocapitalize="off" autocorrect="off" spellcheck="false" required
+       pattern="[0-9A-Za-z -]{6,40}"></p>
+{{else}}
 <p><label for="email">Email</label>
 <input id="email" name="email" type="email" autocomplete="username" required value="{{.Email}}"></p>
 <p><label for="password">Password</label>
 <input id="password" name="password" type="password" autocomplete="current-password" required></p>
-<p><button type="submit">Sign in</button></p>
+{{end}}
+<p><button type="submit">{{if eq .Step "challenge"}}Verify{{else}}Sign in{{end}}</button></p>
 </form>
 </main>
 </body>
 </html>
 `))
 
-// oidcLoginPage renders the form. Exported behaviour, unexported function: there
-// is one caller and it is three lines above.
-func oidcLoginPage(banner oidc.LoginBanner, state string) []byte {
+// renderLoginPage renders whichever step the data names.
+//
+// Exported behaviour, unexported function, and ONE renderer for both steps: there
+// is one template, and a second renderer would be a second place for the four
+// security headers writeHTML sets to go missing.
+func renderLoginPage(data loginPageData) []byte {
 	var out strings.Builder
-	data := loginPageData{
+	if err := loginTemplate.Execute(&out, data); err != nil {
+		// A template that cannot render its own struct is a bug in this file, and
+		// an empty body is the worst possible way to find out. The status is already
+		// whatever the caller wrote by the time this returns.
+		return []byte("<!DOCTYPE html><title>Sign in</title><p>Sign in is temporarily unavailable.</p>")
+	}
+	return []byte(out.String())
+}
+
+// oidcLoginPage renders the password step. It is a thin wrapper over
+// renderLoginPage so that the one caller of this step names a step rather than
+// building a struct.
+func oidcLoginPage(banner oidc.LoginBanner, state string) []byte {
+	return renderLoginPage(loginPageData{
 		ClientName: banner.ClientName,
 		Email:      banner.LoginHint,
 		State:      state,
 		Action:     banner.RequestID,
-	}
-	if err := loginTemplate.Execute(&out, data); err != nil {
-		// A template that cannot render its own struct is a bug in this file, and
-		// an empty body is the worst possible way to find out. The status is still
-		// 200 because the caller has already written it by the time this returns.
-		return []byte("<!DOCTYPE html><title>Sign in</title><p>Sign in is temporarily unavailable.</p>")
-	}
-	return []byte(out.String())
+		Step:       oidcStepPassword,
+	})
 }
 
 // writeHTML sends an HTML page.

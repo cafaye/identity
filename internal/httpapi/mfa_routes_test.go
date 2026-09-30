@@ -505,7 +505,6 @@ func TestTheMFARoutesAreAbsentWithoutAService(t *testing.T) {
 
 	reduced := New(nil,
 		WithAuth(authServiceFor(s.pool, s.clock)),
-		WithMFAChallenge(authServiceFor(s.pool, s.clock)),
 		WithLogger(slogLogger(&recordingHandler{})),
 	)
 

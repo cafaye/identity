@@ -104,7 +104,7 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 	}
 
 	opts := []httpapi.Option{httpapi.WithLogger(logger)}
-	authSvc, tenancy, secondFactor, err := buildAuth(cfg, pool, logger)
+	authSvc, tenancy, secondFactor, mfaUsable, err := buildAuth(cfg, pool, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -112,8 +112,16 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 		opts = append(opts,
 			httpapi.WithAuth(authSvc),
 			httpapi.WithTenancy(tenancy),
-			httpapi.WithMFA(secondFactor),
+			// The login's second step rides on WithAuth, because auth.Service is what
+			// mints the session behind it. Only the MANAGEMENT routes are conditional,
+			// and only on a usable key: such a process must not be able to enroll a
+			// factor it could never verify, while still refusing the users who enrolled
+			// elsewhere. Mounting both, or neither, is a bypass in one direction or
+			// the other.
 		)
+		if mfaUsable {
+			opts = append(opts, httpapi.WithMFA(secondFactor))
+		}
 	} else {
 		// Said out loud, because a process serving probes and no auth surface is a
 		// valid configuration and a surprising one.
@@ -160,9 +168,11 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 // It returns the MFA use cases alongside the auth ones because auth.Login cannot
 // work without them: a correct password must not mint a session for an account
 // that has a second factor, and the only way to know is to ask.
-func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*auth.Service, *accounts.Service, *mfa.Service, error) {
+// The fourth return is mfaUsable: whether this deployment can encrypt and decrypt a
+// TOTP secret, which is exactly whether the MANAGEMENT routes may be mounted.
+func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*auth.Service, *accounts.Service, *mfa.Service, bool, error) {
 	if pool == nil {
-		return nil, nil, nil, nil
+		return nil, nil, nil, false, nil
 	}
 
 	// One outbox store, shared. It is stateless apart from its pool, and two of
@@ -198,8 +208,10 @@ func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*aut
 	// every second factor on the platform, and they do not.
 	vault, err := buildMFASecret(cfg, logger)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
+	_, mfaUsable := vault.(mfa.Unavailable)
+	mfaUsable = !mfaUsable
 	secondFactor := mfa.NewService(
 		db.TxRunner{Pool: pool},
 		db.Direct{Pool: pool},
@@ -210,16 +222,17 @@ func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*aut
 		clock.System{},
 		cfg.MFAIssuer(),
 	)
-	if _, unusable := vault.(mfa.Unavailable); unusable {
-		logger.Warn("MFA_ENCRYPTION_KEY is not configured; the MFA management routes are not mounted " +
-			"and this process cannot verify a second factor for anybody")
-	} else {
+	if mfaUsable {
 		logger.Info("multi-factor authentication is available",
 			"issuer", cfg.MFAIssuer(),
 			"period_seconds", int(mfa.Period.Seconds()),
 			"digits", mfa.Digits,
 			"skew_steps", mfa.SkewSteps,
+			"recovery_codes", mfa.RecoveryCodeCount,
 		)
+	} else {
+		logger.Warn("MFA_ENCRYPTION_KEY is not configured; the MFA management routes are not mounted " +
+			"and this process cannot verify a second factor for anybody")
 	}
 
 	authSvc := auth.NewService(
@@ -244,7 +257,7 @@ func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*aut
 		auth.DefaultSessionTTL,
 	)
 
-	return authSvc, tenancy, secondFactor, nil
+	return authSvc, tenancy, secondFactor, mfaUsable, nil
 }
 
 // buildMFASecret returns the vault for the configured key, or mfa.Unavailable{}.

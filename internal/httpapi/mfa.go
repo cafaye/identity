@@ -84,25 +84,20 @@ func WithMFA(m MFAManage) Option {
 	}
 }
 
-// WithMFAChallenge mounts the login's second step, POST /v1/session/mfa.
+// NOTE ON WHY THERE IS NO WithMFAChallenge OPTION.
 //
-// SEPARATE FROM WithMFA AND DELIBERATELY SO. The management routes need a key;
-// this one must exist without one, because the failure has to be "an enrolled
-// user cannot sign in here", not "the service has never heard of MFA" — the second
-// of which would be the bypass. It also needs an Auth service to have resolved the
-// challenge, so it hangs off registerRoutes' existing condition.
-func WithMFAChallenge(m MFAChallenge) Option {
-	return func(o *options) {
-		if m != nil {
-			o.mfaChallenge = m
-		}
-	}
-}
-
-// MFAChallenge is the slice of auth.Service the second step needs.
-type MFAChallenge interface {
-	CompleteSecondFactor(ctx context.Context, in auth.CompleteSecondFactorInput) (auth.LoginResult, error)
-}
+// The login's second step is mounted whenever the AUTH surface is, because
+// auth.Service is what completes it — CompleteSecondFactor is on the Auth interface
+// and cannot be anywhere else without a second way for a session to come into
+// being. So it needs no option of its own, and adding one would have been a second
+// way to leave it unmounted.
+//
+// That is also the correct DEPENDENCY, and it is what makes the keyless deployment
+// safe: with a database and no MFA_ENCRYPTION_KEY the management routes are absent
+// (WithMFA was never called) while this route is present, so a user who enrolled
+// elsewhere is refused at their second factor rather than being let in on their
+// password. The absence of the management routes says nothing about whether this
+// one exists.
 
 // ---------------------------------------------------------------------------
 // routes
@@ -485,12 +480,10 @@ func presentedChallenge(r *http.Request, body *completeSecondFactorRequest) stri
 //
 //	POST /v1/session/mfa  {challenge?, code}  →  200 {token, expires_at}
 //
-// It is mounted beside the login rather than on the MFA management routes'
-// condition, so it exists on a deployment with no MFA_ENCRYPTION_KEY. That
-// deployment answers 503 from here rather than 404, which is the whole difference
-// between "this service cannot do that" and "this service has never heard of MFA"
-// — and a client that believed the second would be free to treat the absence of a
-// challenge as the absence of a requirement.
+// It goes through auth.Service.CompleteSecondFactor, which is on the Auth interface
+// because that is where the session is minted — inside the same transaction that
+// consumes the challenge. A separate option for it would have been a second way to
+// leave the whole login unreachable on a deployment that has no MFA_ENCRYPTION_KEY.
 func (o options) handleCompleteSecondFactor(w http.ResponseWriter, r *http.Request) {
 	var body *completeSecondFactorRequest
 	if !decodeBody(w, r, &body) {
@@ -505,7 +498,7 @@ func (o options) handleCompleteSecondFactor(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	result, err := o.mfaChallenge.CompleteSecondFactor(r.Context(), auth.CompleteSecondFactorInput{
+	result, err := o.auth.CompleteSecondFactor(r.Context(), auth.CompleteSecondFactorInput{
 		ChallengeToken: challenge,
 		Code:           body.Code,
 	})

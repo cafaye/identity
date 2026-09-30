@@ -128,19 +128,15 @@ func (o options) registerRoutes(r chiRouter) {
 	r.Delete("/v1/session", o.handleLogout)
 	r.Get("/v1/me", o.handleMe)
 
-	// THE SECOND STEP OF A LOGIN, mounted beside the first rather than on the MFA
-	// routes' condition.
+	// THE SECOND STEP OF A LOGIN, mounted beside the first and deliberately NOT
+	// gated on the MFA management routes' condition.
 	//
-	// It hangs off the auth service because there is no other way to know a
-	// challenge is real, and it is deliberately NOT gated on the MFA management
-	// routes being present: a deployment with no MFA_ENCRYPTION_KEY has users who
-	// enrolled elsewhere, and those users must get a 503 from the code submission
-	// rather than a 404 for the endpoint — because a 404 would say this service has
-	// never heard of MFA, and a client that believed it would be free to treat the
-	// absence of the challenge as the absence of the requirement.
-	if o.mfaChallenge != nil {
-		r.Post("/v1/session/mfa", o.handleCompleteSecondFactor)
-	}
+	// A deployment with no MFA_ENCRYPTION_KEY has users who enrolled elsewhere, and
+	// those users must reach this route and be refused at their second factor. A 404
+	// here would say this service has never heard of MFA, and a client that believed
+	// it would be free to treat the absence of a challenge as the absence of a
+	// requirement — which is the bypass, expressed as a routing decision.
+	r.Post("/v1/session/mfa", o.handleCompleteSecondFactor)
 
 	// The account routes need both services: a session to resolve the caller from
 	// and a tenancy service to resolve their role in it. With only one of the two

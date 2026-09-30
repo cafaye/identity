@@ -66,7 +66,6 @@ func newMFAServer(t *testing.T) *mfaServer {
 	return &mfaServer{
 		handler: New(nil,
 			WithAuth(svc),
-			WithMFAChallenge(svc),
 			WithMFA(second),
 			WithLogger(slogLogger(logs)),
 		),

@@ -128,7 +128,17 @@ func (c Config) MFAEncryptionKey() ([]byte, error) {
 }
 
 // MFAIssuer is the label an authenticator app displays next to the entry.
-func (c Config) MFAIssuer() string { return c.MFAIssuerLabel }
+//
+// The default is applied HERE as well as in Load, so a Config written as a literal —
+// in a test, or in a one-off tool — still names something. An authenticator app
+// showing a blank account is a support ticket, and Load is not the only way to
+// build a Config.
+func (c Config) MFAIssuer() string {
+	if c.MFAIssuerLabel == "" {
+		return DefaultMFAIssuer
+	}
+	return c.MFAIssuerLabel
+}
 
 // MFAEncryptionKeyConfigured reports whether this deployment has a usable key,
 // without revealing anything about it. main uses it to decide whether to mount the

@@ -208,7 +208,7 @@ func mountedMFARoutes() []string {
 	var found []string
 
 	r := chi.NewRouter()
-	opts := options{auth: newFakeAuth(), mfaChallenge: newFakeAuth(), mfa: newFakeMFAManage()}
+	opts := options{auth: newFakeAuth(), mfa: newFakeMFAManage()}
 	opts.registerRoutes(r)
 
 	_ = chi.Walk(r, func(method string, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
