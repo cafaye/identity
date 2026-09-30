@@ -144,6 +144,11 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 // original tables) and enum types (Postgres has no LIKE for a type). Re-read the
 // migrations when adding a table, a constraint or an enum value; this list has to
 // stay in step with them.
+//
+// 00009 added three more tables and no new enum type, so the two CREATE TYPE
+// statements below are still the whole list. A registration's grant types and
+// scopes are text arrays validated in Go, because those closed sets are a code
+// fact — adding a scope must not be a migration.
 func Schema(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
@@ -209,6 +214,27 @@ func Schema(t *testing.T) *pgxpool.Pool {
 			USING role::text::` + schema + `.account_role`,
 		`ALTER TABLE ` + schema + `.account_invitations ALTER COLUMN role TYPE ` + schema + `.account_invitation_role
 			USING role::text::` + schema + `.account_invitation_role`,
+		// The OIDC tables. No enum types here, which is why the list above stops
+		// at two CREATE TYPE statements: a client registration is text arrays and
+		// timestamps, and a grant type or a scope is validated in Go because the
+		// closed sets are a code fact rather than a schema fact.
+		`CREATE TABLE ` + schema + `.oidc_clients (LIKE public.oidc_clients INCLUDING ALL)`,
+		`CREATE TABLE ` + schema + `.oidc_auth_requests (LIKE public.oidc_auth_requests INCLUDING ALL)`,
+		`CREATE TABLE ` + schema + `.oidc_access_tokens (LIKE public.oidc_access_tokens INCLUDING ALL)`,
+		`ALTER TABLE ` + schema + `.oidc_clients ADD CONSTRAINT oidc_clients_account_id_fkey
+			FOREIGN KEY (account_id) REFERENCES ` + schema + `.accounts (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.oidc_clients ADD CONSTRAINT oidc_clients_created_by_fkey
+			FOREIGN KEY (created_by) REFERENCES ` + schema + `.users (id) ON DELETE RESTRICT`,
+		`ALTER TABLE ` + schema + `.oidc_clients ADD CONSTRAINT oidc_clients_revoked_by_fkey
+			FOREIGN KEY (revoked_by) REFERENCES ` + schema + `.users (id) ON DELETE RESTRICT`,
+		`ALTER TABLE ` + schema + `.oidc_auth_requests ADD CONSTRAINT oidc_auth_requests_client_row_id_fkey
+			FOREIGN KEY (client_row_id) REFERENCES ` + schema + `.oidc_clients (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.oidc_auth_requests ADD CONSTRAINT oidc_auth_requests_subject_fkey
+			FOREIGN KEY (subject) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.oidc_access_tokens ADD CONSTRAINT oidc_access_tokens_client_row_id_fkey
+			FOREIGN KEY (client_row_id) REFERENCES ` + schema + `.oidc_clients (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.oidc_access_tokens ADD CONSTRAINT oidc_access_tokens_subject_fkey
+			FOREIGN KEY (subject) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
 	}
 	for _, stmt := range stmts {
 		if _, err := admin.Exec(ctx, stmt); err != nil {

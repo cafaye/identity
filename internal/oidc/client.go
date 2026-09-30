@@ -42,18 +42,20 @@ var (
 	// digest. Same reasoning as ErrRevoked: distinct internally, one answer
 	// outside.
 	ErrInvalidSecret = errors.New("oidc client secret is invalid")
+	// ErrAlreadyRevoked means the registration is already revoked. It exists so
+	// an operator who clicks twice is told so; a 204 either way would leave them
+	// believing a second credential had just been destroyed.
+	ErrAlreadyRevoked = errors.New("oidc client is already revoked")
 )
 
 // Field validation codes. They land verbatim in the `errors[]` array of the
 // cafaye error envelope, so they are part of the contract.
 const (
-	CodeRequired          = "required"
-	CodeInvalidFormat     = "invalid_format"
-	CodeTooMany           = "too_many"
-	CodeUnsupported       = "unsupported"
-	CodeOpenIDRequired    = "openid_required"
-	CodeDuplicateClientID = "duplicate_client_id"
-	CodeAlreadyRevoked    = "already_revoked"
+	CodeRequired       = "required"
+	CodeInvalidFormat  = "invalid_format"
+	CodeTooMany        = "too_many"
+	CodeUnsupported    = "unsupported"
+	CodeOpenIDRequired = "openid_required"
 )
 
 // FieldError is a per-field validation failure, rendered as one entry of a
@@ -75,6 +77,12 @@ const (
 	// unique. A sequential or derived id would be a free oracle for "which
 	// products run on this platform".
 	clientIDBytes = 32
+
+	// MaxNameLength is accounts.MaxNameLength, restated rather than imported.
+	// accounts does not import this package and a name limit is a fact about the
+	// shape of a name, not about OIDC; one of the two has to own it and the
+	// migration restates the number a third time.
+	MaxNameLength = 120
 
 	// MaxRedirectURIs bounds the registration. Ten origins is more than any
 	// product needs — a web app, a mobile app and a couple of staging
@@ -107,6 +115,10 @@ type Client struct {
 	// ClientID is the public, protocol-visible handle. Random, 32 bytes,
 	// base64url.
 	ClientID string
+	// Name is what the login page calls the product: "Anytalk". It is here
+	// because a login page that cannot name the application asking for a password
+	// is the setup for a credential-phishing page on this service's own domain.
+	Name string
 	// SecretDigest is the lower-case hex SHA-256 of the client secret. The secret
 	// itself is never stored and is returned exactly once, by Register.
 	SecretDigest string
@@ -121,9 +133,15 @@ type Client struct {
 	// and always including openid.
 	Scopes    []string
 	CreatedAt time.Time
-	RevokedAt *time.Time
 	CreatedBy id.UUID
-	RevokedBy *id.UUID
+
+	// RevokedAt, RevokedBy and RevokeReason are set together or not at all, and
+	// the table's CHECK says so. The reason is not in the event: it is what an
+	// operator typed, and a field whose values vary per operator is a field every
+	// consumer learns to ignore.
+	RevokedAt    *time.Time
+	RevokedBy    *id.UUID
+	RevokeReason *string
 }
 
 // IsActive reports whether the registration may still be used.
