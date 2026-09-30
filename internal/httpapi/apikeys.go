@@ -104,10 +104,10 @@ type apiKeyResponse struct {
 	// credential is still worth having. LastUsedAt is omitted when the token has
 	// never been presented, and `omitempty` is doing real work: "never used" and
 	// "used at the epoch" are different answers and only the first is true.
-	CreatedAt   time.Time  `json:"created_at"`
-	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
-	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
-	RevokeReason *string   `json:"revoke_reason,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	LastUsedAt   *time.Time `json:"last_used_at,omitempty"`
+	RevokedAt    *time.Time `json:"revoked_at,omitempty"`
+	RevokeReason *string    `json:"revoke_reason,omitempty"`
 }
 
 // issuedAPIKeyResponse is the 201 from POST /v1/accounts/:id/api-keys, and it is
@@ -581,5 +581,3 @@ func refuseAPIKeyRequest(w http.ResponseWriter, r *http.Request) {
 	problemFor(w, r, http.StatusForbidden, CodeForbidden,
 		"an api key may not use this endpoint; use a session")
 }
-
-

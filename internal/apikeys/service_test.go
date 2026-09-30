@@ -214,12 +214,12 @@ func (f *serviceFixture) breakTheOutbox(t *testing.T) {
 //
 // The three assertions are deliberately different in kind:
 //
-//	1. the 201's Token is the credential — it resolves.
-//	2. Authenticate with it works, so (1) is not vacuous: a token that did not
-//	   work would make the rest of this test pass for the wrong reason.
-//	3. NOTHING ELSE the use case returns carries it: not the Key, not the
-//	   TokenDigest field, not the Name a caller chose. A struct that grew a Token
-//	   field, or a handler that reached for key.Token, would fail here.
+//  1. the 201's Token is the credential — it resolves.
+//  2. Authenticate with it works, so (1) is not vacuous: a token that did not
+//     work would make the rest of this test pass for the wrong reason.
+//  3. NOTHING ELSE the use case returns carries it: not the Key, not the
+//     TokenDigest field, not the Name a caller chose. A struct that grew a Token
+//     field, or a handler that reached for key.Token, would fail here.
 func TestMintReturnsTheSecretExactlyOnce(t *testing.T) {
 	f := newServiceFixture(t)
 	ctx := context.Background()
@@ -367,8 +367,10 @@ func TestAMintIsValidatedBeforeAnythingIsWritten(t *testing.T) {
 			wantField: "name",
 		},
 		{
-			name:      "a name carrying a control character",
-			give:      func(f *serviceFixture) MintInput { return MintInput{Name: "ci\ndeploy", Scopes: []string{ScopeAccountsRead}} },
+			name: "a name carrying a control character",
+			give: func(f *serviceFixture) MintInput {
+				return MintInput{Name: "ci\ndeploy", Scopes: []string{ScopeAccountsRead}}
+			},
 			wantField: "name",
 		},
 		{

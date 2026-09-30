@@ -140,29 +140,29 @@ func scopeFrom(ctx context.Context) []string {
 var accountRouteScopes = map[string]string{
 	// The tenancy reads. accounts:read is also the default a CI job needs and the
 	// one that leaks the least.
-	"GET /v1/accounts":                             apikeys.ScopeAccountsRead,
-	"GET /v1/accounts/{accountID}":                 apikeys.ScopeAccountsRead,
-	"GET /v1/accounts/{accountID}/members":         apikeys.ScopeAccountsRead,
+	"GET /v1/accounts":                     apikeys.ScopeAccountsRead,
+	"GET /v1/accounts/{accountID}":         apikeys.ScopeAccountsRead,
+	"GET /v1/accounts/{accountID}/members": apikeys.ScopeAccountsRead,
 
 	// The account's own mutations, except deleting it.
-	"POST /v1/accounts":                            apikeys.ScopeAccountsWrite,
-	"PATCH /v1/accounts/{accountID}":               apikeys.ScopeAccountsWrite,
-	"POST /v1/accounts/{accountID}/invitations":    apikeys.ScopeAccountsWrite,
-	"PATCH /v1/accounts/{accountID}/members/{userID}": apikeys.ScopeAccountsWrite,
+	"POST /v1/accounts":                                apikeys.ScopeAccountsWrite,
+	"PATCH /v1/accounts/{accountID}":                   apikeys.ScopeAccountsWrite,
+	"POST /v1/accounts/{accountID}/invitations":        apikeys.ScopeAccountsWrite,
+	"PATCH /v1/accounts/{accountID}/members/{userID}":  apikeys.ScopeAccountsWrite,
 	"DELETE /v1/accounts/{accountID}/members/{userID}": apikeys.ScopeAccountsWrite,
-	"POST /v1/invitations/accept":                  apikeys.ScopeAccountsWrite,
+	"POST /v1/invitations/accept":                      apikeys.ScopeAccountsWrite,
 
 	// Deleting the account is its own scope: it is the only one of these that
 	// cannot be undone, and a token carrying accounts:write held by somebody who
 	// later becomes a member is already refused on the role check — so the extra
 	// scope is for the owner case, where the role gate alone would let it through.
-	"DELETE /v1/accounts/{accountID}":              apikeys.ScopeAccountsDelete,
+	"DELETE /v1/accounts/{accountID}": apikeys.ScopeAccountsDelete,
 
 	// The account's OpenID Connect registrations, read and write in one scope: both
 	// GETs are owner-only routes whose response IS the integration's configuration,
 	// so a separate read scope would be a name nobody has a use for.
-	"POST /v1/accounts/{accountID}/oidc-clients":       apikeys.ScopeOIDCClientsWrite,
-	"GET /v1/accounts/{accountID}/oidc-clients":        apikeys.ScopeOIDCClientsWrite,
+	"POST /v1/accounts/{accountID}/oidc-clients":              apikeys.ScopeOIDCClientsWrite,
+	"GET /v1/accounts/{accountID}/oidc-clients":               apikeys.ScopeOIDCClientsWrite,
 	"GET /v1/accounts/{accountID}/oidc-clients/{clientID}":    apikeys.ScopeOIDCClientsWrite,
 	"DELETE /v1/accounts/{accountID}/oidc-clients/{clientID}": apikeys.ScopeOIDCClientsWrite,
 }

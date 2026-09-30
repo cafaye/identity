@@ -51,7 +51,6 @@ var (
 	// the membership; this layer does not, and asking it to distinguish the two
 	// would mean a second membership read.
 	ErrNotAuthorized = errors.New("caller may not manage api keys in this account")
-
 )
 
 // ErrNameTaken and ErrAlreadyRevoked are the STORE's, and they are returned from
@@ -182,16 +181,16 @@ type IssuedKey struct {
 //
 // FOUR RULES, IN THIS ORDER, and the order is what makes the refusals cheap:
 //
-//	1. the ids are real          a zero uuid is a bug in the route, and handing it
-//	                              to a query would be a wasted round trip
-//	2. the name                  what an operator revokes by
-//	3. the scopes                refused, never curated
-//	4. the lifetime             and then the caller is asked whether they may
-//	4b. the role                 mint AT ALL, which is after the validation because
-//	                              a member who sent an unknown scope deserves the
-//	                              scope error — it is the bug in their request, and
-//	                              answering 403 would send them looking for a
-//	                              permissions problem that is not the one they have
+//  1. the ids are real          a zero uuid is a bug in the route, and handing it
+//     to a query would be a wasted round trip
+//  2. the name                  what an operator revokes by
+//  3. the scopes                refused, never curated
+//  4. the lifetime             and then the caller is asked whether they may
+//     4b. the role                 mint AT ALL, which is after the validation because
+//     a member who sent an unknown scope deserves the
+//     scope error — it is the bug in their request, and
+//     answering 403 would send them looking for a
+//     permissions problem that is not the one they have
 //
 // The row and the event are one transaction. A token whose row committed and whose
 // announcement did not is a credential this platform minted and no consumer was

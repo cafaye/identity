@@ -119,11 +119,11 @@ func (f *fakeAPIKeys) Revoke(_ context.Context, in apikeys.RevokeInput) (apikeys
 // asserted in a comment is that "we do not store the token" is easy to claim and
 // easy to get subtly untrue. Three separate claims:
 //
-//	1. the 201 carries the token and it is the only field that does;
-//	2. the response has no field a client could mistake for it — no digest, no
-//	   prefix, no second copy;
-//	3. EVERY other response on the surface does not carry it, which is the part
-//	   "shown once" actually means.
+//  1. the 201 carries the token and it is the only field that does;
+//  2. the response has no field a client could mistake for it — no digest, no
+//     prefix, no second copy;
+//  3. EVERY other response on the surface does not carry it, which is the part
+//     "shown once" actually means.
 func TestMintAPIKeyReturnsTheSecretOnce(t *testing.T) {
 	t.Parallel()
 
