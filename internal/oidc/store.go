@@ -183,19 +183,24 @@ func (s *Store) ClientsForAccount(ctx context.Context, q db.Querier, accountID i
 
 // RevokeClient marks a registration revoked and returns the stored row.
 //
+// Scoped by account_id as well as id. The HTTP layer has already established that
+// the caller owns the account; the query says so again because a use case
+// reached any other way would not have, and a cross-tenant revocation is exactly
+// the bug a redundant WHERE clause costs nothing to prevent.
+//
 // Conditional on revoked_at IS NULL, so a second revocation updates zero rows and
 // comes back ErrAlreadyRevoked rather than moving revoked_at and overwriting who
 // did it. Two operators clicking the same button at the same moment produce one
 // revocation event, not two.
-func (s *Store) RevokeClient(ctx context.Context, q db.Querier, rowID, by id.UUID, at time.Time, reason string) (Client, error) {
+func (s *Store) RevokeClient(ctx context.Context, q db.Querier, rowID, accountID, by id.UUID, at time.Time, reason string) (Client, error) {
 	const query = `
 		UPDATE oidc_clients
-		SET revoked_at = $2, revoked_by = $3, revoke_reason = NULLIF($4, '')
-		WHERE id = $1 AND revoked_at IS NULL
+		SET revoked_at = $3, revoked_by = $4, revoke_reason = NULLIF($5, '')
+		WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
 		RETURNING ` + clientColumns
 
 	var c Client
-	err := q.QueryRow(ctx, query, rowID, at, by, reason).Scan(
+	err := q.QueryRow(ctx, query, rowID, accountID, at, by, reason).Scan(
 		&c.ID, &c.AccountID, &c.ClientID, &c.Name, &c.SecretDigest, &c.RedirectURIs, &c.GrantTypes, &c.Scopes,
 		&c.RevokedAt, &c.RevokeReason, &c.RevokedBy, &c.CreatedAt, &c.CreatedBy,
 	)
@@ -205,7 +210,8 @@ func (s *Store) RevokeClient(ctx context.Context, q db.Querier, rowID, by id.UUI
 		// operator who clicked twice should be told "already revoked" and an
 		// operator with a stale id should be told "not found" — the second is a
 		// support question with a different answer.
-		if _, lookupErr := s.ClientByRowID(ctx, q, rowID); errors.Is(lookupErr, ErrNotFound) {
+		existing, lookupErr := s.ClientByRowID(ctx, q, rowID)
+		if errors.Is(lookupErr, ErrNotFound) || existing.AccountID != accountID {
 			return Client{}, ErrNotFound
 		}
 		return Client{}, ErrAlreadyRevoked

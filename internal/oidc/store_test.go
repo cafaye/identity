@@ -203,7 +203,7 @@ func TestStoreRevokeClientIsOnceOnly(t *testing.T) {
 	created := f.mustCreateClient(t, f.account, f.owner)
 	other, by := f.seedAccount(t, "revoker")
 
-	if _, err := f.store.RevokeClient(f.ctx, f.q(), created.ID, by, storeTestNow.Add(time.Minute), "rotated"); err != nil {
+	if _, err := f.store.RevokeClient(f.ctx, f.q(), created.ID, f.account, by, storeTestNow.Add(time.Minute), "rotated"); err != nil {
 		t.Fatalf("RevokeClient: %v", err)
 	}
 
@@ -223,7 +223,7 @@ func TestStoreRevokeClientIsOnceOnly(t *testing.T) {
 
 	// The second revocation is refused rather than moving revoked_at, so the
 	// record of who revoked and when stays the first, truthful one.
-	if _, err := f.store.RevokeClient(f.ctx, f.q(), created.ID, other, storeTestNow.Add(time.Hour), "again"); !errors.Is(err, ErrAlreadyRevoked) {
+	if _, err := f.store.RevokeClient(f.ctx, f.q(), created.ID, f.account, other, storeTestNow.Add(time.Hour), "again"); !errors.Is(err, ErrAlreadyRevoked) {
 		t.Errorf("the second RevokeClient = %v, want ErrAlreadyRevoked", err)
 	}
 	again, err := f.store.ClientByRowID(f.ctx, f.q(), created.ID)
@@ -234,7 +234,7 @@ func TestStoreRevokeClientIsOnceOnly(t *testing.T) {
 		t.Errorf("revoked_at moved to %v; a second revocation overwrote the first", again.RevokedAt)
 	}
 
-	if _, err := f.store.RevokeClient(f.ctx, f.q(), id.MustNew(), by, storeTestNow, ""); !errors.Is(err, ErrNotFound) {
+	if _, err := f.store.RevokeClient(f.ctx, f.q(), id.MustNew(), f.account, by, storeTestNow, ""); !errors.Is(err, ErrNotFound) {
 		t.Errorf("revoking an unknown client = %v, want ErrNotFound", err)
 	}
 }

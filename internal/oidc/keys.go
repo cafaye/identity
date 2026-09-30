@@ -224,3 +224,13 @@ func (k *SigningKey) JWKS() ([]byte, error) {
 	}
 	return document, nil
 }
+
+// marshalPKCS8 re-encodes the private key, for the encryption-key derivation in
+// provider.go.
+//
+// The bytes are the same key in a canonical encoding whatever PEM block it
+// arrived in, which is what makes the derived value stable across a
+// PKCS#1-to-PKCS#8 rewrite of the same file.
+func marshalPKCS8(k *SigningKey) ([]byte, error) {
+	return x509.MarshalPKCS8PrivateKey(k.priv)
+}
