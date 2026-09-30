@@ -118,21 +118,39 @@ func TestDiscoveryPointsAtThePathGuardHardcodes(t *testing.T) {
 // Everything this service does not serve is absent rather than advertised. An
 // endpoint in the menu that answers 404 is a product configured against a route
 // that does not exist, and they find out at their outage.
+//
+// The `*_auth_methods_supported` fields are in this table and NOT an afterthought:
+// the first live run of this provider served a document that blanked
+// introspection_endpoint and revocation_endpoint and still advertised how to
+// authenticate to both of them, because blanking an endpoint does not touch the
+// field beside it. The first version of this test asserted the endpoints alone
+// and passed against the broken document. It asserts the whole set now.
 func TestDiscoveryOmitsWhatThisServiceDoesNotServe(t *testing.T) {
 	t.Parallel()
 
 	doc := newTestProvider(t).DiscoveryFor(contextWithIssuer(t, "https://identity.test"))
 
 	omitted := map[string]string{
-		"introspection_endpoint":           doc.IntrospectionEndpoint,
-		"revocation_endpoint":              doc.RevocationEndpoint,
-		"end_session_endpoint":             doc.EndSessionEndpoint,
-		"device_authorization_endpoint":    doc.DeviceAuthorizationEndpoint,
-		"check_session_iframe":             doc.CheckSessionIframe,
-		"request_parameter_supported":      boolField(doc.RequestParameterSupported),
-		"back_channel_logout_supported":    boolField(doc.BackChannelLogoutSupported),
-		"registration_endpoint":            doc.RegistrationEndpoint,
-		"client_id_metadata_document_supp": boolField(doc.ClientIDMetadataDocumentSupported),
+		"introspection_endpoint":        doc.IntrospectionEndpoint,
+		"revocation_endpoint":           doc.RevocationEndpoint,
+		"end_session_endpoint":          doc.EndSessionEndpoint,
+		"device_authorization_endpoint": doc.DeviceAuthorizationEndpoint,
+		"check_session_iframe":          doc.CheckSessionIframe,
+		"registration_endpoint":         doc.RegistrationEndpoint,
+
+		"introspection_endpoint_auth_methods_supported": joinMethods(
+			doc.IntrospectionEndpointAuthMethodsSupported),
+		"introspection_endpoint_auth_signing_alg_values_supported": joinAlgs(
+			doc.IntrospectionEndpointAuthSigningAlgValuesSupported),
+		"revocation_endpoint_auth_methods_supported": joinMethods(
+			doc.RevocationEndpointAuthMethodsSupported),
+		"revocation_endpoint_auth_signing_alg_values_supported": joinAlgs(
+			doc.RevocationEndpointAuthSigningAlgValuesSupported),
+
+		"request_parameter_supported":           boolField(doc.RequestParameterSupported),
+		"back_channel_logout_supported":         boolField(doc.BackChannelLogoutSupported),
+		"back_channel_logout_session_supported": boolField(doc.BackChannelLogoutSessionSupported),
+		"client_id_metadata_document_supp":      boolField(doc.ClientIDMetadataDocumentSupported),
 	}
 	for name, value := range omitted {
 		if value != "" && value != "false" {
@@ -140,6 +158,19 @@ func TestDiscoveryOmitsWhatThisServiceDoesNotServe(t *testing.T) {
 		}
 	}
 }
+
+// joinMethods and joinAlgs render the two list types into the one string the
+// table above holds, so that a failure names the offending FIELD and not just
+// "something is wrong somewhere in the document".
+func joinMethods(methods []oidc.AuthMethod) string {
+	out := make([]string, 0, len(methods))
+	for _, m := range methods {
+		out = append(out, string(m))
+	}
+	return strings.Join(out, ",")
+}
+
+func joinAlgs(algs []string) string { return strings.Join(algs, ",") }
 
 func TestDiscoveryAdvertisesOnlyWhatIsImplemented(t *testing.T) {
 	t.Parallel()
