@@ -1,0 +1,412 @@
+# gate.yml — how identity is gated, declared rather than guessed.
+#
+# WHY THIS FILE IS HERE. `core` owns the format
+# (`schemas/gate.schema.json`), the checker (`harness/gate_check.py`) and the
+# reasoning (`docs/gate.md`). Six of thirteen services shipped a `gate.yml`
+# saying what their local gate is worth; identity was one of the seven that did
+# not. The cost is specific and was measured for this file: `bin/prime` prints
+# no test count, anywhere, in any mode — so a developer running it sees a green
+# result and learns nothing about whether the gate can detect anything.
+#
+# THE TWO COMMANDS, BOTH MEASURED, AND THEY ARE NOT THE SAME. This is the
+# first thing the packet asked for and it is the reason this file is not a
+# formality.
+#
+#   Developer:  bin/prime  ==  mise run prime
+#               go mod download && go build ./... && go test ./...
+#               Measured green on this tree: 335s wall, exit 0.
+#
+#   CI:         .github/workflows/ci.yml, the `gate` job. It runs bin/prime
+#               UNMODIFIED, and then runs a SECOND, STRICTER suite the
+#               developer command does not: `go test -v -count=1 -race
+#               -coverprofile=... ./...`, plus `goose up` above both, plus
+#               `go vet ./...`, `gofmt -l .`, a lockfile guard,
+#               `bin/coverage-floor`, and a boot test that starts the real
+#               binary five times.
+#
+#   THE DIFFERENCE THAT MATTERED WAS ONE FLAG, AND IT IS NOW GONE. `bin/prime`
+#   used to run `go test ./...` with no `-count=1`, which Go serves from its test
+#   cache. Measured on this tree with the cache warm: **exit 0, 18 `ok` package
+#   lines, 8 seconds wall, and 16 of the 18 packages read `(cached)` — two
+#   packages actually executed.** A developer who ran the gate twice with nothing
+#   changed got a second green gate that verified nothing at all. `-count=1` is
+#   now in `bin/prime`, so the developer's command and CI's counted command agree
+#   on the one thing that decides whether a green result is a fact. kit's Go
+#   template already passed the flag and kit's validator (`tests/validate.sh`)
+#   fails a Go CI step that omits it; see bin/prime for the long form.
+#
+#   Every proof below is matched against a package line rather than a test name,
+#   and that is a property of the runner rather than a preference: see the note
+#   above the proof list. A `(cached)` line satisfies a package-line proof, and
+#   now that `-count=1` is in place no line in a green run is cached.
+version: 1
+name: identity
+
+gate:
+  # An argv, never a shell string, so the exit code is the gate's own. This
+  # fleet's one recorded false green was `… | tail -45; echo "PRIME EXIT=$?"`
+  # under zsh, where `$?` is `tail`'s and `tail` is always 0. An argv has no
+  # pipeline in it to lose an exit code.
+  #
+  # `bin/prime`, unmodified as the COMMAND — AGENTS.md and ci.yml both make "the
+  # CI gate is the same command, not a CI variant of it" a rule, and a
+  # declaration pointing at a stricter command would make this file the second
+  # gate it exists to prevent. What the command CONTAINS was corrected, once, in
+  # this packet; see bin/prime and REPORT-identity-13-gate.md.
+  command: [bin/prime]
+  # The fleet's spelling, nine of thirteen repositories. It already resolves to
+  # the entrypoint below with no edit: mise.toml says
+  # `[tasks.prime] run = "./bin/prime"`, so `check_mise_task` reads the file
+  # straight out of the task and `gate.task-unresolvable` cannot fire.
+  miseTask: prime
+  # The file behind the command, checked on disk, with the executable bit.
+  entrypoint: bin/prime
+  # Deliberately generous, and the number is measured rather than guessed.
+  # 335s for a warm green run on this tree; a cold checkout additionally fetches
+  # ~60 modules and compiles the module graph, and the database tier has to
+  # build a private schema per test. This repository's own `dbtest.Schema`
+  # gives each schema clone 20 seconds, so a run on a loaded machine is
+  # bounded by contention and not by this number. A timeout tight enough to be
+  # a bug detector is tight enough to be a flake generator on somebody's first
+  # run, and this one exists to stop a hung gate, not to measure one.
+  timeoutSeconds: 3600
+  proof:
+    # ---------------------------------------------------------------------
+    # WHY NONE OF THESE HAS A `minimum`, which is unusual for this fleet.
+    #
+    # `minimum` is read from a single capture group in the LAST line that
+    # matches. Every other adopter can supply one because its runner prints a
+    # summary carrying a count: ExUnit's `Result: 535 passed`, pytest's
+    # `898 passed`, minitest's `228 runs`, npm's `# pass 187`, cargo's
+    # `test result: ok. 7 passed`, and `go tool cover`'s `total:`.
+    #
+    # **Go's `go test` prints no test count, and this was MEASURED on this tree
+    # rather than recalled.** `go test ./...` prints one line per PACKAGE —
+    #
+    #     ok  	github.com/cafaye/identity/internal/mfa	0.531s
+    #     ?   	github.com/cafaye/identity/internal/platform/dbtest	[no test files]
+    #
+    # — and the only number on the line is a DURATION. Verified against a
+    # complete 5225-line `go test -v -count=1 ./...` run: every candidate
+    # single-capture-group pattern over that output captures either a package
+    # path or a duration, never a count, and a search for any line of the form
+    # `<integer> passed|tests` returns nothing. The one capture group that IS an
+    # integer on an `ok` line is the duration, and a floor on a duration is a
+    # number that means nothing. A floor on the COUNT OF MATCHING LINES is not
+    # expressible either: the checker reads the LAST match, not the number of
+    # matches.
+    #
+    # The schema sanctions exactly this. `gate.proof[].minimum` is documented as
+    # "omit it only for a proof that reports nothing countable (a step that must
+    # appear in the log, a tier that must not say it skipped)", and a Go package
+    # line is a step that must appear in the log. So this is the schema's
+    # designed case, not a gap worked around in it.
+    #
+    # So the expected counts are written down here as MEASURED FACTS instead of
+    # as a floor, and the actual decrease-detector lives where it can see a
+    # count: `SUITE_FLOOR` and `DATABASE_TIER_FLOOR` in .github/workflows/ci.yml,
+    # read out of a `-v` run. See the note on those numbers below — they are
+    # the finding, not the fix.
+    #
+    #     whole suite      1789 PASS, 0 SKIP, 0 FAIL
+    #     database tier    1590 PASS, 0 SKIP, across 13 packages
+    #
+    # measured with `go test -v -count=1 ./...` against the pinned
+    # postgres:17.11-alpine, and cross-checked with ci.yml's own awk, which
+    # reports the same two totals. The 1789 is 809 top-level `--- PASS:` lines
+    # plus 980 indented subtest ones; both counts are in the report. The skip
+    # count is reported separately and on
+    # purpose: it is zero, and a zero written next to the pass count is the only
+    # way a reader learns the number was looked for.
+    #
+    # Read as one assertion, these eight lines say: the gate ran, the database
+    # tier ran against a real database, and the eight packages that carry the
+    # security boundary all executed.
+    # ---------------------------------------------------------------------
+    #
+    # 1-3. THE DATABASE TIER, and these three are the load-bearing proofs.
+    #
+    # Three packages carry a test NAMED `TestTheDatabaseTierActuallyRan`, and
+    # **the three assert three different things.** Measured, not inferred, by
+    # running this gate with `TEST_DATABASE_URL` unset:
+    #
+    #   internal/mfa/store_test.go:810     t.Fatalf unless TEST_DATABASE_URL is
+    #                                     set. ENFORCES the tier.
+    #   internal/apikeys/store_test.go:788 t.Fatalf unless TEST_DATABASE_URL is
+    #                                     set. ENFORCES the tier.
+    #   internal/admin/store_test.go:35    t.Fatal under `testing.Short()` and
+    #                                     NOTHING ELSE — it never reads
+    #                                     TEST_DATABASE_URL. Does NOT enforce
+    #                                     the tier.
+    #
+    # So proofs 1 and 2 below are the ones that carry the claim:
+    # `ok github.com/cafaye/identity/internal/mfa` cannot be printed by a run in
+    # which the database tier did not execute. In the run just measured, exactly
+    # those two packages went red and the other ELEVEN of the thirteen database
+    # packages — 1,590 tests' worth, including internal/httpapi's 669-test
+    # authorization matrix — printed `ok` having silently SKIPPED every
+    # database test. That is the defect this whole packet exists to end, still
+    # reachable, and it is why these two lines exist.
+    #
+    # Proof 3 is honest about being weaker, and says so rather than borrowing
+    # the strength of its two neighbours: with the database absent it still
+    # matched, because admin's copy of the guard passes in that case. It asserts
+    # that internal/admin's tests ran and passed, which is worth having, and it
+    # is NOT evidence that admin's tier reached a database. Reported in
+    # REPORT-identity-13-gate.md as a finding; fixing it would mean changing a
+    # test assertion, which this packet does not do.
+    - id: mfa-tier-ran
+      match: '^ok\s+github\.com/cafaye/identity/internal/mfa\t'
+    - id: apikeys-tier-ran
+      match: '^ok\s+github\.com/cafaye/identity/internal/apikeys\t'
+    - id: admin-tests-passed
+      match: '^ok\s+github\.com/cafaye/identity/internal/admin\t'
+    # 4. The largest package and the one that carries the authorization matrix,
+    # the OpenAPI drift walk in both directions, the security-logging canary and
+    # the OIDC allow-list test. 669 PASS lines measured, which is more than a
+    # third of the suite.
+    - id: httpapi-matrix-ran
+      match: '^ok\s+github\.com/cafaye/identity/internal/httpapi\t'
+    # 5. The package that guards ci.yml itself: that the workflow really runs
+    # bin/prime, that migrations really run before it, that the toolchain pin
+    # matches go.mod, and that no secret is written down. A gate whose own
+    # guard package silently stops running is a gate with no reader.
+    - id: ci-guard-ran
+      match: '^ok\s+github\.com/cafaye/identity/internal/platform/ci\t'
+    # 6. The hand-written client, which is where the credential-leak sweep and
+    # the "the committed generated file is what the pinned generator produces"
+    # test live. Not a cache of the generated code — `client/` itself, which
+    # AGENTS.md is explicit is hand-written and inside this module so it is
+    # gated.
+    - id: client-ran
+      match: '^ok\s+github\.com/cafaye/identity/client\t'
+    # 7. cmd/identity, where `TestMFAEncryptionKeyIsNeverGenerated` and the
+    # "no key mounts no management routes" wiring case live. This is the entry
+    # point, and `./...` would not reach it if the module layout changed.
+    - id: cmd-identity-ran
+      match: '^ok\s+github\.com/cafaye/identity/cmd/identity\t'
+    # 8. NOT a success line, and that is why it is here. `client/generated` is
+    # 12,284 lines of committed oapi-codegen output with 3,001 statements and no
+    # test, excluded from the coverage floor by the DECLARED path
+    # `client/generated` in coverage-exclusions.
+    #
+    # This proof asserts the exclusion is still real: the package has no test
+    # files. AGENTS.md and `TestTheCoverageExclusionIsOnlyGeneratedCode` both
+    # hold the rule that a test written against generated code is deleted by the
+    # next `go generate` and must not be added to raise coverage — so a test
+    # appearing here is the defect, and this line going red says so in the gate
+    # rather than in a review.
+    - id: generated-excluded
+      match: '^\?\s+github\.com/cafaye/identity/client/generated\t\[no test files\]$'
+
+    # ---------------------------------------------------------------------
+    # THIS GATE HAS BEEN OBSERVED RED. A declaration that has only ever been
+    # observed green is a claim about a gate nobody has tested. Every run below
+    # was produced by breaking something on purpose on this tree, and each is
+    # quoted from the checker's own output rather than described.
+    #
+    # RED 0 — THE FALSE GREEN, and the one this packet exists to rule out. The
+    # packet's premise is that "a checker replaced by a function that
+    # unconditionally exits 0 would leave this repository green", so that is
+    # what was tried: a copy of this tree with `bin/prime` replaced by
+    #
+    #     #!/bin/sh
+    #     exit 0
+    #
+    # The gate exits 0. The checker does not believe it:
+    #
+    #   FAIL gate.proof-missing: proof 'mfa-tier-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'apikeys-tier-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'admin-tests-passed' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'httpapi-matrix-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'ci-guard-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'client-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'cmd-identity-ran' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'generated-excluded' never appeared; ...
+    #   FAIL ...: 8 failure(s), 2 warning(s)
+    #
+    # Checked in bash under `set -o pipefail`; the checker's own exit code was
+    # captured directly and was 1. All eight proofs went red, and note WHAT DID
+    # NOT: there is no `gate.nonzero` here, because the exit code really was 0.
+    # The exit code was never the thing catching this one — the proofs are. That
+    # is the whole difference between a gate and a command that exits zero, and
+    # it is why a declaration with no proofs could not be trusted even if its
+    # command were perfect.
+    #
+    # RED 1 — the database tier silently absent. `bin/prime` re-run with
+    # TEST_DATABASE_URL unset, which is the exact configuration that produced
+    # identity's recorded "1430 tests proving they do not notice an empty
+    # database":
+    #
+    #   FAIL gate.nonzero: the gate exited 1
+    #   FAIL gate.proof-missing: proof 'mfa-tier-ran' never appeared; no line of
+    #        the gate's output ... matches '^ok\s+github\.com/cafaye/identity/internal/mfa\t'
+    #   FAIL gate.proof-missing: proof 'apikeys-tier-ran' never appeared; ...
+    #   FAIL ...: 3 failure(s), 2 warning(s)
+    #
+    # Two independent signals, and the second is the one that would survive a
+    # repair to the first: the exit code caught it, AND the tier proofs
+    # disappeared. Fix the exit code alone and these two lines still go red.
+    #
+    # RED 2 — a package that quietly loses its tests. internal/admin's two test
+    # files moved out of the tree, so the package reports `[no test files]`:
+    #
+    #   FAIL gate.nonzero: the gate exited 1
+    #   FAIL gate.proof-missing: proof 'admin-tests-passed' never appeared; ...
+    #   FAIL gate.proof-missing: proof 'ci-guard-ran' never appeared; ...
+    #   FAIL ...: 3 failure(s), 2 warning(s)
+    #
+    # Three signals for one deletion, and the third is this repository's own
+    # doing rather than this file's: internal/platform/ci's
+    # TestTheCoverageExclusionIsOnlyGeneratedCode walks the tree, finds
+    # service_test.go and store_test.go in git but not in the worktree, fails,
+    # and takes `ci-guard-ran` down with it. That test was written to catch a
+    # deleted GENERATED file and caught a deleted suite instead, which is the
+    # best argument for having it. The files were restored before this commit.
+    #
+    # AND THE ONE THAT WAS NOT FIXED, because it is the finding:
+    # `internal/admin`'s copy of `TestTheDatabaseTierActuallyRan` passes with no
+    # database at all. See the three-copies note above. It stays red in RED 1
+    # and is reported in REPORT-identity-13-gate.md; changing it would mean
+    # editing a test assertion, which is the one thing this packet does not do.
+    #
+    # RED 3 — THE FALSE GREEN THAT WAS LIVE IN THIS REPOSITORY, reproduced and
+    # then fixed. Not a hypothetical breakage: this is what `bin/prime` did on
+    # the tree this declaration was written from, because it ran `go test ./...`
+    # with no `-count=1` and Go served the suite from its test cache. Measured,
+    # warm cache, same command, against the migrated database:
+    #
+    #     exit 0   wall 8s   18 `ok` package lines   16 read `(cached)`
+    #
+    # Two of eighteen packages executed. Every proof in this list was satisfied
+    # by a `(cached)` line, the exit code was 0, and a developer who had just run
+    # the gate had verified nothing about this tree. That is the packet's premise
+    # happening inside the repository the packet is about, and it is why the flag
+    # is now in `bin/prime` — measured after the fix: exit 0, 126s, 18 packages,
+    # 0 cached.
+    # ---------------------------------------------------------------------
+
+external:
+  # NOT self-contained, and saying so is the point. `bin/prime` needs a Go
+  # toolchain this repository pins rather than ships, a module proxy on a cold
+  # checkout, and a PostgreSQL server with this repository's 13 migrations
+  # applied. A declaration that called this self-contained would be describing a
+  # gate nobody has ever run on a clean machine — which is the same defect as
+  # identity's suite being green against an unmigrated database, told the other
+  # way round.
+  selfContained: false
+  requirements:
+    # The pin is mise.toml's `go = "1.26"` against go.mod's `go 1.26.1`, and
+    # ci.yml asserts the two agree on every run. Note the residue: `go.mod`
+    # asks for 1.26.1 and mise.toml pins the minor, so a machine with only
+    # `mise install` can satisfy one and not the other. Named here rather than
+    # fixed, because fixing a toolchain pin is a decision and not this packet's.
+    - kind: toolchain
+      name: go 1.26 — mise.toml pins the minor, go.mod asks for 1.26.1, and ci.yml asserts the two agree
+      satisfy:
+        # A bare name, so this is a claim about THIS MACHINE and the checker
+        # deliberately does not run it. It reports `gate.requirement-unproven`,
+        # a warning that never moves the exit code, which is the right severity:
+        # a checker that failed on it would be red on a laptop and green on CI.
+        command: [mise, install]
+        unmet: bin/prime exits 127 from `go mod download` with "go: command not found" in the message
+    # The server. `postgres:17-alpine`, the same service docker-compose.yml
+    # carries, and the same minor ci.yml pins at 17.11-alpine.
+    #
+    # THE PORT IS NOT 5432 ON EVERY MACHINE, and this is measured rather than
+    # hypothetical: `docker-compose.yml` publishes `${POSTGRES_PORT:-5432}` and
+    # comments that a local Postgres already holding 5432 must be worked around.
+    # On the machine this was written on, a native PostgreSQL 18.4 owned
+    # 127.0.0.1:5432 and every container run of `docker compose up -d
+    # postgres` came up HEALTHY while `goose` and every test failed with
+    # `role "identity" does not exist` — the health check is `pg_isready`,
+    # which reports a server accepting connections and does not authenticate.
+    # The fix is the one the compose file already documents:
+    # `POSTGRES_PORT=5433 docker compose up -d postgres`.
+    - kind: database
+      name: PostgreSQL reachable at $TEST_DATABASE_URL — docker compose's postgres:17-alpine, default max_connections=100
+      satisfy:
+        command: [docker, compose, up, -d, postgres]
+        unmet: >-
+          bin/prime fails in three packages at once with "TEST_DATABASE_URL is
+          set but not reachable", or `role "identity" does not exist` from goose
+          while the container reports healthy — which means a local Postgres is
+          holding 5432 and POSTGRES_PORT has to be set
+    # The schema. This is a SEPARATE requirement from the server above and it is
+    # separate because it is a different failure: identity's migrations are a
+    # deploy step, the service never migrates itself, and against an unmigrated
+    # database the suite dies on `relation "public.users" does not exist` —
+    # loud, but a red that reads like a code failure. This is the third of the
+    # three mistakes core/docs/gate.md records for this repository, and it is the
+    # one that cost a 604-second recovery.
+    - kind: database
+      name: the 13 migrations in migrations/ applied, as a deploy step ABOVE the suite — never inside it
+      satisfy:
+        # A repository-relative path, so the checker verifies the file is there:
+        # a requirement satisfied by something that does not exist is a pointer
+        # to a page that does not exist. migrations/README.md is where the
+        # command is documented, and it is the right thing to point at because
+        # the argv cannot be written down here — it interpolates a DSN.
+        command: [migrations/README.md]
+        unmet: >-
+          the suite fails with `relation "public.users" does not exist`, or with
+          `permission denied for schema public` when the role does not own the
+          schema
+    # Once, and only on a cold checkout. `go mod download` is bin/prime's FIRST
+    # step, so it is inside the gate rather than beside it, and after it the
+    # gate is offline. ci.yml's lockfile guard then asserts `go mod download`
+    # left go.mod and go.sum byte-identical.
+    - kind: network
+      name: the Go module proxy, ONCE, on a cold checkout — the ~60 modules go.sum pins, fetched by bin/prime's own first step
+      satisfy:
+        # Repository-relative, so the checker verifies the file is there.
+        # `bin/prime` is the argv that actually reaches the network — there is no
+        # separate setup script in this repository to name instead.
+        command: [bin/prime]
+        unmet: bin/prime exits nonzero at `go mod download`, naming a module in go.sum, with a network or dial error
+  #
+  # NOT REQUIRED, and named here so nobody goes looking for them:
+  #
+  #   * no credential, and this is the sharp one for a security-boundary
+  #     repository. `MFA_ENCRYPTION_KEY` — the variable that looks most like a
+  #     secret in this tree — is read by NO test. Every MFA test builds a
+  #     config.Config literal or a Lookup over a map, so the suite needs no key
+  #     and cannot leak one. ci.yml generates a key per run from /dev/urandom,
+  #     masks it before the process sees it, and the log carries only its
+  #     length; a literal in that file would be a secret in a repository and a
+  #     literal in a step would be a secret in a retained, searchable log.
+  #   * The credential in $TEST_DATABASE_URL is not a secret and is not declared
+  #     as one: it is the TEST-ONLY user and password that docker-compose.yml
+  #     and ci.yml already commit in plain text, and it is named as test-only in
+  #     both. No DSN is written into this file, because a declaration is a
+  #     document that ends up in every report about the run.
+  #   * no service beyond the database above. The suite starts its own
+  #     httptest servers on 127.0.0.1 with port 0, so nothing dials out and
+  #     nothing needs a fixed port.
+  #   * no filesystem path outside the repository. The Go build cache and the
+  #     module cache are the machine's, not the tree's, and the tree is left
+  #     byte-identical — which ci.yml asserts after every gate run.
+  #
+  # WHAT THIS DECLARATION CANNOT SEE, named so it is not over-read:
+  #
+  #   * the pass count. See the proofs above: Go prints none, so there is no
+  #     floor here and the decrease-detector is ci.yml's.
+  #   * the database schema. `gate.proof` is a line of output. Proving the tier
+  #     ran against a MIGRATED schema is the `goose up` step's job in ci.yml,
+  #     and this file cannot substitute for it.
+  #   * `env:` blocks in a workflow. `gate.ci-disagrees` reads `run:` bodies
+  #     textually, so a workflow that dropped TEST_DATABASE_URL from its env
+  #     would still pass the static phase — though it would then fail at run
+  #     time, which is the better of the two failures.
+
+ci:
+  workflow: .github/workflows/ci.yml
+  # `[bin/prime]` and not `[./bin/prime, -v, -count=1, -race]`, on purpose. The
+  # workflow really does run both — the `gate` job's "the gate a developer runs"
+  # step is `./bin/prime` unmodified, and its "the whole suite, verbose, counted
+  # and under -race" step is the stricter command above — and `invokes` only
+  # claims the gate is REACHABLE from CI. Pointing it at the stricter command
+  # would make this check sensitive to a verbosity change that has nothing to do
+  # with whether CI gates this repository, which is the only question the field
+  # asks.
+  invokes: [bin/prime]

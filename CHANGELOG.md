@@ -56,6 +56,114 @@ All notable changes to identity are recorded here. The format follows
   note is kept because the failure it describes is still live for the OIDC types
   below it, where core's catalog has no row at all.
 
+### Added (packet identity-13-gate)
+
+- **`gate.yml`, so `bin/prime` means something here.** Six of thirteen services
+  declared a gate; identity was one of seven that did not, so a developer running
+  `bin/prime` saw a green result and learned nothing about whether the gate could
+  detect anything. The format is `cafaye/core`'s `schemas/gate.schema.json` and the
+  checker is its `harness/gate_check.py`.
+
+  - **`bin/prime` could not be executed at all, and that was found by declaring it.**
+    The file has the executable bit and no interpreter line, so `execve` fails with
+    `ENOEXEC`: `FAIL gate.command-missing: … [Errno 8] Exec format error:
+    'bin/prime'`. A developer and CI never saw it because `bash` and `zsh` fall
+    back to interpreting a shebang-less file themselves; the checker runs the gate
+    with `subprocess` and no shell, so it hit the real behaviour on the first
+    attempt. Every other adopter ships a shebang and kit's Go template ships
+    `#!/bin/sh`. Fixed with one line — see **Fixed** below.
+
+  - **THE DECLARATION CARRIES NO FLOOR, and that is a property of Go, measured
+    rather than assumed.** `minimum` is read from a capture group in the last
+    matching line, and every other adopter's runner prints a count — ExUnit's
+    `Result: 535 passed`, pytest's `898 passed`, minitest's `228 runs`, npm's
+    `# pass 187`, cargo's `test result: ok. 7 passed`. **`go test` prints no test
+    count**: it prints one line per package and the only number on it is a
+    duration. Checked against a complete 5,225-line `go test -v -count=1 ./...`
+    run of this suite — every candidate capture group yields a package path or a
+    duration, and a search for any `<integer> passed|tests` line returns nothing.
+    The schema sanctions this case exactly ("omit it only for a proof that reports
+    nothing countable"), so the eight proofs are presence assertions and the
+    expected counts are recorded in the file as measured facts — **1789 PASS / 0
+    SKIP** whole suite (809 top-level + 980 subtest lines), **1590 PASS / 0 SKIP**
+    database tier across 13 packages — while the actual decrease-detector stays in
+    `ci.yml`, which counts a `-v` run.
+
+  - **`bin/prime` ran no tests, and said `ok` 18 times while doing it.** It ended
+    with a bare `go test ./...`, which Go serves from its test cache. Measured on
+    this tree with a warm cache: **exit 0, wall 8s, 18 `ok` package lines, 16 of
+    them `(cached)` — two packages actually executed.** Every proof in the
+    declaration was satisfied by a `(cached)` line, so a developer who had just
+    run the gate had verified nothing. **Fixed** — see **Fixed** below. The
+    measured result after the fix: exit 0, 126s, 18 packages, 0 cached.
+
+  - **The gate was observed red three times, on purpose, and all three are quoted
+    in the file.** The important one is the packet's own premise tested directly: a
+    copy of this tree whose `bin/prime` is `#!/bin/sh` + `exit 0` makes **all
+    eight proofs go red and the checker's exit code 1**, with **no** `gate.nonzero`
+    — the exit code really was 0. The proofs, not the exit code, are what tell a
+    gate apart from a command that exits zero. With `TEST_DATABASE_URL` unset —
+    the configuration behind identity's recorded "1430 tests against an unmigrated
+    database" — `gate.nonzero` fires *and* the `mfa-tier-ran` and
+    `apikeys-tier-ran` proofs disappear. With `internal/admin`'s test files
+    removed, `admin-tests-passed` disappears *and* `ci-guard-ran` goes with it,
+    because this repository's own `TestTheCoverageExclusionIsOnlyGeneratedCode` —
+    written to catch a deleted generated file — walks the tree, finds the two files
+    in git but not in the worktree, and fails.
+
+- **Measured, reported, and NOT changed: CI's floors are 535 and 424 tests below
+  this suite.** `SUITE_FLOOR: 1254` against a measured 1789, and
+  `DATABASE_TIER_FLOOR: 1166` against a measured 1590. **535 tests — 30% of the
+  suite — could be deleted and CI would still be green.** Two hand-written copies
+  of measurements in the same file are stale the same way `REPORT-identity-12` was
+  about: the comment says "11 packages that open a pool" and there are 13, and the
+  run summary says "10 migrations applied" and there are 13. Reported for the
+  manager with the numbers attached; `ci.yml` is untouched by this packet. The
+  counts here were reproduced independently with `ci.yml`'s own awk against a fresh
+  `-count=1` run, and agree to the test.
+
+- **What was NOT exercised, named so the next reader knows.** The suite tier is
+  gated on **`TEST_DATABASE_URL`** and was run with it set, against
+  `postgres:17-alpine` with all 13 migrations applied: **0 skips, so the database
+  tier did run** rather than silently passing. **`go test -race ./...` was not
+  run** — this machine was at load 31–70 for the whole packet, and a race run
+  under that load measures contention rather than races. `bin/coverage-floor` was
+  not run; it needs a coverage profile and this packet changed no code.
+
+- **The database tier is enforced by two packages out of thirteen, and one of the
+  three copies of the guard that enforces it does not.** Measured by running the
+  gate with the variable unset: **11 of the 13 database packages still print
+  `ok`** — including `internal/httpapi`'s 669-test authorization matrix — because
+  `dbtest.Pool`/`dbtest.Schema` skip silently and a package whose tests all skip
+  still reports `ok`. `internal/mfa` and `internal/apikeys` call `t.Fatalf` when
+  `TEST_DATABASE_URL` is unset; **`internal/admin`'s same-named
+  `TestTheDatabaseTierActuallyRan` only guards `-short` and never reads the
+  variable**, and `ci.yml`'s single `--- PASS: TestTheDatabaseTierActuallyRan (`
+  grep cannot tell the three apart. Left as found and named in `gate.yml`, which
+  weakens its own `admin` proof to match: it is documented as *not* evidence that
+  admin's tier reached a database. Changing it means editing a test assertion, so
+  it belongs to whoever owns the tier.
+
+### Fixed (packet identity-13-gate)
+
+- **`bin/prime` now passes `-count=1`, so a green gate means the tests ran.** One
+  flag, and it is the difference between a gate and a replay. Before: `go test
+  ./...` served from Go's test cache, measured at **exit 0, 8 seconds, 16 of 18
+  packages cached, two executed** — every proof satisfied, nothing verified. After:
+  18 packages, 0 cached, 126s. This is not a local preference either: kit's Go
+  template ships `go test -count=1 ./...` and kit's validator **fails** a Go CI
+  step that omits it (`tests/validate.sh:3014`), so identity's gate was the one
+  place a fleet-wide rule did not hold. The header comment, which claimed this
+  file was kit's template "unmodified", was false and now records the real
+  divergence.
+
+- **`bin/prime` is executable again.** Added the `#!/bin/sh` shebang it has been
+  missing since the identity-01 scaffold, with a comment explaining that it is
+  load-bearing. The body is `set -eu` and three commands, so behaviour is
+  unchanged — but without it the file cannot be `exec`'d by anything that does not
+  go through a shell, which is why `core`'s checker could not start the declared
+  gate at all.
+
 ### Added (packet identity-12-coverage)
 
 - **The coverage floor has an exclusion mechanism, declared, and the floor did not

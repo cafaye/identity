@@ -28,6 +28,12 @@ client/                THE GO CLIENT: a generated transport and the hand-written
 bin/prime              the gate: go mod download && go build ./... && go test ./...
 bin/coverage-floor     the coverage floor, over the profile minus coverage-exclusions
 coverage-exclusions    DECLARED paths left out of that measurement: reason, owner, dates
+gate.yml               WHAT THIS GATE IS WORTH, declared: the entrypoint, the proofs the
+                       gate's own output must contain, and what the gate needs from the
+                       machine. Checked by cafaye/core's harness/gate_check.py, NOT by
+                       go test. Go prints no test count, so this file carries no
+                       `minimum` floor and the decrease-detector is SUITE_FLOOR in
+                       .github/workflows/ci.yml — read the report before changing it.
 ```
 
 `client/` is deliberately NOT under `internal/`, and that is the only reason it is
