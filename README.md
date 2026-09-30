@@ -27,6 +27,20 @@ Chi over echo: same five routing features, a fraction of the dependencies, and
 signature. It is a router, not a framework — nothing in `internal/` needs to
 know chi exists to be tested.
 
+## Dependencies
+
+Three direct dependencies, each with a cause:
+
+- `chi` — routing, above.
+- `pgx` — Postgres. The pool and the `SKIP LOCKED` claim in the outbox.
+- `alexedwards/argon2id` — password hashing. Go's standard library has no
+  password KDF and `x/crypto` ships only the raw primitive with no encoded-digest
+  format or parameter handling, so this is the one case where the standard
+  library genuinely cannot do the job. It is not a framework, it has no
+  transitive dependencies of its own, and reimplementing argon2id in `internal/`
+  would be far more dangerous than depending on it. It arrives with the auth
+  packet; the scaffold had only the first two.
+
 ## Running it
 
 Nothing but Go is needed, and no database is required — v0 supports an unset
@@ -69,7 +83,19 @@ service quietly listening on the wrong port.
 |---|---|---|
 | `GET /healthz` | `200 {"status":"ok"}` | Liveness. Always 200 while the process serves — it never touches a dependency, so a database outage cannot get the process restarted out from under in-flight work. |
 | `GET /readyz` | `200 {"status":"ok","deps":"postgres"}` | Readiness. 200 when every dependency answers, `503 {"status":"unavailable",...}` otherwise, with each probe bounded at 2s. |
-| anything else | `404 {"status":"not_found"}` | JSON, not chi's default plain text. |
+| `POST /v1/users` | `201 {"id","email"}` | Register. `409 conflict` if the address is taken, `422 validation_failed` with `errors[]` on a bad field, `400 invalid_json` on a malformed body, `413 payload_too_large` past 4 KB. |
+| `POST /v1/session` | `200 {"token","expires_at"}` | Log in. Sets the `__Host-session` cookie to the same token. `401 unauthorized` for any unusable credential, `423 account_locked` with `Retry-After` while locked. |
+| `DELETE /v1/session` | `204` | Revoke the current session and clear the cookie. `401` if no credential was presented. |
+| `GET /v1/me` | `200 {"id","email"}` | The authenticated user. `401` with no usable credential. |
+| anything else | `404 not_found` | A problem document, not chi's default plain text. |
+
+Every non-2xx is `application/problem+json` per core's error envelope, including
+`404` and `405`. The `trace_id` in the body always matches the `X-Trace-Id`
+response header, and internal failures are logged with that id rather than
+described to the caller.
+
+The `/v1` routes exist only when `DATABASE_URL` is set. Without it they are
+absent, so a missing database is a clear `404` rather than a pile of `500`s.
 
 With no `DATABASE_URL`, readiness is `200 {"status":"ok","deps":"none"}` — there
 is nothing to check, and saying so is more useful to an operator than an empty
@@ -84,9 +110,13 @@ a database host is `10.0.0.5` or that a password was rejected.
 ```
 cmd/identity/main.go   thin entrypoint: load config, build the app, serve, drain on SIGTERM
 internal/config/       environment in, validated Config out
-internal/httpapi/      the router and the two probe handlers
+internal/httpapi/      the router, the probes, and the v1 auth surface
+internal/auth/         register, login, resolve — the use cases and their ordering
+internal/users/        accounts and the email-uniqueness rules
+internal/sessions/     session tokens, hashing and revocation
+internal/outbox/       transactional event envelope, SKIP LOCKED claim, publisher
 internal/platform/db/  the pgx pool, and the readiness ping
-migrations/            goose SQL files (convention established, no schema yet)
+migrations/            goose SQL files
 ```
 
 `cmd/` + `internal/` is the layout from `refs/goreleaser`. `main` owns nothing
@@ -96,8 +126,8 @@ type that the tests drive directly.
 
 ## Testing
 
-`go test ./...` passes on a machine with no database and no Docker. The two
-tests that need a real server skip themselves unless `TEST_DATABASE_URL` is set:
+`go test ./...` passes on a machine with no database and no Docker. The
+integration tests skip themselves unless `TEST_DATABASE_URL` is set:
 
 ```sh
 docker compose up -d postgres
@@ -114,8 +144,8 @@ a failure deadline (PLAN.md §3).
 
 goose SQL files in `migrations/`, numbered and annotated. `goose` is a CLI
 tool, not a module dependency. `00001_init.sql` establishes the convention and
-creates nothing. Migrations are a deploy step, not a boot step — see
-[migrations/README.md](migrations/README.md).
+`00002`–`00004` create `users`, `sessions` and `outbox_events`. Migrations are a
+deploy step, not a boot step — see [migrations/README.md](migrations/README.md).
 
 ## Image
 
@@ -130,15 +160,18 @@ docker run --rm -p 8080:8080 identity
 ## Not built yet
 
 Everything below is a later packet, and none of it is stubbed to look finished:
-sessions and password auth, email verification, OAuth, accounts/roles/invites,
-OIDC, MFA, API tokens, the admin API, and the generated authz matrix suite. No
-users table, no JWT code, no OIDC provider.
+email verification, password reset, OAuth, accounts/roles/invites, OIDC, MFA,
+API tokens, the admin API, and the generated authz matrix suite. No JWT code, no
+OIDC provider, and no self-service password recovery — a user who forgets a
+password today has no path back in.
 
 ## Roadmap
 
 - [x] Skeleton: config, `/healthz`, `/readyz`, pgx pool, graceful shutdown
 - [x] Migration convention, image, compose stack
-- [ ] Password auth, sessions, lockout
+- [x] Password auth, sessions, lockout
+- [x] Error envelope, trace ids, panic recovery
+- [x] Outbox: transactional events, SKIP LOCKED claim, publisher loop
 - [ ] Email verification, password reset
 - [ ] OAuth via goth
 - [ ] Accounts, memberships, roles, invitations

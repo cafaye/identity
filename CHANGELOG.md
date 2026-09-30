@@ -6,7 +6,62 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `internal/users`, `internal/sessions`, `internal/auth` — the account and
+  session substrate and the four use cases on top of it: `Register`, `Login`,
+  `Authenticate`, `Logout`. Argon2id digests, per-account lockout on repeated
+  failed sign-ins, and a `401` for every unusable credential alike so the login
+  endpoint is not an account-enumeration oracle.
+- `internal/outbox` — the event envelope, a transactional store, `SKIP LOCKED`
+  claim and a publisher loop. `identity.user.created` is written in the same
+  transaction as the user row, which is the reason the store methods take a
+  `Querier` rather than the pool.
+- `internal/httpapi` — the v1 surface: `POST /v1/users`, `POST /v1/session`,
+  `DELETE /v1/session`, `GET /v1/me`. The session token travels in an
+  `__Host-session` cookie *and* in the login body; a cookie is a browser
+  mechanism and an API client cannot use one. Request bodies are capped at 4 KB
+  and rejected at the reader, and unknown fields are refused rather than
+  silently dropped.
+- The core error envelope — every non-2xx is `application/problem+json` with
+  core's `code` and `trace_id` extensions, including `404` and `405`, which
+  previously carried a bespoke JSON body. Codes beyond core's reserved list
+  (`account_locked` 423, `invalid_json` 400, `payload_too_large` 413) are this
+  service's extension and are flagged for the manager.
+- `internal/httpapi/trace.go` — a trace id on every request and every response.
+  An inbound id is reused so a trace survives a hop through guard or a proxy;
+  an unusable one is replaced rather than rejected.
+- `internal/httpapi/recover.go` — a panic in a handler becomes a logged 500
+  with a quotable trace id instead of a closed connection and a bare log line.
+  `http.ErrAbortHandler` is re-panicked, and a response that is already
+  committed is left alone rather than appended to.
+- `migrations/00002`–`00004` — the `users`, `sessions` and `outbox_events`
+  tables, each with a `Down`.
+- `cmd/identity` wiring tests — the auth surface driven through the real
+  handler `newApp` builds, with and without a database, and a case proving an
+  unreachable database is a readiness failure rather than a startup failure.
+
+### Changed
+
+- `POST /v1/users` and `POST /v1/session` are mounted only when
+  `DATABASE_URL` is set. Without it they are absent, so a missing database is
+  a clear `404` rather than a pile of `500`s.
+- A third direct dependency, `alexedwards/argon2id`, arrives with the password
+  hashing. It is the one case the standard library cannot cover — `x/crypto`
+  ships the raw primitive but no encoded-digest format — and the cause is now
+  stated in the README, as `AGENTS.md` requires. The scaffold had `chi` and
+  `pgx` only.
+
+### Notes
+
+- `writeJSON` lives in `problem.go` beside `writeProblem`, not in the router
+  file. The two are the pair core's "no service invents its own error body"
+  rule describes, so a handler has exactly two writers and nowhere else to
+  reach for a third.
+- A `logout` with no credential presented is `401`, not `204`: a `204` would
+  tell a client its request succeeded when nothing happened.
+- `go test ./...` is still green with no database and no Docker. The Postgres
+  integration tests skip unless `TEST_DATABASE_URL` is set.
 
 ## [0.1.0] - 2026-09-30
 

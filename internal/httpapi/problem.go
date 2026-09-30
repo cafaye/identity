@@ -22,10 +22,10 @@ const errorTypeBase = "https://errors.cafaye.com/"
 //	invalid_json        400  a body that is not JSON at all
 //	payload_too_large   413  a body past the accepted size
 //
-// They are listed together in openapi/v1.yaml and flagged for the manager: core
-// owns this list, and a service that quietly invents codes is the drift the
-// document exists to prevent. A 423 is required by the lockout the packet
-// specifies, and the other two are the honest answers for a malformed or
+// They are listed together in openapi/v1.yaml and flagged there for the
+// manager: core owns the set, and a service that quietly invents codes is the
+// drift the document exists to prevent. A 423 is required by the lockout the
+// packet specifies, and the other two are the honest answers for a malformed or
 // oversized request — folding them into validation_failed would have reported a
 // syntactically broken body as a semantic failure.
 const (
