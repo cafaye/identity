@@ -168,7 +168,18 @@ func TestTheCoverageExclusionIsOnlyGeneratedCode(t *testing.T) {
 		for _, path := range matched {
 			raw, err := os.ReadFile(filepath.Join(root, path))
 			if err != nil {
-				t.Fatalf("reading %s: %v", path, err)
+				// `git ls-files` still lists a tracked file that has been deleted
+				// from the worktree, so this IS the rule-4 case and not a broken
+				// test — the generator moved, or the file was deleted, and the
+				// declaration is now exempting nothing. Saying "no such file"
+				// would be true and useless; the name below is what a reader needs.
+				t.Errorf("line %d: %s is excluded and %s is in git but not in the worktree.\n"+
+					"The declaration is now exempting nothing. `git ls-files` still lists it, "+
+					"which is why this reads as a missing file rather than an unused entry — "+
+					"the generator moved, or the file was deleted, and either way somebody has "+
+					"to decide what the exclusion covers now.",
+					entry.line, entry.prefix, path)
+				continue
 			}
 			files++
 			lines += strings.Count(string(raw), "\n")
@@ -252,7 +263,15 @@ func TestEveryExcludedDirectoryIsNamedInTheDeclaration(t *testing.T) {
 		dir := path[:strings.LastIndex(path, "/")]
 		raw, err := os.ReadFile(filepath.Join(root, path))
 		if err != nil {
-			t.Fatalf("reading %s: %v", path, err)
+			// Same rule-4 case as above, reported once and in the same words. A
+			// reader who has just been told a file is missing should not also be
+			// told a generated directory was never declared, because both are one
+			// fact: the tree moved and the declaration did not.
+			t.Errorf("%s is in git but not in the worktree, so this walk cannot tell "+
+				"whether the directory it belongs to is generated. The generator moved, or "+
+				"the file was deleted, and %s has not been restated.",
+				path, exclusionsFile)
+			continue
 		}
 		if generatedHeader.Match(raw) {
 			generatedDirs[dir] = true
