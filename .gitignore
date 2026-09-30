@@ -1,0 +1,18 @@
+# Compiled binaries. The service builds to ./identity (mise run build).
+/identity
+/identity.exe
+
+# Test and coverage output.
+coverage.txt
+*.out
+*.test
+
+# Local environment.
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise.
+.DS_Store
+.idea/
+.vscode/

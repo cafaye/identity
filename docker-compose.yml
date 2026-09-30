@@ -1,0 +1,52 @@
+# The local development stack for identity: the service and the Postgres it will
+# use. `docker compose up -d` is the whole thing.
+#
+#   docker compose up -d
+#   curl localhost:8080/healthz
+#   curl localhost:8080/readyz
+#
+# The service also runs without a database (v0 supports an unset
+# DATABASE_URL, and /readyz then reports `"deps":"none"`), so this stack exists
+# for the packets that need real Postgres, not to make the service start.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: identity
+      POSTGRES_PASSWORD: identity
+      POSTGRES_DB: identity
+    ports:
+      # Host-side DSNs only (goose, TEST_DATABASE_URL). The service talks to
+      # postgres over the compose network, not through this mapping. If 5432 is
+      # already taken by a local Postgres, override it: POSTGRES_PORT=5433 docker
+      # compose up -d, and point DATABASE_URL at localhost:${POSTGRES_PORT}.
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # The identity service is started only once this reports healthy, so
+      # pgx never races a Postgres that is still in its init phase.
+      test: ["CMD-SHELL", "pg_isready -U identity -d identity"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  identity:
+    build:
+      context: .
+      args:
+        GO_VERSION: "1.26"
+    environment:
+      PORT: "8080"
+      LOG_LEVEL: debug
+      DATABASE_URL: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
