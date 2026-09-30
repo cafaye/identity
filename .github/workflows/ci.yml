@@ -74,35 +74,42 @@ jobs:
   # `{owner}/{repo}/.github/workflows/{file}@{ref}` and documents that
   # subdirectories of the workflows directory are not supported, so a
   # `uses: cafaye/kit/workflows/ci.reusable.yml@master` line resolves to nothing
-  # and the build is red before it starts. Verified at that path in ../kit at
-  # commit 13228ed.
+  # and the build is red before it starts. Verified present at that path in
+  # ../kit at 13228ed, and re-verified at kit HEAD 4fe04fd.
   #
-  # KNOWN RED ON ARRIVAL, on two steps, for reasons that live in kit's file and
-  # not in this one:
+  # KNOWN RED ON ARRIVAL, on two steps, and this is a conflict with kit's own
+  # rules rather than a choice made here. kit/README.md's adoption checklist ends
+  # with "The workflow is green on the adoption PR", and kit/AGENTS.md says "Never
+  # weaken a check to make the gate green. If a check is wrong, fix the check".
+  # identity cannot satisfy the first without violating the second, because both
+  # reds below are structural:
   #
-  #   - `lint` runs golangci-lint with no `.golangci.yml` in this repository, so
-  #     it is golangci-lint's DEFAULT set rather than kit's stricter one. On the
-  #     commit that added this file it reports 31 issues: 13 errcheck, 9 unused,
-  #     6 staticcheck, 3 ineffassign. Run with kit's own config
-  #     (kit/lint/golangci.yml) it reports 83 — the extra 50 are misspell, plus
-  #     noctx and errorlint findings. `go vet ./...`, `gofmt -l .` and `bin/prime`
-  #     are all clean and the gate job is green, so the failure is named rather
-  #     than inferred. Copying kit's config is its own packet: the checklist says
-  #     "unmodified", and the config's own comment says its `go:` floor (1.24)
-  #     must match go.mod (1.26.1). Those two instructions disagree, so this
-  #     packet does not silently pick one.
   #   - `test` runs `go test -race -coverprofile=coverage.out ./...` with no
   #     Postgres, because a caller cannot hand a reusable workflow a service
   #     container. internal/mfa's TestTheDatabaseTierActuallyRan fails the moment
   #     TEST_DATABASE_URL is absent, so this step dies on the first package that
   #     needs one. That is identity-06's deliberate design — a green suite that
-  #     never touched a database is a false claim — meeting a workflow that
-  #     cannot host a database.
+  #     never touched a database is a false claim — meeting a workflow that cannot
+  #     host a database. The only way to make this step green from here is to
+  #     un-fail that test, which is the weakening kit's AGENTS.md forbids.
+  #   - `lint` runs golangci-lint, and this repository has no `.golangci.yml`, so
+  #     it is golangci-lint's DEFAULT set. Measured 2026-09-30 with
+  #     golangci-lint v2.6.2: 31 issues — errcheck 13, unused 9, staticcheck 6,
+  #     ineffassign 3. With kit's own config (kit/lint/golangci.yml) it is 83:
+  #     the defaults plus misspell 50, noctx 6, errorlint 4, copyloopvar 3, less
+  #     errcheck 11. So copying the config makes this step redder, not greener,
+  #     and the 50 misspellings are somebody else's packet.
   #
-  # Delete this job when kit's Go job grows a `services`/`env` seam, and not
-  # before on the strength of a green `ci`: there will not be one until then.
-  # Everything it would have verified is verified in `gate`, against a database,
-  # with the toolchain read out of go.mod.
+  # There is no `continue-on-error` on a job that calls a reusable workflow
+  # either — GitHub accepts only name, uses, with, secrets, strategy, needs, if,
+  # concurrency and permissions there — so the caller cannot even mark this job
+  # non-blocking. Until kit grows a `services`/`env` seam, `gate` is the job for
+  # branch protection to require, and this one is expected red.
+  #
+  # Delete this job when that seam exists, and not before on the strength of a
+  # green `ci`: there will not be one until then. Everything it would have
+  # verified is verified in `gate`, against a database, with the toolchain read
+  # out of go.mod.
   ci:
     name: 'ci (kit: go)'
     uses: cafaye/kit/.github/workflows/ci.reusable.yml@master
@@ -190,12 +197,20 @@ jobs:
       # The coverage floor, enforced below. The same number is passed to kit
       # above; this is the copy that is checked.
       COVERAGE_FAIL_UNDER: '70'
-      # Decrease detectors, not targets. Measured on the commit that added this
-      # file with the database tier applied: 1254 PASS lines across the whole
-      # suite, 1166 of them in packages that open a pool, zero SKIP anywhere. A
-      # lower number is a deleted test and this goes red; a higher one is a new
-      # test, which is a one-line edit here. They are not read out of the run, so
-      # a run cannot satisfy itself by having fewer tests.
+      # Decrease detectors, not targets. Measured on 2026-09-30 against
+      # `go test -v -count=1 -race ./...` with the database tier applied, from a
+      # complete log: 1254 PASS lines across the whole suite, 1166 of them in the
+      # 11 packages that open a pool, zero SKIP anywhere, 73.2% coverage. A lower
+      # number is a deleted test and this goes red; a higher one is a new test,
+      # which is a one-line edit here. They are not read out of the run, so a run
+      # cannot satisfy itself by having fewer tests.
+      #
+      # The SUITE_FLOOR was 1237 and is now 1254. 1237 is 1254 minus the 17 tests
+      # in internal/platform/ci: that number had been measured from a log taken
+      # before this package's own tests were in the tree, so the floor had a
+      # 17-test blind spot, and the package that guards this file was the one
+      # number the floor could not see. A floor is only a decrease detector if it
+      # was measured from a complete run.
       SUITE_FLOOR: '1254'
       DATABASE_TIER_FLOOR: '1166'
       MODULE: github.com/cafaye/identity
@@ -311,11 +326,14 @@ jobs:
       - name: per-package wall-clock
         # The only thing that distinguishes "ran" from "skipped" from the
         # outside, so it is printed as its own step rather than left in a log
-        # nobody scrolls. Read it against the same numbers with no database:
-        # internal/accounts goes from 0.9s to ~36s and internal/httpapi from 3.3s
-        # to ~69s, because the second number is 431 tests against real Postgres
-        # and the first is 190 tests and 124 skips. This step adds -race, so
-        # expect internal/httpapi nearer 138s.
+        # nobody scrolls.
+        #
+        # Read it against the same command with TEST_DATABASE_URL unset, measured
+        # on the same machine: internal/accounts 0.36s -> 83s, internal/httpapi
+        # 1.4s -> 110s, internal/mfa 2.0s -> 90s. The second number is the same
+        # package's tests running against a real Postgres; the first is those
+        # tests skipping themselves. That difference is the evidence, and no
+        # number in this job is a substitute for it.
         run: |
           set -euo pipefail
           awk '
@@ -349,8 +367,15 @@ jobs:
           # time somebody documents one. A tier naming a package that cannot fail
           # on a missing schema is worse than no tier, because it reads as
           # evidence.
+          # `|| true` is load-bearing, and it is there because of `set -e`: grep
+          # exits 1 when it matches nothing, so an EMPTY derivation — the case the
+          # check below exists to catch — would abort the step on that exit code
+          # before the check ran. The step would still be red, so no false green
+          # is possible, but the log would carry no reason at all: a bare exit 1
+          # that reads as an unrelated failure. Let the empty list through to the
+          # check that explains it.
           grep -rl --include='*_test.go' -E 'dbtest\.(Pool|Schema|EnvVar)|TEST_DATABASE_URL' . \
-            | sed 's|^\./||' | sort > "$RUNNER_TEMP/db-candidates.txt"
+            | sed 's|^\./||' | sort > "$RUNNER_TEMP/db-candidates.txt" || true
           : > "$RUNNER_TEMP/db-files.txt"
           while read -r file; do
             if awk '{ sub(/^[[:space:]]*(\/\/|\*).*/, "") } { print }' "$file" \
@@ -682,6 +707,8 @@ jobs:
             echo "Floors are decrease detectors, not targets: green means nothing was"
             echo "deleted, skipped or excluded since these numbers were measured."
             echo
-            echo "The \`ci (kit: go)\` job is expected red — no database, and"
-            echo "golangci-lint's default set. Read this job."
+            echo "**Require \`gate\` in branch protection, not \`ci (kit: go)\`.** The"
+            echo "latter is expected red on two steps for reasons that live in kit's"
+            echo "file — no database seam, and no .golangci.yml in this tree — and a"
+            echo "caller cannot even mark it continue-on-error. This job is the gate."
           } >> "$GITHUB_STEP_SUMMARY"

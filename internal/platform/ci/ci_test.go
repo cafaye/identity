@@ -45,6 +45,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -354,6 +355,45 @@ func TestTheLockfileGuardExists(t *testing.T) {
 	}
 	t.Error("no step runs `git diff --exit-code … go.sum`; the gate can move the lockfile and " +
 		"nothing here would say so")
+}
+
+// TestTheTwoFloorsAreDistinct asserts the suite floor is strictly above the
+// database-tier floor, which is a weaker claim than it looks and catches a
+// specific copy-paste: the two are declared next to each other, and setting them
+// to the same number would leave the whole-suite count unchecked, because the
+// tier's total already meets it.
+//
+// It is here because the numbers are measured, not derived, so nothing else in
+// this file can see a wrong one. They are 1254 and 1166 as of 2026-09-30, and
+// the gap is the 88 tests in the four packages that open no pool.
+func TestTheTwoFloorsAreDistinct(t *testing.T) {
+	suite, tier := floor(t, "SUITE_FLOOR"), floor(t, "DATABASE_TIER_FLOOR")
+	if suite <= tier {
+		t.Errorf("SUITE_FLOOR is %d and DATABASE_TIER_FLOOR is %d. The database tier is a\n"+
+			"subset of the suite, so the suite floor has to be the larger of the two: at\n"+
+			"equal values the whole-suite count is never checked, because the tier's\n"+
+			"total already satisfies it.", suite, tier)
+	}
+}
+
+// floor reads one of the two PASS-count floors out of the gate job's env block.
+func floor(t *testing.T, name string) int {
+	t.Helper()
+
+	for _, line := range workflowLines(t) {
+		trimmed := strings.TrimSpace(line)
+		key, value, found := strings.Cut(trimmed, ":")
+		if !found || strings.TrimSpace(key) != name {
+			continue
+		}
+		n, err := strconv.Atoi(strings.Trim(strings.TrimSpace(value), `'"`))
+		if err != nil {
+			t.Fatalf("%s = %q, which is not a number", name, value)
+		}
+		return n
+	}
+	t.Fatalf("the gate job declares no %s, so a deleted test is invisible", name)
+	return 0
 }
 
 // TestEveryRunBlockIsValidShell is the regression test for a defect that shipped

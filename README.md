@@ -69,7 +69,7 @@ Nothing but Go is needed, and no database is required — v0 supports an unset
 `DATABASE_URL`:
 
 ```sh
-mise install          # or use any Go >= 1.25
+mise install          # or use any Go >= 1.26
 go run ./cmd/identity # http://localhost:8080
 ```
 
@@ -462,10 +462,21 @@ Migrations are a deploy step, so they are not a test step — `goose up` is its 
 command above the suite, and a suite run against an unmigrated database fails
 loudly with `relation "public.users" does not exist` rather than skipping.
 
-With no `TEST_DATABASE_URL`: **759 PASS lines, 309 SKIP**. With it:
-**1254 PASS lines, 0 SKIP**. `internal/accounts` goes from 0.9s to ~36s and
-`internal/httpapi` from 3.3s to ~69s, and that difference is the only thing that
-tells "ran" from "skipped" from the outside.
+With no `TEST_DATABASE_URL`: **776 PASS lines, 309 SKIP, and 1 FAIL** — the fail
+is `TestTheDatabaseTierActuallyRan`, and it is the point. With it:
+**1254 PASS lines, 0 SKIP, 0 FAIL**, 73.2% coverage, no data races under `-race`.
+
+That difference is the only thing that tells "ran" from "skipped" from the
+outside, and the wall-clock is where it shows. Same command, same machine, only
+`TEST_DATABASE_URL` differing:
+
+| package | no database | with the tier |
+|---|---|---|
+| `internal/accounts` | 0.36s | 83s |
+| `internal/httpapi` | 1.4s | 110s |
+| `internal/mfa` | 2.0s | 90s |
+| `internal/auth` | 1.8s | 55s |
+| `internal/outbox` | 2.5s | 46s |
 
 SIGTERM handling is not asserted through a mock: `TestMainHandlesSIGTERM` runs
 the real `main()` in a child process, waits for it to report that it is serving,
@@ -482,11 +493,24 @@ runs this repository's own for the rest:
 uses: cafaye/kit/.github/workflows/ci.reusable.yml@master
 ```
 
-`ci (kit: go)` is **expected red** — kit's Go job runs `go test` with no Postgres,
-and a caller cannot hand a reusable workflow a service container
-(`services:` is not one of the keys GitHub accepts on a calling job). It also runs
-golangci-lint's default set, which reports 31 issues in this tree today. Both are
-named in the file rather than left to be inferred.
+`ci (kit: go)` is **expected red**, and that is a conflict with kit's own rules
+rather than a choice made here: kit's checklist ends with "The workflow is green
+on the adoption PR" and kit's AGENTS.md says "Never weaken a check to make the
+gate green". Two steps are red, both structurally.
+
+- `test` runs `go test` with no Postgres, and a caller cannot hand a reusable
+  workflow a service container (`services:` is not one of the keys GitHub accepts
+  on a calling job). `TestTheDatabaseTierActuallyRan` fails the moment
+  `TEST_DATABASE_URL` is absent, so making this step green from here would mean
+  un-failing that test — the weakening kit forbids.
+- `lint` runs golangci-lint, and this tree has no `.golangci.yml`, so it is the
+  default set: 31 issues (errcheck 13, unused 9, staticcheck 6, ineffassign 3).
+  With kit's config it is 83, so copying the config makes it redder, not greener.
+
+The caller cannot even mark the job non-blocking: `continue-on-error` is not one
+of the keys GitHub accepts on a job that calls a reusable workflow. **Require
+`gate` in branch protection.** Delete the `ci` job when kit's Go job grows a
+`services`/`env` seam, and not before on the strength of a green run.
 
 `gate` is the job to read. Postgres 17.11 as a service, `goose up` as its own step
 above the gate, `bin/prime` unmodified, and then the assertions: the database tier
@@ -496,7 +520,9 @@ a `git diff --exit-code` on `go.mod`/`go.sum`, and a coverage floor. `MFA_ENCRYP
 is generated from `/dev/urandom` per run, masked, and printed nowhere.
 
 The floors are decrease detectors, not targets: a green run means nothing was
-deleted, skipped or excluded since they were measured.
+deleted, skipped or excluded since they were measured. They are currently 1254
+for the suite and 1166 for the tier, both measured from a complete run with the
+tier applied.
 
 `internal/platform/ci` is the test for that file. It parses no YAML — a YAML
 dependency would move `go.mod`, and AGENTS.md's rule is that `go.mod` moves only

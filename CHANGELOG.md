@@ -24,8 +24,12 @@ All notable changes to identity are recorded here. The format follows
     the tree (every `_test.go` that calls `dbtest.Pool`, `dbtest.Schema` or reads
     the variable, comments stripped), requires each derived package to appear in
     the output with tests in it, fails on any `--- SKIP:` line, and holds floors
-    of 1237 PASS lines for the suite and 1166 for the tier. The floors are
-    decrease detectors, not targets.
+    of 1254 PASS lines for the suite and 1166 for the tier. The floors are
+    decrease detectors, not targets. The suite floor moved from 1237 to 1254:
+    1237 was 1254 minus the 17 tests in `internal/platform/ci`, so the old
+    number had been measured from a log taken before this package's own tests
+    were in the tree — a 17-test blind spot in the one package that guards the
+    workflow.
   - **The ordering is the contract.** Migrations are a deploy step, so `goose up`
     is never in the same step as the suite, and `goose status` prints ten applied
     migrations before the first test runs. Without that ordering the suite fails
@@ -139,6 +143,24 @@ All notable changes to identity are recorded here. The format follows
 
 ### Changed
 
+- Two defects in `.github/workflows/ci.yml`, both found by executing the steps
+  rather than reading them, and both in the check that exists to prove the
+  database tier ran:
+  - **The step did not parse.** The awk program counting PASS lines per package
+    sat inside a shell single-quoted string, and an apostrophe in a comment
+    inside that string — `a package's tests` — closed the quote early. The shell
+    re-parsed the rest as commands and the step died on a syntax error, so the
+    one check in the job whose job is to prove the tier ran never ran. The prose
+    moved out of the awk program into shell comments, where an apostrophe is
+    free, and `internal/platform/ci` now runs `bash -n` over every `run:` block on
+    every commit so the next one is caught before it ships. Reintroducing the
+    apostrophe makes that test fail with the original error.
+  - **The empty-tier guard never ran.** `grep -rl` exits 1 when it matches
+    nothing, so under `set -e` an empty derivation aborted the step *before* the
+    check that explains it. The step was still red, so no false green was
+    possible, but the log carried no reason at all. `|| true` on the pipeline
+    lets the empty list through to the check, which now prints
+    `the database tier matched no test file.`
 - `auth.NewService` takes a **required** `SecondFactor`. A login that cannot ask
   whether an account has a second factor now returns `ErrNoSecondFactor` instead
   of minting a session — that failure is silent by construction otherwise, since
