@@ -122,7 +122,7 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if _, err := pool.Exec(ctx, `TRUNCATE TABLE outbox_events, sessions, users CASCADE`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE outbox_events, connected_accounts, sessions, users CASCADE`); err != nil {
 		t.Fatalf("truncating: %v", err)
 	}
 }
@@ -173,7 +173,15 @@ func Schema(t *testing.T) *pgxpool.Pool {
 		`CREATE TABLE ` + schema + `.users (LIKE public.users INCLUDING ALL)`,
 		`CREATE TABLE ` + schema + `.sessions (LIKE public.sessions INCLUDING ALL)`,
 		`CREATE TABLE ` + schema + `.outbox_events (LIKE public.outbox_events INCLUDING ALL)`,
+		// connected_accounts carries an enum-typed column. LIKE copies the column
+		// with its type, which for an enum is a reference to the type in `public` —
+		// so the values still resolve even though search_path is the private
+		// schema. No CREATE TYPE here: the type is shared, not cloned, and a second
+		// one in the private schema would not be the type the column refers to.
+		`CREATE TABLE ` + schema + `.connected_accounts (LIKE public.connected_accounts INCLUDING ALL)`,
 		`ALTER TABLE ` + schema + `.sessions ADD CONSTRAINT sessions_user_id_fkey
+			FOREIGN KEY (user_id) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.connected_accounts ADD CONSTRAINT connected_accounts_user_id_fkey
 			FOREIGN KEY (user_id) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
 	}
 	for _, stmt := range stmts {
