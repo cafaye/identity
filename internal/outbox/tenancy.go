@@ -183,14 +183,26 @@ func NewMemberRemoved(now time.Time, accountID, userID id.UUID, role string) (En
 	})
 }
 
-// newTenancyEvent is the shared construction: a fresh envelope id, the tenancy
-// subject, the injected time, and a payload marshalled from a struct.
+// newTenancyEvent is newSubjectEvent with the account as the subject, which is
+// the rule for every event in this file: see the package comment's note on why a
+// membership change is an event about the account.
+func newTenancyEvent(now time.Time, eventType string, accountID id.UUID, payload any) (Envelope, error) {
+	return newSubjectEvent(now, eventType, accountID.String(), payload)
+}
+
+// newSubjectEvent is the shared construction for every event this service
+// publishes: a fresh envelope id, a subject, the injected time, and a payload
+// marshalled from a struct.
 //
 // The struct-and-marshal is not ceremony. Concatenating these fields into a JSON
 // string by hand is how a name containing a quote produces a payload that is not
 // a JSON object, and Validate would then reject the event at the one place that
 // could have caught it with a useful message.
-func newTenancyEvent(now time.Time, eventType string, accountID id.UUID, payload any) (Envelope, error) {
+//
+// The subject is a parameter rather than derived, because the entity an event is
+// about is not always the entity whose id the caller happens to have in hand:
+// tenancy events are about the account, the OIDC events are about the client.
+func newSubjectEvent(now time.Time, eventType, subject string, payload any) (Envelope, error) {
 	eventID, err := id.New()
 	if err != nil {
 		return Envelope{}, fmt.Errorf("outbox: minting an envelope id: %w", err)
@@ -206,7 +218,7 @@ func newTenancyEvent(now time.Time, eventType string, accountID id.UUID, payload
 		ID:          eventID,
 		Type:        eventType,
 		Source:      SourceIdentity,
-		Subject:     accountID.String(),
+		Subject:     subject,
 		Time:        now.UTC(),
 		Data:        data,
 	}, nil
