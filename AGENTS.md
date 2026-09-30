@@ -140,15 +140,27 @@ mechanism. A comment restating the line below it is noise.
 
 ## Tests that need infrastructure
 
-`go test ./...` is green on a bare machine with no Postgres and no Docker. The
-two integration tests skip unless `TEST_DATABASE_URL` is set:
+**`go test ./...` is red on a machine with no Postgres, and that is the design.**
+`internal/mfa`'s `TestTheDatabaseTierActuallyRan` FAILS rather than skips when
+`TEST_DATABASE_URL` is unset. Every test in that file is a database test, so
+without the variable the file has proven nothing, and a suite that reports `ok`
+has reported something false.
 
 ```sh
-docker compose up -d postgres
+docker compose up -d --wait postgres
+goose -dir migrations postgres "$DATABASE_URL" up
 TEST_DATABASE_URL="postgres://identity:identity@localhost:5432/identity?sslmode=disable" go test ./...
 ```
 
+`goose up` is a deploy step and is above the suite, never in the same command: a
+suite run against an unmigrated database fails with
+`relation "public.users" does not exist`, which is loud but reads like a code
+failure rather than a broken pipeline.
+
 A skip is honest; a test that silently passes without proving anything is not.
+CI closes the second half of that — `.github/workflows/ci.yml` derives the tier
+from the tree, fails on any `--- SKIP:` line, and holds a floor on the PASS count
+so a deleted test is visible.
 
 ## Gates
 
@@ -161,6 +173,13 @@ go test -race ./...
 
 All four before a commit lands. `bin/prime` is the kit Go template; if kit
 changes it, follow kit.
+
+CI runs the same four, in the same order, plus `goose up` above them — see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). A CI-only variant of
+`bin/prime` would be a second gate, and a second gate is a second thing to be
+wrong. `internal/platform/ci` is what keeps the two honest: it asserts that the
+workflow really runs `bin/prime`, that the migrations really run before it, that
+the toolchain pin matches `go.mod`, and that no secret is written down.
 
 ## Adding an endpoint
 

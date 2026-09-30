@@ -8,6 +8,62 @@ All notable changes to identity are recorded here. The format follows
 
 ### Added
 
+- `.github/workflows/ci.yml` — CI, in two halves. `ci (kit: go)` calls
+  `cafaye/kit/.github/workflows/ci.reusable.yml@master` for the shared half.
+  `gate` is the service-specific half: Postgres 17.11 as a job service, `goose up`
+  as its own step **above** the gate, `bin/prime` unmodified, and then the
+  assertions. It is a separate job rather than steps inside kit's because GitHub
+  accepts only `name`, `uses`, `with`, `secrets`, `strategy`, `needs`, `if`,
+  `concurrency` and `permissions` on a job that calls a reusable workflow —
+  `services:` is not reachable from the caller, so the database tier cannot live
+  in kit's `go` job at all.
+  - **The database tier cannot go quietly green.** `dbtest.Pool` returns a pool
+    and *skips* the test when `TEST_DATABASE_URL` is unset, and
+    `TestTheDatabaseTierActuallyRan` fails rather than skips — so the gate is red
+    before any assertion runs. On top of that the gate **derives** the tier from
+    the tree (every `_test.go` that calls `dbtest.Pool`, `dbtest.Schema` or reads
+    the variable, comments stripped), requires each derived package to appear in
+    the output with tests in it, fails on any `--- SKIP:` line, and holds floors
+    of 1254 PASS lines for the suite and 1166 for the tier. The floors are
+    decrease detectors, not targets. The suite floor moved from 1237 to 1254:
+    1237 was 1254 minus the 17 tests in `internal/platform/ci`, so the old
+    number had been measured from a log taken before this package's own tests
+    were in the tree — a 17-test blind spot in the one package that guards the
+    workflow.
+  - **The ordering is the contract.** Migrations are a deploy step, so `goose up`
+    is never in the same step as the suite, and `goose status` prints ten applied
+    migrations before the first test runs. Without that ordering the suite fails
+    on `relation "public.users" does not exist` — loud, but a red that reads like
+    a code failure rather than a pipeline that is wired wrong.
+  - 23 named MFA, session and matrix tests have to appear in the log by name, so
+    "the security tests ran" is a measurement rather than a summary line.
+  - `MFA_ENCRYPTION_KEY` is generated from `/dev/urandom` per run, masked, and
+    printed nowhere. No test needs one — every one builds a `config.Config`
+    literal — but no test covered the operator's path either, so the gate boots
+    the binary three times: a 16-byte key refuses and names the variable, no key
+    mounts no management surface (404), and a real key mounts it (401).
+  - Beyond `bin/prime`: `go vet ./...`, `gofmt -l .`,
+    `git diff --exit-code -- go.mod go.sum`, `go test -race` (AGENTS.md's fourth
+    gate, which `bin/prime` does not run), and a coverage floor of 70% against a
+    measured 73.2%.
+  - **Known red on arrival, and the reasons are in kit's file, not this one.**
+    `ci (kit: go)` fails on `lint` (golangci-lint's default set, 31 issues here)
+    and on `test` (no Postgres). Delete the job when kit's Go job grows a
+    `services`/`env` seam, and not before on the strength of a green run.
+- `internal/platform/ci` — the test for the workflow file. `.github/workflows/ci.yml`
+  is the artifact under test, and a workflow nobody has executed is a workflow
+  nobody has tested. Seventeen tests, and each names the step it is about: the
+  `uses:` path resolving, the inputs being kit's, the `versions` literal matching
+  `go.mod`'s `go` directive, the gate running `bin/prime`, the migrations running
+  before it, the tier being derived and skip-checked, the Postgres image being
+  pinned, the lockfile guard naming `go.sum` on the same line as the `git diff`,
+  `coverage-fail-under` being above zero, `telemetry` being a quoted string, no
+  secret literal, every named security test existing in the tree, and every
+  `run:` block parsing under `bash -n` — an apostrophe inside an awk program or a
+  grep pattern ends the quoting and the shell re-parses the rest as commands. It
+  parses no YAML: a YAML dependency would move `go.mod`, and AGENTS.md's rule is that
+  `go.mod` moves only for a stated cause.
+
 - `internal/mfa` — the second factor: TOTP enrollment, the challenge a login waits
   on, recovery codes, and the lockout that stops somebody who has stolen a password
   from finishing the job with six digits of guessing. `github.com/pquerna/otp`
@@ -87,6 +143,24 @@ All notable changes to identity are recorded here. The format follows
 
 ### Changed
 
+- Two defects in `.github/workflows/ci.yml`, both found by executing the steps
+  rather than reading them, and both in the check that exists to prove the
+  database tier ran:
+  - **The step did not parse.** The awk program counting PASS lines per package
+    sat inside a shell single-quoted string, and an apostrophe in a comment
+    inside that string — `a package's tests` — closed the quote early. The shell
+    re-parsed the rest as commands and the step died on a syntax error, so the
+    one check in the job whose job is to prove the tier ran never ran. The prose
+    moved out of the awk program into shell comments, where an apostrophe is
+    free, and `internal/platform/ci` now runs `bash -n` over every `run:` block on
+    every commit so the next one is caught before it ships. Reintroducing the
+    apostrophe makes that test fail with the original error.
+  - **The empty-tier guard never ran.** `grep -rl` exits 1 when it matches
+    nothing, so under `set -e` an empty derivation aborted the step *before* the
+    check that explains it. The step was still red, so no false green was
+    possible, but the log carried no reason at all. `|| true` on the pipeline
+    lets the empty list through to the check, which now prints
+    `the database tier matched no test file.`
 - `auth.NewService` takes a **required** `SecondFactor`. A login that cannot ask
   whether an account has a second factor now returns `ErrNoSecondFactor` instead
   of minting a session — that failure is silent by construction otherwise, since
