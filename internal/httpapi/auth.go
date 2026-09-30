@@ -116,6 +116,13 @@ func (o options) registerRoutes(r chiRouter) {
 	if o.tenancy != nil {
 		o.registerTenancyRoutes(r)
 	}
+
+	// The OIDC protocol surface needs a session to render its login page and a
+	// key to sign with. Both are the auth service's, so it hangs off the same
+	// condition rather than a second one.
+	if o.oidc != nil {
+		o.registerOIDCRoutes(r)
+	}
 }
 
 // chiRouter is the slice of *chi.Mux these routes need. Naming it keeps the

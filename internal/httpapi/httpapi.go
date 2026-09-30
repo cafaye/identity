@@ -32,6 +32,8 @@ type options struct {
 	readinessTimeout time.Duration
 	auth             Auth
 	tenancy          Tenancy
+	oidc             OIDC
+	oidcClients      OIDCClients
 }
 
 // Option customises the handler built by New.
@@ -74,6 +76,11 @@ func New(checks []Check, opts ...Option) http.Handler {
 	r.MethodNotAllowed(methodNotAllowed)
 	r.Get("/healthz", handleHealthz)
 	r.Get("/readyz", o.handleReadyz(checks))
+	// The well-known documents are registered before the /v1 and /oidc routes
+	// because they are reachable without a session, a database or a signing key
+	// being configured, and a process with no DATABASE_URL should still be able
+	// to answer a probe for its own metadata.
+	o.registerOIDCWellKnownRoutes(r)
 	o.registerRoutes(r)
 
 	// Outermost first: the trace id must exist before anything can log or report

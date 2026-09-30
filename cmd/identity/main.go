@@ -23,6 +23,7 @@ import (
 	"github.com/cafaye/identity/internal/auth"
 	"github.com/cafaye/identity/internal/config"
 	"github.com/cafaye/identity/internal/httpapi"
+	"github.com/cafaye/identity/internal/oidc"
 	"github.com/cafaye/identity/internal/outbox"
 	"github.com/cafaye/identity/internal/platform/clock"
 	"github.com/cafaye/identity/internal/platform/db"
@@ -111,6 +112,20 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 		logger.Warn("no DATABASE_URL configured; the /v1 auth routes are not mounted")
 	}
 
+	provider, clients, err := buildOIDC(cfg, pool, logger)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case provider == nil && cfg.OIDCEnabled():
+		// The opposite surprise: keys are configured and there is nowhere to keep
+		// the registrations, so the provider would sign tokens for clients that
+		// cannot be registered or revoked.
+		logger.Warn("OIDC is configured but there is no DATABASE_URL; the OIDC surface is not mounted")
+	case provider != nil:
+		opts = append(opts, httpapi.WithOIDC(provider), httpapi.WithOIDCClients(clients))
+	}
+
 	handler := httpapi.New(checks, opts...)
 
 	return &app{
@@ -176,6 +191,65 @@ func buildAuth(pool *pgxpool.Pool, logger *slog.Logger) (*auth.Service, *account
 	)
 
 	return authSvc, tenancy
+}
+
+// buildOIDC assembles the OpenID Connect provider, or returns nils when this
+// process is not one.
+//
+// Three conditions, and all three are required. A signing key with no database has
+// nowhere to keep a registration, so the provider could sign tokens for clients
+// that can never be registered or revoked. A database with no key cannot sign. And
+// no issuer means the provider is not configured at all, which is the legitimate
+// deployment — a courier, or a local stack that has no key yet.
+//
+// The order inside is the dependency order: the key, because the storage adapter
+// needs it to publish the key set; the storage, because the provider needs it for
+// every protocol decision; then the provider and the registration use cases,
+// which share the one store.
+func buildOIDC(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*oidc.Provider, *oidc.Service, error) {
+	if !cfg.OIDCEnabled() || pool == nil {
+		return nil, nil, nil
+	}
+
+	key, err := oidc.LoadSigningKey(cfg.OIDCSigningKey, cfg.OIDCKeyID)
+	if err != nil {
+		// A startup failure, not a warning. The alternative is a provider that
+		// signs with a key it invented, publishes a document nobody has cached and
+		// rotates its own trust anchor on every restart.
+		return nil, nil, fmt.Errorf("loading the OIDC signing key: %w", err)
+	}
+
+	store := oidc.NewStore(pool)
+	storage := oidc.NewStorage(store, oidc.NewProfileReader(), key, clock.System{}, db.Direct{Pool: pool}, oidc.PathLogin)
+
+	provider, err := oidc.NewProvider(oidc.Config{
+		Issuer:        cfg.OIDCIssuer,
+		SigningKey:    key,
+		AllowInsecure: cfg.OIDCAllowInsecure,
+	}, storage)
+	if err != nil {
+		return nil, nil, fmt.Errorf("building the OIDC provider: %w", err)
+	}
+
+	// One store, one event appender, one clock. Two of each would be two objects
+	// that have to be configured identically and nothing that stops them drifting.
+	events := outbox.NewStore(pool)
+	clients := oidc.NewService(
+		db.TxRunner{Pool: pool},
+		store,
+		events,
+		storage,
+		clock.System{},
+		db.Direct{Pool: pool},
+	)
+
+	logger.Info("the OIDC provider is mounted",
+		"issuer", provider.Issuer(),
+		"key_id", key.ID(),
+		"authorize", oidc.PathAuthorize,
+	)
+
+	return provider, clients, nil
 }
 
 // Listen binds the socket. It is separate from Run so the address is known —

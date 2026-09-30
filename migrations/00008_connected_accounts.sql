@@ -1,4 +1,4 @@
--- 00005_connected_accounts.sql — a social identity linked to a user.
+-- 00008_connected_accounts.sql — a social identity linked to a user.
 --
 -- "Continue with Google/GitHub" needs exactly one new fact: the provider's own
 -- identifier for a person, and the credential this service holds on their behalf.

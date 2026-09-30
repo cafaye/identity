@@ -21,6 +21,9 @@ const errorTypeBase = "https://errors.cafaye.com/"
 //	account_locked      423  a login refused by the brute-force lockout
 //	invalid_json        400  a body that is not JSON at all
 //	payload_too_large   413  a body past the accepted size
+//	invalid_request     400  a request this service understood and named a
+//	                       specific problem with, on a surface it owns
+//	not_a_member        404  covered by not_found; the sentence carries the reason
 //
 // They are listed together in openapi/v1.yaml and flagged there for the
 // manager: core owns the set, and a service that quietly invents codes is the
@@ -47,6 +50,14 @@ const (
 	CodeMethodNotAllowed = "method_not_allowed"
 	CodeInvalidJSON      = "invalid_json"
 	CodePayloadTooLarge  = "payload_too_large"
+
+	// CodeInvalidRequest is 400 for a request this service understood well enough
+	// to name a specific problem with, on a surface it owns. It is the OAuth 2.0
+	// error name for the same class of thing, which is deliberate: the one place
+	// this service answers with the cafaye envelope for an OAuth-shaped refusal is
+	// the /oidc/authorize pre-check, and a client debugging it will search for
+	// `invalid_request` in the specifications.
+	CodeInvalidRequest = "invalid_request"
 )
 
 // titles is the fixed human-readable summary per code. core: "title is a fixed,
@@ -66,6 +77,7 @@ var titles = map[string]string{
 	CodeMethodNotAllowed: "Method not allowed",
 	CodeInvalidJSON:      "Malformed request body",
 	CodePayloadTooLarge:  "Request body too large",
+	CodeInvalidRequest:   "Invalid request",
 }
 
 func titleFor(code string) string {

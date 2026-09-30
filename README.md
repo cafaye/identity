@@ -29,7 +29,7 @@ know chi exists to be tested.
 
 ## Dependencies
 
-Three direct dependencies, each with a cause:
+Four direct dependencies, each with a cause:
 
 - `chi` — routing, above.
 - `pgx` — Postgres. The pool and the `SKIP LOCKED` claim in the outbox.
@@ -40,6 +40,18 @@ Three direct dependencies, each with a cause:
   transitive dependencies of its own, and reimplementing argon2id in `internal/`
   would be far more dangerous than depending on it. It arrives with the auth
   packet; the scaffold had only the first two.
+- `zitadel/oidc` — the OpenID Connect **provider**. The protocol is not
+  reimplemented here: the library owns the OAuth 2.0 and OIDC state machines, and
+  `internal/oidc` supplies the two things a library cannot have, which are a
+  storage implementation over this service's own tables and a login UI bound to
+  this service's own sessions. `refs/oidc` (v3.51.10) is the library, read for
+  its examples.
+- `go-jose/v4` — **forced, not chosen.** `op.SigningKey` returns a
+  `jose.SignatureAlgorithm` and `op.Key.Key()` holds a `jose` key, so the
+  library's storage interface cannot be implemented without importing it. It
+  arrives with 21 other indirect modules (`rs/cors`, `zitadel/schema`,
+  `bmatcuk/doublestar`, `otel`, `gorilla/securecookie` and their closures).
+  `go mod tidy` is idempotent and `go.sum` is committed.
 
 ## Running it
 
@@ -76,6 +88,10 @@ service quietly listening on the wrong port.
 | `PORT` | `8080` | TCP port to bind. Must be 1-65535. |
 | `DATABASE_URL` | *(unset)* | Postgres DSN. Optional in v0; unset means no pool and no readiness dependency. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Drives `log/slog`. |
+| `OIDC_ISSUER` | *(unset)* | The OpenID Connect issuer. All three OIDC variables are required together or not at all. |
+| `OIDC_SIGNING_KEY` | *(unset)* | PEM-encoded RSA private key, ≥ 2048 bits. PKCS#1 and PKCS#8 both load. |
+| `OIDC_SIGNING_KEY_ID` | *(unset)* | The `kid` published in the JWKS and signed into every token. 1-64 characters of `A-Z a-z 0-9 . _ -`. |
+| `OIDC_ALLOW_INSECURE` | `false` | Permits an `http` issuer. For `localhost` and compose stacks only. |
 
 ## Endpoints
 
@@ -87,7 +103,11 @@ service quietly listening on the wrong port.
 | `POST /v1/session` | `200 {"token","expires_at"}` | Log in. Sets the `__Host-session` cookie to the same token. `401 unauthorized` for any unusable credential, `423 account_locked` with `Retry-After` while locked. |
 | `DELETE /v1/session` | `204` | Revoke the current session and clear the cookie. `401` if no credential was presented. |
 | `GET /v1/me` | `200 {"id","email"}` | The authenticated user. `401` with no usable credential. |
-| anything else | `404 not_found` | A problem document, not chi's default plain text. |
+| `POST /v1/accounts/:id/oidc-clients` | `201 {id, client_id, client_secret, …}` | Register a relying party. **Owner only.** `client_secret` is returned here and never again. |
+| `GET /v1/accounts/:id/oidc-clients` | `200 [{id, client_id, name, …}]` | The account's registrations, newest first. `[]` and not `null`. **Owner only.** |
+| `GET /v1/accounts/:id/oidc-clients/:clientId` | `200 {id, client_id, …}` | One registration. `clientId` is the row id, not the `client_id` the product presents. **Owner only.** |
+| `DELETE /v1/accounts/:id/oidc-clients/:clientId` | `204` | Revoke a registration, and every access token issued against it, in one transaction. `409 conflict` if already revoked. **Owner only.** |
+| anything else on `/v1` | `404 not_found` | A problem document, not chi's default plain text. |
 
 Every non-2xx is `application/problem+json` per core's error envelope, including
 `404` and `405`. The `trace_id` in the body always matches the `X-Trace-Id`
@@ -105,6 +125,65 @@ Probe failures are logged with the underlying error and **never** returned to th
 caller: an unauthenticated request to `/readyz` must not be a way to learn that
 a database host is `10.0.0.5` or that a password was rejected.
 
+### The OpenID Connect provider
+
+`identity` is a first-class OIDC **provider**, so any product signs users in
+against cafaye itself rather than configuring Google OAuth per product — and the
+JWT verification every other cafaye service already does against identity's JWKS
+becomes a standard, interoperable surface.
+
+These routes exist only when the three `OIDC_*` variables above are all set AND
+`DATABASE_URL` is set. Without them they are absent, so the failure is a clear
+`404` rather than a pile of `500`s.
+
+| Route | Response | Meaning |
+|---|---|---|
+| `GET /.well-known/openid-configuration` | `200` | OpenID Connect Discovery. |
+| `GET /.well-known/oauth-authorization-server` | `200` | RFC 8414. The same document; the library does not register it, identity does. |
+| `GET /.well-known/jwks.json` | `200 {"keys":[…]}` | RFC 7517. One key, `use: sig`, `alg: RS256`. Public half only. |
+| `GET,POST /oidc/authorize` | `302` | The authorization endpoint. Requires PKCE with `S256`. `redirect_uri` matched **exactly**. |
+| `GET /oidc/authorize/callback` | `302` | The login page's return leg. Mints the code. |
+| `GET,POST /oidc/login/:requestId` | `200` / `302` | The sign-in page. This service's own sessions and cookie. |
+| `POST /oidc/token` | `200 {access_token, id_token, …}` | `grant_type=authorization_code` and nothing else. HTTP Basic client auth. |
+| `GET,POST /oidc/userinfo` | `200 {sub, email, …}` | The claims the token was granted, and only those. |
+| `GET /oidc/introspect`, `/oidc/revoke`, `/oidc/end-session`, `/oidc/device_authorization` | `404 not_found` | Not built. Absent from the discovery document too. |
+
+**TWO ERROR SHAPES, AND THE SPLIT IS DELIBERATE.** `/v1/*` and the
+`/oidc/authorize` pre-checks answer `application/problem+json`; everything else
+under `/oidc/*` answers RFC 6749's `{"error": …}`. An off-the-shelf OIDC client
+library cannot parse a problem document, and interop with one is the entire
+point of the surface. The two documents that describe the two — `openapi/v1.yaml`
+and `openid/openid.yaml` — exist for the same reason.
+
+The claims:
+
+- `sub` — the user. The same for every client.
+- `email`, `email_verified` — on the `email` scope. **`email_verified` is always
+  `false`**: this service has no email-verification column yet, so there is
+  nothing it could prove, and `true` would be a claim about something nobody has
+  checked. It is present and false rather than absent, because a relying party
+  that cannot see the field has to assume it is verified.
+- `name` — on the `profile` scope. The personal account's name, derived from the
+  email's local part. A stand-in, not a user-chosen name.
+- `accounts` — on the `accounts` scope. An **array** of `{account_id, name, slug,
+  role, personal}`. An array and not a single `account_id` because a user of a
+  cafaye product is in a personal account and usually several team accounts, and a
+  token carrying one of them would be wrong for the others. core's conventions ask
+  for `account_id`; this is the multi-account form of that fact.
+- `scope` — the capability scopes, space-delimited. `email` and `profile` are
+  userinfo scopes and live in the ID token and at userinfo instead; an address is
+  not a capability.
+
+Two decisions the manager may want to rule on, both recorded in the code:
+
+- The `scope` claim is spelled `scope`, not `scopes`. RFC 9068 registers that
+  name and `guard`'s verifier splits on exactly that string; core's prose says
+  `scopes`. One line in `internal/oidc/storage.go` either way.
+- An unknown scope at `/oidc/authorize` is **400** with a problem envelope, as
+  the packet specifies. core scopes 400 to "malformed syntax the client could not
+  have known" and 422 to "semantically wrong", so this is a deliberate departure
+  and it is listed under "Known gaps" in `openid/openid.yaml`.
+
 ## Layout
 
 ```
@@ -114,6 +193,9 @@ internal/httpapi/      the router, the probes, and the v1 auth surface
 internal/auth/         register, login, resolve — the use cases and their ordering
 internal/users/        accounts and the email-uniqueness rules
 internal/sessions/     session tokens, hashing and revocation
+internal/oidc/         the OIDC provider: storage adapter, registrations, the key
+internal/accounts/     the tenancy use cases: accounts, memberships, invitations
+internal/oauth/        the social-login client side: state, token cipher, registry
 internal/outbox/       transactional event envelope, SKIP LOCKED claim, publisher
 internal/platform/db/  the pgx pool, and the readiness ping
 migrations/            goose SQL files
@@ -160,10 +242,23 @@ docker run --rm -p 8080:8080 identity
 ## Not built yet
 
 Everything below is a later packet, and none of it is stubbed to look finished:
-email verification, password reset, OAuth, accounts/roles/invites, OIDC, MFA,
-API tokens, the admin API, and the generated authz matrix suite. No JWT code, no
-OIDC provider, and no self-service password recovery — a user who forgets a
-password today has no path back in.
+email verification, password reset, MFA, scoped API tokens, the admin API, and
+key rotation. No self-service password recovery — a user who forgets a password
+today has no path back in.
+
+Inside the OIDC provider, specifically not built: refresh tokens (access tokens
+live fifteen minutes and cannot be renewed), the implicit flow, client
+credentials, the JWT profile grant, `private_key_jwt` client authentication,
+dynamic client registration, token introspection, the revocation endpoint,
+end-session, the device flow, and a consent screen. Each one is a refusal at the
+point a client would reach for it, and each is absent from the discovery
+document, rather than a stub that looks finished.
+
+**A product cannot register itself.** Client management is owner-gated on an
+account, reusing `RequireAccountRole`, because `identity` has no platform-admin
+role yet — the admin API is a later packet, and a rule this service cannot
+express would be a rule with a bypass in it. A service-to-service credential for
+a product arrives with the scoped API tokens packet.
 
 ## Roadmap
 
@@ -173,13 +268,13 @@ password today has no path back in.
 - [x] Error envelope, trace ids, panic recovery
 - [x] Outbox: transactional events, SKIP LOCKED claim, publisher loop
 - [ ] Email verification, password reset
-- [ ] OAuth via goth
-- [ ] Accounts, memberships, roles, invitations
-- [ ] OIDC provider
+- [x] OAuth (social login) via goth
+- [x] Accounts, memberships, roles, invitations
+- [x] OIDC provider (zitadel/oidc)
 - [ ] MFA: TOTP + recovery codes
 - [ ] Scoped API tokens
 - [ ] Admin API
-- [ ] Authorization matrix suite (route table × role × anonymous)
+- [x] Authorization matrix suite (route table × role × anonymous)
 
 See [AGENTS.md](AGENTS.md) for the conventions this repository follows and
 [CHANGELOG.md](CHANGELOG.md) for what has landed.

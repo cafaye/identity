@@ -11,8 +11,11 @@ openapi: 3.1.0
 
 info:
   title: cafaye identity
-  version: 1.0.0
-  summary: Authentication, sessions, accounts and tenancy.
+  # Bumped for the OIDC registration routes. No path prefix moved and no existing
+  # response shape changed, so core's sync rule asks for exactly this: a
+  # non-breaking change bumps only the document version.
+  version: 1.1.0
+  summary: Authentication, sessions, accounts, tenancy and OIDC registrations.
   description: |
     `identity` is the cafaye platform's security boundary: it is what every other
     service asks to identify a caller.
@@ -54,6 +57,37 @@ info:
     Request bodies are capped at 4096 bytes. A registration is an email and a
     password; nothing legitimate approaches that, and the cap is what stops an
     unauthenticated caller choosing how much this service parses per request.
+
+    ## The OpenID Connect provider is a different document
+
+    This service is also an OpenID Connect provider, and its protocol surface is
+    NOT here. The discovery document, the JWKS, the authorization, token and
+    userinfo endpoints, and the login page are all on paths the specifications
+    fix — `/.well-known/openid-configuration`, `/oidc/authorize` and so on — and
+    core's conventions put every path in this document under `/v1`. A document
+    that contained both would break one of the two rules.
+
+    The provider's contract is `openid/openid.yaml`, and it is a separate file
+    for the same reason the error envelope differs there: an off-the-shelf OIDC
+    client library cannot parse a problem document, and core's `/v1` rule cannot
+    be satisfied by a path RFC 8414 chooses. What IS in this document is the
+    cafaye API for managing the registrations that provider accepts:
+    `/v1/accounts/{account_id}/oidc-clients`.
+
+    ## Two authorization decisions worth knowing before reading the matrix
+
+    A non-member of an account gets **404**, never 403, on every account-scoped
+    route including the OIDC ones. A 403 would confirm that the account id they
+    guessed is a real account, which is a free tenant-enumeration oracle on a
+    table whose ids are the only thing standing between one customer and
+    another.
+
+    Registering, reading and revoking an OIDC client are **owner-only**. Adding a
+    client is adding a new way for code to arrive in a product and get a token
+    back out, and "can read the member list" is not authority to widen the
+    perimeter. `identity` has no platform-admin role yet — the admin API is a
+    later packet — so the owner role is the one privilege this service already
+    has that means "may change what can enter this account".
   contact:
     name: identity
     url: https://github.com/cafaye/identity
@@ -73,6 +107,10 @@ tags:
     description: Registration. Creating the credential is the only way to obtain one.
   - name: sessions
     description: Logging in, resolving a session, and revoking it.
+  - name: oidc-clients
+    description: |
+      OpenID Connect client registrations: the credentials products present at
+      the token endpoint. The protocol surface itself is in `openid/openid.yaml`.
   - name: probes
     description: Liveness and readiness. Consumed by orchestrators, not by clients.
 
@@ -355,6 +393,218 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /v1/accounts/{account_id}/oidc-clients:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    post:
+      tags: [oidc-clients]
+      operationId: registerOIDCClient
+      summary: Register an OpenID Connect client
+      description: |
+        Registers a relying party: the credential a product presents at the token
+        endpoint when it runs an authorization-code flow against this service.
+
+        **Owner only.** Adding a client is adding a new way for code to arrive in
+        this product and get a token back out, so a member of the account is 403
+        and a non-member is 404.
+
+        `client_id` and `client_secret` are minted here and returned here, and
+        `client_secret` is returned **once**. It is never stored — only its
+        SHA-256 is — and there is no endpoint that re-reads it. A caller that
+        loses it registers again, which is the rule a session token, an
+        invitation token and a password already follow.
+
+        `redirect_uris` is matched EXACTLY. No prefix, no glob, no pattern of
+        any kind: `https://app.example.com.evil.com/cb` is not a match for a
+        registered `https://app.example.com/cb`, and a prefix comparison would
+        make this service an open redirector for every product registered here.
+        Plain `http` is accepted only on loopback, so a product can develop
+        against a local stack without the registration ever accepting a
+        plain-http origin.
+
+        `scopes` is intersected with what this provider implements
+        (`openid email profile accounts`) and must include `openid`. `grant_types`
+        must be `authorization_code`: this service issues no refresh token, has
+        no service identity for client credentials, and has no consent screen for
+        an implicit flow, so registering any of them is refused at 422 with the
+        field named rather than discovered at 3am.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterOIDCClientRequest'
+            example:
+              name: Anytalk
+              redirect_uris: ['https://app.anytalk.com/callback']
+              grant_types: [authorization_code]
+              scopes: [openid, email, profile, accounts]
+      responses:
+        '201':
+          description: The registration, and its secret.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisteredOIDCClient'
+              example:
+                id: ab000000-0000-0000-0000-000000000001
+                client_id: 8Jm1xQ0pQz7rV2nK4wL9cT6bY3hA5sD0fG1eI2jK
+                client_secret: 5rT2wQ9zX1cV4bN6mK8jH0dF3gL5pS7aY9uE1iO
+                name: Anytalk
+                redirect_uris: ['https://app.anytalk.com/callback']
+                grant_types: [authorization_code]
+                scopes: [accounts, email, openid, profile]
+                created_at: '2026-09-30T12:00:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [oidc-clients]
+      operationId: listOIDCClients
+      summary: List an account's OpenID Connect clients
+      description: |
+        Every registration this account owns, newest first. An account with none
+        answers `[]` and not `null`.
+
+        A bare array rather than core's `data` + `page` wrapper, and the omission
+        is deliberate: this list is a handful of rows, and a cursor over four of
+        them is a wrapper a client has to unwrap to render a settings page. The
+        first account that wants a hundred products gets the wrapper then.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: The account's registrations.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OIDCClient'
+              example:
+                - id: ab000000-0000-0000-0000-000000000001
+                  client_id: 8Jm1xQ0pQz7rV2nK4wL9cT6bY3hA5sD0fG1eI2jK
+                  name: Anytalk
+                  redirect_uris: ['https://app.anytalk.com/callback']
+                  grant_types: [authorization_code]
+                  scopes: [accounts, email, openid, profile]
+                  created_at: '2026-09-30T12:00:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/accounts/{account_id}/oidc-clients/{client_id}:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+      - name: client_id
+        in: path
+        required: true
+        description: |
+          The registration's row id — not the `client_id` the product presents.
+          The row id is what the revocation event's `subject` is, and what the
+          other three routes name.
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [oidc-clients]
+      operationId: getOIDCClient
+      summary: Read an OpenID Connect client
+      description: |
+        One registration. `client_secret` and the stored digest are both absent
+        and will stay absent: the secret exists once, in the 201.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: The registration.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OIDCClient'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [oidc-clients]
+      operationId: revokeOIDCClient
+      summary: Revoke an OpenID Connect client
+      description: |
+        Stops honouring the registration. The row is kept rather than deleted — an
+        audit of which credentials existed is worth more than a tidier table, and
+        `revoked_at` is what makes the difference readable afterwards.
+
+        The revocation is real rather than advisory: every access token issued
+        against this registration is revoked in the same transaction, because a
+        token is a signed JWT that a verifier on the edge will keep accepting
+        until its `exp` and revoking the registration does not by itself stop one.
+        A token minted before the revocation therefore fails at userinfo
+        immediately, not fifteen minutes later.
+
+        204 rather than the revoked row, matching every other `DELETE` in this
+        service. The `identity.oidc_client.revoked` event is where a consumer
+        learns what happened.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '204':
+          description: The registration is revoked. No body.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The registration is already revoked. A 204 either way would leave an
+            operator who clicked twice believing they had just destroyed a second
+            credential.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /healthz:
     get:
       tags: [probes]
@@ -456,6 +706,18 @@ components:
         request, which a self-contained JWT cannot do. The OIDC provider, and the
         JWTs core describes, arrive with the OIDC packet.
 
+  parameters:
+    AccountId:
+      name: account_id
+      in: path
+      required: true
+      description: |
+        The account. A caller who is not a member of it gets 404 and never 403,
+        because a 403 would confirm the account exists to somebody guessing ids.
+      schema:
+        type: string
+        format: uuid
+
   headers:
     TraceId:
       description: |
@@ -548,6 +810,132 @@ components:
           type: string
           format: date-time
           description: RFC3339 UTC. Judged against the service's clock, not the database's.
+
+    OIDCClient:
+      type: object
+      description: |
+        One OpenID Connect registration. `client_secret` and `secret_digest` are
+        both absent and always will be: the secret exists once, in the 201, and
+        the digest is what the row holds.
+      additionalProperties: false
+      required: [id, client_id, name, redirect_uris, grant_types, scopes, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: |
+            The row's identifier, and the `subject` of its events. NOT the
+            `client_id` the product presents — those are different values and
+            conflating them is how a consumer ends up correlating on something it
+            cannot look up.
+        client_id:
+          type: string
+          minLength: 43
+          maxLength: 43
+          description: |
+            The public, protocol-visible handle: 32 random bytes, base64url without
+            padding. Unguessable rather than merely unique, because it is half of
+            the credential pair on the token endpoint.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: |
+            What the login page calls the product. Required, because a login page
+            that cannot name the application asking for a password is the setup
+            for a credential-phishing page on this service's own domain.
+        redirect_uris:
+          type: array
+          minItems: 1
+          maxItems: 10
+          items:
+            type: string
+            format: uri
+          description: |
+            The allow-list, matched EXACTLY. No prefix, no glob, no pattern. A
+            registered URI may be `https`, or `http` on loopback only; a fragment
+            and a wildcard are both refused. Sorted, and deduplicated.
+        grant_types:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [authorization_code]
+          description: |
+            Always `authorization_code` today. This service issues no refresh
+            token, has no service identity for client credentials, and has no
+            consent screen for an implicit flow.
+        scopes:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [openid, email, profile, accounts]
+          description: |
+            A subset of what this provider implements, intersected with what the
+            provider supports, and always including `openid`. A client that did
+            not register a scope cannot be granted it by asking at the authorize
+            endpoint.
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+          description: |
+            Absent while the registration is live. A revoked registration is kept
+            rather than deleted, and this is what makes the difference readable
+            afterwards.
+
+    RegisteredOIDCClient:
+      allOf:
+        - $ref: '#/components/schemas/OIDCClient'
+        - type: object
+          additionalProperties: false
+          required: [client_secret]
+          properties:
+            client_secret:
+              type: string
+              minLength: 43
+              maxLength: 43
+              description: |
+                32 random bytes, base64url, returned in this 201 and never again.
+                Only its SHA-256 is stored, so a dump of the registrations table is
+                not a set of credentials. Losing it means registering again.
+
+    RegisterOIDCClientRequest:
+      type: object
+      additionalProperties: false
+      required: [name, redirect_uris, grant_types, scopes]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        redirect_uris:
+          type: array
+          minItems: 1
+          maxItems: 10
+          items:
+            type: string
+            format: uri
+        grant_types:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [authorization_code]
+        scopes:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [openid, email, profile, accounts]
+          description: |
+            Names outside this set are DROPPED rather than refused, and this is the
+            one place that is true: a product registering itself asks for what it
+            would like and the operator curates what it gets. The authorization
+            endpoint, where a caller asks for a token right now, refuses.
 
     Problem:
       type: object
@@ -651,6 +1039,50 @@ components:
             detail: authentication is required to access this resource
             instance: /v1/me
             code: unauthorized
+            trace_id: 0af7651916cd43dd8448eb211c80319c
+
+    Forbidden:
+      description: |
+        The caller can see the resource and may not act on it. The route's minimum
+        role is higher than theirs.
+
+        Never used for "you are not a member of this account" — that is 404, so
+        the response cannot confirm that an account id somebody guessed is real.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/forbidden
+            title: Forbidden
+            status: 403
+            detail: your role in this account does not permit this action
+            instance: /v1/accounts/ab000000-0000-0000-0000-000000000000/oidc-clients
+            code: forbidden
+            trace_id: 0af7651916cd43dd8448eb211c80319c
+
+    NotFound:
+      description: |
+        No such resource, or one this caller may not know about. One status and
+        one sentence for both, because a 403 for "not a member" would confirm the
+        account exists to somebody guessing ids.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/not_found
+            title: Not found
+            status: 404
+            detail: no such OIDC client is visible to you
+            instance: /v1/accounts/ab000000-0000-0000-0000-000000000000/oidc-clients/cd000000-0000-0000-0000-000000000000
+            code: not_found
             trace_id: 0af7651916cd43dd8448eb211c80319c
 
     ValidationFailed:
