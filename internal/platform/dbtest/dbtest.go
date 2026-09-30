@@ -122,7 +122,7 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if _, err := pool.Exec(ctx, `TRUNCATE TABLE mfa_challenges, mfa_used_totp_steps, mfa_recovery_codes, mfa_credentials, oidc_access_tokens, oidc_auth_requests, oidc_clients, outbox_events, connected_accounts, sessions, account_invitations, account_users, accounts, users CASCADE`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE api_keys, mfa_challenges, mfa_used_totp_steps, mfa_recovery_codes, mfa_credentials, oidc_access_tokens, oidc_auth_requests, oidc_clients, outbox_events, connected_accounts, sessions, account_invitations, account_users, accounts, users CASCADE`); err != nil {
 		t.Fatalf("truncating: %v", err)
 	}
 }
@@ -147,9 +147,10 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 //
 // 00009 added three more tables and no new enum type, so the two CREATE TYPE
 // statements below are still the whole list. 00010 added four more and no enum
-// either. A registration's grant types and scopes are text arrays validated in Go,
-// because those closed sets are a code fact — adding a scope must not be a
-// migration.
+// either, and 00011 added api_keys, which is a text[] and two timestamps. A
+// registration's grant types and scopes are text arrays validated in Go, because
+// those closed sets are a code fact — adding a scope must not be a migration. An
+// api key's scopes are validated in Go for exactly the same reason.
 func Schema(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
@@ -252,6 +253,19 @@ func Schema(t *testing.T) *pgxpool.Pool {
 			FOREIGN KEY (credential_id) REFERENCES ` + schema + `.mfa_credentials (id) ON DELETE CASCADE`,
 		`ALTER TABLE ` + schema + `.mfa_challenges ADD CONSTRAINT mfa_challenges_user_id_fkey
 			FOREIGN KEY (user_id) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
+		// The api_keys table. No enum types, so LIKE copies everything — including
+		// the partial unique index on (account_id, lower(name)), which is what
+		// makes the "one live name per account" test mean something here: a schema
+		// without it would accept a duplicate and the test would pass for the
+		// wrong reason. The three foreign keys are written out because LIKE does
+		// not copy them and they would otherwise point at public.
+		`CREATE TABLE ` + schema + `.api_keys (LIKE public.api_keys INCLUDING ALL)`,
+		`ALTER TABLE ` + schema + `.api_keys ADD CONSTRAINT api_keys_user_id_fkey
+			FOREIGN KEY (user_id) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.api_keys ADD CONSTRAINT api_keys_account_id_fkey
+			FOREIGN KEY (account_id) REFERENCES ` + schema + `.accounts (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.api_keys ADD CONSTRAINT api_keys_revoked_by_fkey
+			FOREIGN KEY (revoked_by) REFERENCES ` + schema + `.users (id) ON DELETE RESTRICT`,
 	}
 	for _, stmt := range stmts {
 		if _, err := admin.Exec(ctx, stmt); err != nil {
