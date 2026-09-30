@@ -63,6 +63,27 @@ Direct dependencies, each with a cause:
   step matched), how long a code is accepted, and whether a step has been spent.
   It brings `github.com/boombuler/barcode` indirectly, for a QR-code method this
   service does not call. Arrives with the MFA packet.
+- `github.com/oapi-codegen/runtime` — **for the generated client only, and this is
+  the one that corrects MD6.** MD6 said the Go client "reaches `identity`'s existing
+  stack with no new dependency at runtime", on the grounds that oapi-codegen is a
+  `go:generate` tool rather than a library a user imports. **The GENERATOR is right
+  and is not a dependency**: the `//go:generate` line is pinned to `v2.8.0` and
+  `go run <module>@<version>` resolves in module-aware mode, so oapi-codegen never
+  appears in `go.mod` at all. **The code it EMITS is a dependency**, and it imports
+  this module for parameter binding and for its `UUID` and `Email` types. That brings
+  two more (`apapsch/go-jsonmerge/v2` and `google/uuid`), so three in total.
+
+  **None of the three reaches the service's binary.** `client/` is not imported by
+  `./cmd/identity` and never should be: a service that called its own API over HTTP
+  would add a network hop to itself and depend on a client to do what its own stores
+  already do. `go list -deps ./cmd/identity | grep oapi-codegen` is empty, and
+  `TestTheServiceBinaryDoesNotReachTheGeneratedClient` holds that as a check rather
+  than a claim. The full reasoning, including what it costs the coverage floor, is
+  [DECISIONS.md](DECISIONS.md) D6 — and what it costs is answered there now: the
+  generated client is **excluded from the coverage measurement** by a declared path,
+  with the floor left where it was. See "The coverage floor, and what it is a
+  percentage of" below.
+
 - `go-jose/v4` — **forced, not chosen.** `op.SigningKey` returns a
   `jose.SignatureAlgorithm` and `op.Key.Key()` holds a `jose` key, so the
   library's storage interface cannot be implemented without importing it. It
@@ -763,6 +784,7 @@ internal/oauth/        the social-login client side: state, token cipher, regist
 internal/outbox/       transactional event envelope, SKIP LOCKED claim, publisher
 internal/platform/db/  the pgx pool, and the readiness ping
 internal/platform/ci/  the test that keeps .github/workflows/ci.yml honest
+client/               THE GO CLIENT — a generated transport and the wrapper over it
 migrations/            goose SQL files
 ```
 
@@ -770,6 +792,71 @@ migrations/            goose SQL files
 but process lifetime: everything testable lives in `internal/`, and the pieces
 `main` does own — the socket, the drain, the signal handling — are in an `app`
 type that the tests drive directly.
+
+`client/` is the one directory that is not under `internal/`, and that is the whole
+reason for it: **`internal/` is by definition unimportable, and a client no consumer
+can import is not a client.** It is not reachable from `./cmd/identity` either, which
+is what keeps the client's dependencies out of the service's binary.
+
+## The Go client
+
+`client/` is the third of the fleet's clients, after `cafaye-ts` and `cafaye-py`, and
+the one where the generator is right. Two layers, and the split is MD6's:
+
+```
+client/generated/api.gen.go   GENERATED, COMMITTED. oapi-codegen v2.8.0 over
+                              openapi/v1.yaml: 20 typed operations and a Client
+client/generate.go            the //go:generate line, pinned to v2.8.0
+client/oapi-codegen.yaml      the generator's configuration
+client/transport.go           the interface the generated client satisfies
+client/client.go              the hand-written client: 20 typed methods
+client/credentials.go         which credential this is, and where it may be sent
+client/baseurl.go             where requests go, in a documented order
+client/errors.go              RFC 9457 problem to typed error, typed fallback
+client/redact.go              the scrubber, and the all-or-nothing rule
+client/safetolog.go           a redacting formatter for the generated secret types
+```
+
+**Why Go generates and Python does not is a ruling, not an accident**, and it is
+written down in [DECISIONS.md](DECISIONS.md) D6 so the next person does not read the
+inconsistency as a mistake. In short: Go has a mature OpenAPI 3.1 generator whose
+output is ordinary Go — structs, an interface, an `*http.Response` — so generation is
+a build-time concern. Python's generators impose a runtime one: hey-api's is v0.0.24
+and emits parameterless methods with unsubstituted path templates, and
+openapi-generator's Python output is beta on 3.1 and inverts `const` discriminants to
+`any`. A hand-written Python client has the smaller attack surface, and it is not a
+close call.
+
+**Four things the wrapper owns**, because the generated client cannot: which credential
+this is, where requests go, RFC 9457 mapping, and being the public surface.
+
+**Base URLs have no default.** `ResolveBaseURL` consults, in order: the `BaseURL`
+option, `$CAFAYE_IDENTITY_BASE_URL`, `$CAFAYE_BASE_URL`, and then **throws**. The
+document's own `servers:` entry is deliberately not a default — it would send a
+self-hoster's traffic to somebody else's deployment and it would *succeed*, so nothing
+would look wrong until somebody read a log.
+
+**A credential reaches no string a human reads.** Every string the client builds out
+of anything a caller or a service supplied goes through `Redactor.String`, redaction is
+all-or-nothing, and the credential lives inside **closures** rather than in struct
+fields — `fmt` prints an exported field by value under `%#v`, and that verb does not
+consult `String()`, so a `token string` field is a leak no method can intercept.
+
+**An unknown problem code is a typed error**, so `errors.As(err, &ProblemError)` works
+against every code including the four this document already describes that core's
+reserved list does not have.
+
+**Regenerating is a gate, not a suggestion:**
+
+```sh
+go generate ./client/     # writes client/generated/api.gen.go
+```
+
+`TestTheCommittedGeneratedFileIsWhatThePinnedGeneratorProduces` runs that same
+generator over the same document into a temporary directory and fails when the
+committed file differs, and CI fails the build when four named security tests do not
+PASS by name — among them the credential-leak test, the unknown-problem-code test, the
+regeneration gate and the lint-exclusion narrowness check.
 
 ## Testing
 
@@ -896,6 +983,98 @@ for a stated cause — and it is what catches the `uses:` path drifting back to 
 directory GitHub cannot resolve, the `versions:` literal drifting away from
 `go.mod`, migrations moving below the suite, the SKIP check disappearing, and a
 named security test being renamed.
+
+### The coverage floor, and what it is a percentage of
+
+`gate`'s `coverage` step runs `bin/coverage-floor`, and this is the one number in
+this repository whose denominator is a decision rather than a fact.
+
+Go's `go tool cover -func` prints a `total:` over **every** block in the profile,
+and it has no flag to leave a path out. `client/generated/api.gen.go` is 12,284
+lines of committed oapi-codegen output with **3,001 statements and no test**, so it
+drags module coverage from **73.6% to 44.6%** — measured, both ways, on this tree,
+by `go test -count=1 -race -coverprofile=coverage.out ./...` against Postgres.
+
+Two things that would have been one-line edits, and neither was taken:
+
+- **Lowering the floor to 45.** A floor catches a *decrease*, and 70 was measured
+  against hand-written code. Lowering it admits a real 29-point regression in
+  hand-written code permanently, because the generated file's weight in the
+  denominator never changes.
+- **Adding tests to the generated code.** They would be deleted by the next
+  `go generate`, so the coverage would not survive a week.
+
+So `client/generated` is excluded, by a **declared** path in
+[`coverage-exclusions`](coverage-exclusions) at the repository root:
+
+```
+excluded coverage client/generated files=1 lines=12284 coverage-fail-under=70 \
+  reason="oapi-codegen v2.8.0 output …" owner=identity since=2026-09-30 until=2027-03-31
+```
+
+**Declared, never inferred.** The alternative — skipping any file whose header says
+`// Code generated … DO NOT EDIT.` — fails toward *less* coverage: the header is
+written by whichever generator ran, and one that stops writing it silently
+un-excludes a quarter of the module while the floor stays at 70. An inferred
+exclusion that fails toward *more* coverage is safe. One that fails toward less is
+not.
+
+**A directory, because the tool takes a package and not a file.** That is coarser
+than the anchored regex the lint exclusion uses for the same file, and the
+coarseness is paid for by
+`TestTheCoverageExclusionIsOnlyGeneratedCode`, which enumerates every `.go` file
+under `client/generated` and fails if one is not itself generated.
+`client/` would be a perfectly legal declaration and it would exempt `baseurl.go`,
+`credentials.go`, `errors.go`, `redact.go` and every test in the package.
+
+**The entry must earn its place.** Reason, owner, `since`, `until`, the `files=`
+and `lines=` it covers, and the floor — and **an entry matching nothing is a
+failure** (kit's rule 4, from ESLint's `reportUnusedDisableDirectives`). The
+`files=`/`lines=` fingerprint is what turns "a file appeared under the excluded
+directory" into a red build instead of a silent change of denominator.
+
+**The three facts are printed together, on a green run too.** `bin/coverage-floor`
+emits the measured number, the excluded set with its reason and owner, and the
+floor, in one block, before it compares them:
+
+```
+coverage 73.6% of 4628 statements, over the profile minus 2257 block(s) this file excludes
+excluded — 1 declared entry/entries in coverage-exclusions:
+  client/generated  files=1 lines=12284  owner=identity since=2026-09-30 until=2027-03-31
+      reason: oapi-codegen v2.8.0 output for openapi/v1.yaml, …
+floor 70%  (coverage-fail-under, restated here so the measured number, the excluded set and the floor are read together)
+coverage 73.6% at or above the 70% floor
+```
+
+"coverage 73.6% (floor 70%)" on its own is decoration: a reader cannot tell 70% of
+what. **No percentage is written into `ci.yml`**, which is why the one that used to
+be there is gone rather than updated.
+
+**The floor is still the floor.** `TestTheCoverageFilterCanFail` runs the real
+script over twenty-two broken declarations and profiles, and includes a module at
+**69.9%** (red) and one at **70.1%** (green), with the exclusion in place and
+unchanged. It also includes **699 of 999 statements — 69.97%, which prints as
+"70.0"** — and that one is red, because the comparison is
+`covered * 100 < floor * total` in integers rather than against the printed number.
+Go's own tool rounds the same way and kit's step compares the rounded value, so this
+is stricter than the tool it replaces: that tool's job is to report and this one's is
+to refuse. An exclusion that made coverage unrestrictable would fail that test.
+
+**Where the mechanism lives, and the disagreement it leaves.** It lives here, not
+in kit — identity's *enforcing* coverage step is its own, in `gate`, because kit's
+`test` step runs with no database and dies before reaching a coverage step at all.
+kit is untouched. The consequence, stated rather than hidden: kit's coverage step
+computes `total:` over the whole profile and cannot be told about this declaration,
+so `coverage-fail-under: '70'` is still passed to it and it would read 44.6%. That
+input is left alone on purpose — 45 is the rejected option and 0 is a weakened gate
+— and the threshold is checked in three places by
+`TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor`. The full reasoning is in
+[DECISIONS.md](DECISIONS.md) D6.
+
+**What is still open.** Generating the client into its own Go module, which makes
+the boundary a compile-time fact rather than a config entry. It changes the import
+path of a published client, so it waits; the signal is a second repository asking
+for a generated client, and `until=2027-03-31` fails the build in the meantime.
 
 ## Migrations
 

@@ -1,0 +1,129 @@
+# The coverage exclusion list. ONE file, in this repository, for the one
+# measurement this repository excludes code from.
+#
+# WHAT THIS IS
+#
+# An entry permits ONE path prefix to be left out of the `go tool cover` total the
+# `gate` job compares against its floor. Without it, a path either is measured
+# (which is the default and the only safe default) or somebody edits a threshold,
+# and the second is how a coverage floor stops being a coverage floor.
+#
+# It is read by `bin/coverage-floor`, which the `coverage` step of
+# `.github/workflows/ci.yml` runs, and it is validated by
+# `TestTheCoverageExclusionIsOnlyGeneratedCode` in `internal/platform/ci`, which is
+# the only thing that makes it a declaration rather than a comment.
+#
+# WHY IT IS DECLARED AND NEVER INFERRED
+#
+# The obvious alternative is to exclude every file whose header says
+# `// Code generated … DO NOT EDIT.` That fails in the dangerous direction. The
+# header is written by whichever generator ran: a generator that stops writing it,
+# or a `//go:generate` line pointed at a different tool, SILENTLY RE-EXCLUDES a
+# quarter of this module while the floor stays where it is, and the build goes
+# green having measured almost nothing. An inferred exclusion that fails toward
+# MORE coverage is safe — the floor bites and somebody is told. One that fails
+# toward LESS coverage is not, and this is the one that would.
+#
+# So the path is written here, reviewed, and the test walks the tree to check that
+# what it names is still what it said it named.
+#
+# THIS IS NOT THE ONLY EXCLUSION IN THE REPOSITORY
+#
+# `.golangci.yml` carries a second one, for the same file, in the same shape: a
+# checked-in anchored path with a test that walks every `.go` file and fails if it
+# matched one more. `client/lint_exclusion_test.go` holds that one. Two
+# exclusions, one discipline, two tests — because a lint exclusion and a coverage
+# exclusion are read by different tools and there is no single place both can
+# live, and inventing a shared format to hold two entries would be a second
+# dialect rather than one.
+#
+# ---------------------------------------------------------------------------
+# THE FOUR HYGIENE RULES
+#
+# These are kit's `templates/tier/skip-allowlist` rules, not new ones. An
+# allowlist that invents its own dialect is an allowlist nobody learns twice.
+#
+# 1. EVERY ENTRY NAMES A REASON.
+#    Without one, "generated" becomes the reason for everything, including the
+#    hand-written file somebody put in a generated directory.
+#
+# 2. EVERY ENTRY NAMES AN OWNER.
+#    An exclusion nobody owns is an exclusion nobody will ever remove.
+#
+# 3. EVERY ENTRY HAS BOTH DATES, AND THE GATE READS THE CLOCK.
+#    `since` dates the decision. `until` is the ratchet: an expired entry is a
+#    FAILURE on the day it passes, not a warning. `bin/coverage-floor` exits
+#    non-zero on an expired entry, and the test says so too — so this file is
+#    expected to go red roughly once, and the correct response is to delete the
+#    entry or move the date with a new reason.
+#    `until` here is not a formality. MD16 says the correct long-term shape is a
+#    generated SDK in its OWN Go module, with its own near-zero floor, because a
+#    separate module makes the boundary a compile-time fact rather than a config
+#    entry — and it says that decision was deferred because it changes the import
+#    path of a published client. This expiry is that deferral turning into a
+#    date: it comes due before a second repository asks for a generated client,
+#    which is the signal MD16 names for revisiting rather than copying.
+#
+# 4. AN ENTRY THAT MATCHES NOTHING IS A FAILURE.
+#    This is ESLint's `reportUnusedDisableDirectives` — a disable comment that no
+#    longer suppresses anything — and it is the whole defence of the other three.
+#    Without it this file is a ratchet that only turns one way: a generator that
+#    moves leaves the entry behind, the entry stops matching, and the next person
+#    adds another entry next to it.
+#
+# THE TOTAL IS PRINTED ON PASS, PROMINENTLY.
+#
+# Every entry individually looks justified. The aggregate is the problem, and an
+# aggregate nobody is shown is an aggregate nobody watches — which is a green run
+# is exactly where a growing list is least likely to be noticed. `bin/coverage-floor`
+# prints it on every run, pass or fail, for the same reason kit does.
+#
+# `files=` AND `lines=` ARE NOT DECORATION
+#
+# They are the fingerprint of the excluded SET, and they are what makes "the
+# excluded set changed" a failure rather than a silent change of denominator.
+# Go's coverage step takes a package pattern and not a file, so this exclusion is
+# necessarily a DIRECTORY and necessarily coarser than the lint exclusion beside
+# it. The cost of that coarseness is paid here: a file added to an excluded
+# directory changes `files=`/`lines=`, and the test fails until this line is
+# rewritten. That is the moment somebody has to look at the new file and decide
+# whether it is generated — which is the decision a bare directory exclusion
+# would have made for them.
+#
+# `coverage-fail-under=` IS ON THE ENTRY, NOT IN A HEADER, ON PURPOSE
+#
+# The floor, the path and the size of the excluded set are ONE EDITABLE UNIT, and
+# changing the denominator without restating the floor is the failure this file
+# exists to prevent. `TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor` reads
+# this line and fails if it disagrees with the floor in `.github/workflows/ci.yml`
+# or with the floor passed to kit — so "70%" cannot quietly come to mean three
+# different things in three files.
+#
+# NOTE WHAT IS *NOT* HERE, and why
+#
+# There is no `measured=` field. The measured percentage is printed by
+# `bin/coverage-floor` on every run, beside this file's contents and the floor —
+# which is where MD16 says the floor's meaning has to be restated: "the measured
+# number, the excluded set, and the floor are three facts that belong in one place
+# and are checked together." A number written down by hand in a config file is the
+# one fact of the three that cannot be checked, because it is a copy of a
+# measurement rather than the measurement. The date-stamped "73.2% measured" in
+# `.github/workflows/ci.yml` is exactly that hazard and this packet removes it.
+#
+# ---------------------------------------------------------------------------
+# FORMAT
+#
+#   excluded coverage <path-prefix> files=<n> lines=<n> coverage-fail-under=<n> \
+#       reason="…" owner=… since=YYYY-MM-DD until=YYYY-MM-DD
+#
+# `<path-prefix>` is a repository-relative directory, forward slashes, no `./`,
+# no trailing slash. `reason` is quoted; everything else is bare. A `#` starts a
+# comment. Blank lines are ignored. ONE entry per line: a wrapped reason is two
+# entries, one of which is a parse error.
+#
+# The parser is `bin/coverage-floor`, and it fails closed on any line it does not
+# understand — a reader that finds nothing agrees with a file that excludes
+# nothing, and the two are indistinguishable in a log.
+# ---------------------------------------------------------------------------
+
+excluded coverage client/generated files=1 lines=12284 coverage-fail-under=70 reason="oapi-codegen v2.8.0 output for openapi/v1.yaml, committed on purpose and regenerated on every document change; 3001 statements, none of them exercised by any test in this repository, and a test added to them would be deleted by the next `go generate`. This is not hand-written code and holding it to a hand-written coverage floor measures the generator rather than this repository" owner=identity since=2026-09-30 until=2027-03-31

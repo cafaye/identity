@@ -24,6 +24,7 @@ and its entry here is deleted; the number is never reused.**
 | [D3](#d3-where-the-audit-record-lives-and-why-nothing-can-edit-it) | where does the admin audit record live, and how is it made un-editable? | RULED: `account_audit_log`, append-only in the DATABASE, no foreign key to `accounts` |
 | [D4](#d4-the-admin-surface-is-token-only) | may a browser session reach the admin surface? | RULED: no. Token-only, and the refusal is asserted per route |
 | [D5](#d5-bulk-and-single-revocations-do-not-share-a-shape) | does a bulk revocation take the same request shape as a single one? | RULED: no. `confirm` in the body, a higher minimum, and both counts returned |
+| [D6](#d6-the-generated-client-commits-a-dependency-that-md6-said-it-would-not) | the generated client commits a runtime dependency, which MD6 said it would not — and it takes the coverage floor | RULED, with MD6's stated REASON corrected: the client ships here, generated, and the dependency is paid for |
 
 ## D1: twelve served operations are in no document
 
@@ -409,3 +410,182 @@ case: somebody is performing admin actions while somebody else pages through the
 record of them. And a cursor this build did not issue is a **422 naming `before`**,
 not a silent first page, because on a trail "your token was wrong" and "the records
 are missing" are very different conclusions.
+
+
+## D6: the generated client commits a dependency that MD6 said it would not
+
+**Raised** 2026-09-30 by packet `identity-10`, which added `client/` — the Go client,
+generated from `openapi/v1.yaml` by oapi-codegen v2.8.0, committed, with a
+hand-written wrapper over it.
+
+**What MD6 says, and why it is the reason this entry exists.** MD6 ruled "generate for
+TypeScript and Go, hand-write the unified client, and do not generate Python yet",
+and gave the reason for Go in one sentence: oapi-codegen "reaches `identity`'s
+existing stack with no new dependency at runtime: it is a `go:generate` tool, not a
+library a user imports. A generated client that compiles to ordinary structs and an
+ordinary HTTP call has no supply-chain surface a user has to trust, because there is
+nothing to trust after generation."
+
+**That sentence is half right, and the half that is wrong is the load-bearing half.**
+Measured, not assumed:
+
+- **The generator really is not a dependency.** The `//go:generate` line is pinned to
+  `v2.8.0`, and `go run <module>@<version>` resolves in module-aware mode, so
+  oapi-codegen never appears in `go.mod`. That half of MD6's sentence is exactly
+  right, and it is the same relationship goose is in for `migrations/README.md`.
+- **The generated code IS a dependency.** `client/generated/api.gen.go` imports
+  `github.com/oapi-codegen/runtime` for parameter binding and for its `UUID` and
+  `Email` types. `go.mod` gains three modules: `oapi-codegen/runtime`,
+  `apapsch/go-jsonmerge/v2` and `google/uuid`. A consumer who imports this client
+  gets all three.
+
+**What it costs, stated precisely, because "no new dependency" is the claim and the
+claim is now false in a way somebody has to be able to check.**
+
+| | before this packet | after |
+| --- | --- | --- |
+| `go.mod` modules added | 0 | 3 |
+| `go list -deps ./cmd/identity \| grep oapi-codegen` | empty | **empty** |
+
+**The shipped binary is unaffected**, and that is the part that matters for a service
+which is the platform's security boundary. The dependency is in the module graph, in
+the client package, and in anything that imports the client — not in the artefact
+`identity` builds. `TestTheServiceBinaryDoesNotReachTheGeneratedClient` in
+`client/transport_test.go` holds that as an executable claim, because a comment about
+a supply-chain property is not a supply-chain property.
+
+**The call, and the cost of the other one.**
+
+1. **The client ships here, generated, and the three modules are paid for. CHOSEN.**
+   The dependency is real, bounded, Apache-2.0, and stays out of the binary. The
+   alternative costs more than it saves: the drift gate, the credential-leak test and
+   `go vet` all run on the client *because* it is in this module and therefore in
+   `bin/prime`'s `./...`. Moving it to its own module would leave the coverage floor
+   untouched and leave the client ungated — the failure this repository is built
+   against. AGENTS.md's own position is that "a green build with the database tier
+   silently skipped is a false claim", and an ungated client is the same shape.
+
+2. **Hand-write the Go client, like Python. REJECTED.** It would remove the three
+   modules and cost the platform the drift gate's other half. MD6 already answers
+   this: at 45 operations a hand-written client is "about a day per language" and
+   "genuinely better", and re-decides "when it doubles". identity alone is at 20.
+
+**WHY GO GENERATES AND PYTHON DOES NOT**, restated here because the asymmetry is a
+ruling and not an accident, and the next person to see it should not "fix" the
+inconsistency:
+
+- **Go has a mature 3.1 generator whose output is reviewable.** oapi-codegen v2.8.0
+  emits typed structs and a `Client` interface, produces byte-identical output across
+  runs, and is Apache-2.0. Its output is ordinary Go — structs, an interface, an
+  `*http.Response` — so the artefact a consumer reviews is the artefact they compile.
+- **Python's generators impose a runtime.** hey-api's Python generator is v0.0.24
+  and emits parameterless methods with unsubstituted path templates, so it would emit
+  a request for the literal string `/v1/accounts/{account_id}/oidc-clients`.
+  openapi-generator's Python output is correct but 3.1 is beta there and it inverts
+  `const` discriminants to `any`, defeating compile-time narrowing on exactly the
+  problem-details shape this platform uses.
+- **So the asymmetry is about the generator, not about the language.** Go's toolchain
+  makes generation a build-time concern; Python's tools make it a runtime one. A
+  hand-written Python client has the smaller attack surface of the two, and that is
+  not a close call.
+
+**THE PART THAT IS STILL OPEN, and it is a manager's call, not this packet's.**
+
+Adding 10,334 lines of committed, generated, **0%-covered** code to a module measured
+at 74.7% takes it to **45.9%**. `ci.yml`'s coverage floor is 70, so the `coverage`
+step goes red on this commit.
+
+This packet did **not** move that floor, and did not add a filter to the coverage
+measurement, because both are the shape of thing this repository forbids: making a
+red go away by changing the check rather than the thing being checked. The numbers
+are given here so the decision is available rather than buried.
+
+The three answers, in the order this packet would rank them:
+
+1. **Exclude `client/generated` from the coverage measurement.** It is generated
+   output, and the repository already takes that position for lint in
+   `.golangci.yml`, for exactly the stated reason. This is the closest analogue and
+   the most defensible. It is a change to a CI check and belongs to whoever owns the
+   floor.
+2. **Lower the floor to the measured 45.9%.** Cheap, and honest about what the number
+   now measures, but it makes the floor much weaker for the hand-written code it was
+   there to protect.
+3. **Move the client to its own module** (`client/go.mod`). Restores the service's
+   coverage exactly and keeps the binary clean, and costs the client its place in
+   `bin/prime` — so it needs a second gate, which AGENTS.md calls "a second thing to
+   be wrong".
+
+Whichever is chosen, it is a decision about the repository's coverage policy rather
+than about this client, and it is recorded here rather than made silently.
+
+### ANSWERED 2026-09-30 by packet `identity-12-coverage`: option 1, and why not 2
+
+MD16 in the workspace `DECISIONS.md` ruled it. This records what was actually done
+here rather than a summary of the ruling.
+
+**Option 1, taken.** `coverage-exclusions` at the repository root declares
+`client/generated` — one entry, one directory, with a reason, an owner, a `since`, an
+`until`, the `files=` and `lines=` it covers, and the floor it was justified against.
+`bin/coverage-floor` reads it, filters the profile, prints the measured number, the
+excluded set and the floor in one block, and compares.
+`TestTheCoverageExclusionIsOnlyGeneratedCode` in `internal/platform/ci` walks the tree
+and fails if anything under the excluded directory is not itself generated, or if the
+recorded file and line counts no longer match.
+
+**Option 2 refused, and the numbers here are why.** This tree measures **44.6%** with
+the generated client in it and **73.6%** without it. A floor of 45 is a threshold
+chosen to be met: the gap it absorbs is a real regression in hand-written code, and
+the generated code's weight in the denominator never changes, so the gap would be
+permanent and invisible. Keeping 70 means the floor is still the number that was
+measured against the code somebody wrote.
+
+**The floor was not moved, and no test was added to generated code.** A test written
+against `client/generated/api.gen.go` would be deleted by the next `go generate` and
+the coverage would not survive a week — the same argument the lint exclusion in
+`.golangci.yml` makes, for the same file, in the same shape.
+
+### What is still open, and it is a different question from the one above
+
+**Option 3 is not answered, and it is the correct long-term shape.** A generated SDK
+is a different artefact with different properties, and a separate Go module makes the
+boundary a compile-time fact rather than a config entry. It is not done here because
+it changes the import path of a published client, which is a decision with a
+deprecation window attached.
+
+The signal to settle it is the one MD16 names: **a second repository asking for a
+generated client.** Before then, `coverage-exclusions`'s `until=2027-03-31` fails the
+build, so the question is asked on a date rather than whenever somebody is under
+pressure.
+
+### WHY THE MECHANISM LIVES HERE AND NOT IN kit, which is a judgement and not a fact
+
+The shared workflow should carry the *mechanism* and each repository its own
+*declaration* — that is the right shape and it is what the brief asks for.
+
+It is not here for one concrete reason: **identity's enforcing coverage step is its
+own `coverage` step in the `gate` job, and kit's cannot enforce anything in this
+repository at all.** kit's `test` step runs with no database, so
+`internal/mfa`'s `TestTheDatabaseTierActuallyRan` fails first and the run never
+reaches a coverage step. A mechanism in kit would therefore not be the mechanism this
+repository uses: identity would still need its own copy, and a copy in a repository
+that cannot read kit's at run time is a drifting copy with extra steps — the argument
+`templates/tier/skip-allowlist` already makes about the fleet-wide file.
+
+So the mechanism is here, the declaration is here, and `kit` is untouched, which also
+means this packet does not collide with `kit-04`, live in that repository.
+
+**What kit should grow, and when.** A `coverage-exclusions` input on the reusable
+workflow plus the filter, so a second repository gets the mechanism without writing
+it. The test that should move with it is the "every `.go` file under the excluded
+directory is generated" walk — that is the load-bearing part and the part a consumer
+is most likely to skip. **Do it as a kit packet, not by copying a file across**: a
+copy is a second dialect of the same rule, which is the thing this packet was told not
+to create.
+
+**And the disagreement that leaves behind.** `coverage-fail-under: '70'` is still
+passed to kit. kit's step computes `total:` over the whole profile and cannot be told
+about this declaration, so it would read 44.6% if it ever ran. Left alone on purpose:
+lowering the input to 45 is option 2, and 0 would be weakening a gate to make a build
+green. The threshold is stated in both files, and
+`TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor` fails if they stop being the
+same number.

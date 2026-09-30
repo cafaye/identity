@@ -6,7 +6,170 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
-### Added
+### Added (packet identity-12-coverage)
+
+- **The coverage floor has an exclusion mechanism, declared, and the floor did not
+  move.** `client/generated` is 12,284 lines of committed oapi-codegen output with
+  3,001 statements and no test, and it took module coverage from **73.6% to 44.6%**
+  against a floor of 70. The green move would have been to lower the floor to 45 or
+  to write tests against a file that is deleted on the next `go generate`. Neither
+  was taken; the generated client is now excluded by a **declared path** and the floor
+  is still 70.
+
+  - **`coverage-exclusions` at the repository root, in kit's allowlist dialect.**
+    One entry, `client/generated`, carrying a reason, an owner, a `since`, an
+    `until`, the `files=`/`lines=` it covers, and the floor it was justified against.
+    **An entry matching nothing is a failure** — kit's rule 4, from ESLint's
+    `reportUnusedDisableDirectives`. `files=`/`lines=` are what make a change of the
+    excluded set a red build instead of a silent change of denominator.
+
+  - **Declared, never inferred.** Skipping files by their `// Code generated … DO
+    NOT EDIT.` header was rejected because it fails toward *less* coverage: the
+    header is written by whichever generator ran, and one that stops writing it
+    silently un-excludes a quarter of the module while the floor stays at 70.
+
+  - **`bin/coverage-floor`, not a filter inside a workflow block.** `go tool cover
+    -func` has no way to leave a path out of `total:`, so the exclusion has to filter
+    the profile — and a filter written in YAML is a regular expression nothing but CI
+    executes. The script is driven by
+    `TestTheCoverageFilterCanFail` through twenty-two deliberately broken
+    declarations and profiles, and
+    `TestTheCoverageStepRunsTheCheckedInFilter` fails if the workflow stops calling
+    it, so the tested filter and the enforcing one cannot drift apart.
+
+  - **The exclusion is a directory, because Go takes a package and not a file**, and
+    the coarseness is paid for by
+    `TestTheCoverageExclusionIsOnlyGeneratedCode`: it enumerates every `.go` file
+    under `client/generated` and fails if one is not itself generated.
+    `TestEveryExcludedDirectoryIsNamedInTheDeclaration` holds the other direction —
+    a generated directory that was never declared fails too. `client/` would be a
+    legal declaration and would exempt `baseurl.go`, `credentials.go`, `errors.go`,
+    `redact.go` and every test in the package.
+
+  - **The measured number, the excluded set and the floor are printed together, on a
+    green run as well as a red one**, because "coverage 73.6% (floor 70%)" on its own
+    is decoration and a reader cannot tell 70% of what. **No percentage is written
+    into `ci.yml`** — the copy that was there had already gone stale twice, once
+    when `client/` arrived and once when the generated client was regenerated against
+    a document that had gained three operations.
+
+  - **The floor still bites, to one statement.** `TestTheCoverageFilterCanFail`
+    proves 69.9% is red and 70.1% is green with the exclusion in place and
+    unchanged. An exclusion that made coverage unrestrictable would fail that test,
+    which is the only reason to believe it is a fix rather than a hole.
+
+  - **`kit` is untouched.** The mechanism lives here because identity's *enforcing*
+    coverage step is its own, in `gate` — kit's `test` step runs with no database and
+    dies before reaching a coverage step at all, so a mechanism in kit would not be
+    the one this repository uses. The disagreement that leaves behind is stated in
+    [DECISIONS.md](DECISIONS.md) D6 and in the README: `coverage-fail-under: '70'` is
+    still passed to kit, and kit would read 44.6% because its step computes `total:`
+    over the whole profile. Left alone on purpose — 45 is the rejected option and 0
+    is a weakened gate — and the threshold is checked in three places by
+    `TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor`.
+
+  **Still open:** generating the client into its own Go module, which makes the
+  boundary a compile-time fact rather than a config entry. It changes the import path
+  of a published client, so it waits; the signal is a second repository asking for a
+  generated client, and `until=2027-03-31` fails the build in the meantime.
+
+### Fixed (packet identity-12-coverage, in this release)
+
+- **The generated client was stale against the document, and the merge that proved it
+  is the interesting part.** `identity-10` generated `client/generated/api.gen.go`
+  from `openapi/v1.yaml` as it stood then; `identity-11` added three admin
+  operations to that document on a branch of its own. Merging them left
+  `TestTheCommittedGeneratedFileIsWhatThePinnedGeneratorProduces` and
+  `TestTheTransportCoversEveryOperationInTheDocument` **red** — not because either
+  packet was wrong, but because a committed generated file cannot be merged from two
+  directions.
+
+  The repair is mechanical and is what both tests asked for: `go generate ./client/`
+  against the merged document (10,334 lines → 12,284), plus three methods on
+  `Transport` and the three wrappers on `Client`
+  (`ListAccountAuditLog`, `RevokeAccountInvitation`, `RevokeAccountInvitations`).
+
+  It is recorded here rather than buried because **it is the cost of committing
+  generated code**, and the next merge will hit it again: a generator's output is a
+  function of its input, so two branches that each change the input cannot both have
+  a correct output. The alternative — generating in CI — is the one this repository
+  already rejects for the same file, because a generated file that is not committed
+  cannot be reviewed.
+
+### Added (from packet identity-10, in this release)
+
+- **The Go client**, generated from `openapi/v1.yaml` and committed. `client/` is a
+  hand-written wrapper over a committed oapi-codegen v2.8.0 transport, and it is the
+  third of the fleet's clients after `cafaye-ts` and `cafaye-py` — generated for Go,
+  hand-written for Python, and the asymmetry is a ruling with a reason recorded in
+  [DECISIONS.md](DECISIONS.md) D6 rather than an accident to be tidied up.
+
+  - **`client/generated/api.gen.go` is committed, 20 operations, and regeneration is
+    a gate.** The generator is pinned in `client/generate.go` with
+    `go run <module>@v2.8.0`, which keeps the GENERATOR out of `go.mod` entirely, and
+    `TestTheCommittedGeneratedFileIsWhatThePinnedGeneratorProduces` runs the real
+    generator over the real document into a temporary directory and compares. The
+    temporary directory is the point: a regenerate-in-place `git diff` leaves the tree
+    modified, so the next run passes and the failure is visible exactly once.
+
+  - **The generated code is excluded from lint, by exactly one anchored path.**
+    `.golangci.yml` exempts `^client/generated/api\.gen\.go$` and nothing else, and
+    `TestTheLintExclusionIsOneFileAndNotAPrefix` walks every `.go` file in the tree
+    and fails if the pattern matches one of them. `govet` is deliberately **not**
+    excluded, because `go vet ./client/` passes on the generated file — a check that
+    reports on correctness rather than style has no business being exempted.
+
+  - **The credential reaches no string a human reads, and the rule is structural.**
+    Every string the client builds goes through `Redactor.String`, redaction is all or
+    nothing, and the credential lives inside **closures** rather than in struct
+    fields: `fmt` prints an exported field by value under `%#v`, and that verb does not
+    consult `String()`, so a `token string` field is a leak no method can intercept.
+    `TestTheClientNeverPrintsACredential` runs a full request cycle — including a 422
+    that echoes the caller's own token back in the body and three of its headers — and
+    sweeps `%v`, `%+v`, `%#v`, `%s`, `%q`, every reflected field and the serialised
+    form.
+
+    **The generated types have no redacting `String()` and oapi-codegen does not emit
+    one**, which the brief asks to check for and which is measured rather than assumed:
+    `fmt.Sprintf("%v", IssuedAPIKey{...})` prints the plaintext of a scoped credential
+    this service stores only a SHA-256 of. Go will not let one package define a method
+    on another's type, so the answer is `client.SafeToLog(v)` and
+    `(*Client).SafeToLog(v)`, the latter strictly stronger because it knows the
+    client's own credential.
+
+  - **An unknown problem code is a typed error.** `*UnknownProblemError` carries the
+    code, the status and the trace id, so `errors.As(err, &ProblemError)` works for
+    every code including the four identity already documents that core's reserved list
+    does not have. `ProblemError` is an interface rather than a base struct because
+    `errors.As` matches on assignability and embedding does not create one — a
+    hierarchy of structs would make the single catch work only for codes this build
+    does not know, which is exactly backwards. 202 is a typed error too: a 202 from
+    `POST /v1/session` carries a challenge and **no session**, so returning a `Session`
+    with an empty token would be the credential-shaped non-credential the document
+    warns about.
+
+  - **Base URLs resolve in a documented order and there is no default.** Explicit, then
+    `$CAFAYE_IDENTITY_BASE_URL`, then `$CAFAYE_BASE_URL`, then **throw**. The document's
+    own `servers:` entry is deliberately not used as a default: it would send a
+    self-hoster's traffic to somebody else's deployment and it would *succeed*, so
+    nothing would look wrong until somebody read a log.
+
+  - **Two auth models, classified by identity's own prefix rule.** A `cafaye_` value
+    goes in the `Authorization` header and **not** in a cookie; a session goes in
+    both, because identity prefers the header when both are present and that is what
+    lets one credential work against identity and against the other five services.
+    Tested from the server's side, against a live `httptest.Server`, rather than from
+    the helper's return value.
+
+  - **This costs three modules and a coverage number, and both are recorded.**
+    `github.com/oapi-codegen/runtime` is a real runtime dependency of the generated
+    code — MD6 said the Go client would need none, and that is corrected in
+    [DECISIONS.md](DECISIONS.md) D6 with the measurement. `./cmd/identity` does not
+    reach it, and
+    `TestTheServiceBinaryDoesNotReachTheGeneratedClient` holds that. Adding 10,334
+    lines of generated code at 0% coverage takes the module from 74.7% to 45.9%
+    against a 70% floor; **this packet did not move the floor**, and the options are
+    written down in D2 for whoever owns it.
 
 - **The admin surface** — three operations, and the privilege boundary is one
   sentence: *an account admin may revoke pending invitations to their own account

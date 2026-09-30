@@ -125,11 +125,23 @@ jobs:
       # and internal/platform/ci makes the same assertion on every commit for a
       # developer who never opens Actions.
       versions: '{"go":"1.26.1"}'
-      # Measured, not guessed: 73.2% with the database tier applied and the whole
-      # suite run. The floor is 70 — below the measurement, above nothing. It is
-      # enforced for real in the gate job, because kit's coverage step reads a
-      # profile out of a `test` step that cannot complete here; this value is
-      # where the two agree, not what does the work.
+      # Measured, not guessed: 73.6% of the statements this repository does NOT
+      # exclude, with the database tier applied and the whole suite run. The floor
+      # is 70 — below the measurement, above nothing. It is enforced for real in
+      # the gate job, because kit's coverage step reads a profile out of a
+      # `test` step that cannot complete here; this value is where the two agree,
+      # not what does the work.
+      #
+      # KNOWN DISAGREEMENT, and it is deliberate. kit's coverage step computes
+      # `total:` over the WHOLE profile and cannot be told about
+      # `coverage-exclusions`, so if it ever reached its coverage step it would
+      # read 44.6% and go red against this 70. That is left alone on purpose:
+      # lowering this input to 45 is the one-line edit MD16 exists to forbid, and
+      # 0 would be weakening a gate to make a build green. The honest position is
+      # that this states the THRESHOLD, the gate job states the MEASURED NUMBER
+      # over the declared set, and
+      # `TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor` fails if the two
+      # stop being the same number.
       coverage-fail-under: '70'
       # A string, and 'false', on purpose: kit compares
       # `inputs.telemetry == 'true'`, and GitHub coerces the bare word false to a
@@ -194,16 +206,29 @@ jobs:
       # because this is a service container on the runner's own network.
       TEST_DATABASE_URL: postgres://identity:identity@localhost:5432/identity?sslmode=disable
       DATABASE_URL: postgres://identity:identity@localhost:5432/identity?sslmode=disable
-      # The coverage floor, enforced below. The same number is passed to kit
-      # above; this is the copy that is checked.
+      # The coverage floor, enforced below. The same number is in
+      # `coverage-exclusions` and is passed to kit above; all three are checked
+      # against each other by `TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor`
+      # and by `bin/coverage-floor` itself, which takes this value as its third
+      # argument and refuses to run if it disagrees with the declaration.
       COVERAGE_FAIL_UNDER: '70'
       # Decrease detectors, not targets. Measured on 2026-09-30 against
       # `go test -v -count=1 -race ./...` with the database tier applied, from a
       # complete log: 1254 PASS lines across the whole suite, 1166 of them in the
-      # 11 packages that open a pool, zero SKIP anywhere, 73.2% coverage. A lower
-      # number is a deleted test and this goes red; a higher one is a new test,
-      # which is a one-line edit here. They are not read out of the run, so a run
-      # cannot satisfy itself by having fewer tests.
+      # 11 packages that open a pool, zero SKIP anywhere. A lower number is a
+      # deleted test and this goes red; a higher one is a new test, which is a
+      # one-line edit here. They are not read out of the run, so a run cannot
+      # satisfy itself by having fewer tests.
+      #
+      # The coverage percentage is deliberately NOT quoted here. It used to say
+      # "73.2% coverage" on this line, and that number has been wrong twice: it
+      # was measured before `client/` existed, and again before the generated
+      # client was regenerated against a document that had gained three
+      # operations. A hand-written percentage in a config file is a COPY of a
+      # measurement, and a stale copy reads exactly like a fresh one. The number
+      # is measured on every run and printed beside the excluded set and the
+      # floor by `bin/coverage-floor`, which is the only place a reader has to
+      # look and the only place that cannot go stale.
       #
       # The SUITE_FLOOR was 1237 and is now 1254. 1237 is 1254 minus the 17 tests
       # in internal/platform/ci: that number had been measured from a log taken
@@ -492,7 +517,17 @@ jobs:
             TestNewAppWithoutMFAKeyMountsNoManagementRoutesAndStillChallenges \
             TestConfirmingRevokesEverySessionIssuedBeforeMFA \
             TestOIDCRedirectURINotOnTheAllowList \
-            TestEveryRouteIsInTheMatrix; do
+            TestEveryRouteIsInTheMatrix \
+            TestTheClientNeverPrintsACredential \
+            TestTheGeneratedSecretBearingTypesAreSafeToPrint \
+            TestAnUnknownProblemCodeStillProducesATypedError \
+            TestTheCommittedGeneratedFileIsWhatThePinnedGeneratorProduces \
+            TestTheLintExclusionIsOneFileAndNotAPrefix \
+            TestTheCoverageExclusionIsOnlyGeneratedCode \
+            TestEveryExcludedDirectoryIsNamedInTheDeclaration \
+            TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor \
+            TestTheCoverageStepRunsTheCheckedInFilter \
+            TestTheCoverageFilterCanFail; do
             # The trailing " (" is what makes this exact: `--- PASS: TestFooBar`
             # must not satisfy a check written for `TestFoo`, and go test always
             # puts the duration after the name.
@@ -667,21 +702,30 @@ jobs:
 
       - name: coverage
         # The floor kit's Go job cannot enforce, because it reads a profile out of
-        # a `test` step that dies on the first package without a database. 73.2%
-        # measured with the tier applied; the floor is 70.
+        # a `test` step that dies on the first package without a database.
+        #
+        # `bin/coverage-floor`, not an inline `go tool cover | awk`, and that is
+        # the whole shape of the change. `go tool cover -func` has no way to
+        # leave a path out of its `total:` line, so an exclusion has to be a
+        # filter over the profile — and a filter written inside a workflow block
+        # is a regular expression that nothing but CI ever executes. The script
+        # is executed by `TestTheCoverageFilterCanFail` on every commit, and
+        # `TestTheCoverageStepRunsTheCheckedInFilter` fails if this step ever
+        # stops calling it, so the tested filter and the enforcing one cannot
+        # drift apart.
+        #
+        # The third argument is this job's own `COVERAGE_FAIL_UNDER`, passed so
+        # the script can compare it with the floor in `coverage-exclusions`. Two
+        # statements of one number that disagree is a floor meaning different
+        # things in different files.
+        #
+        # It prints the measured number, the excluded set with its reason and
+        # owner, and the floor, BEFORE it compares them — on a green run as well
+        # as a red one, because "coverage 73.6% (floor 70%)" on its own is
+        # decoration and a reader cannot tell 70% of what.
         run: |
           set -euo pipefail
-          total="$(go tool cover -func="$RUNNER_TEMP/coverage.out" |
-            awk '/^total:/ { gsub(/%/, "", $3); print $3 }')"
-          if [ -z "$total" ]; then
-            echo "::error::no total line in the coverage report; nothing was measured" >&2
-            exit 1
-          fi
-          if [ "$(awk -v a="$total" -v b="$COVERAGE_FAIL_UNDER" 'BEGIN { print (a + 0 < b + 0) ? 1 : 0 }')" != 0 ]; then
-            echo "::error::coverage ${total}% is below the ${COVERAGE_FAIL_UNDER}% floor" >&2
-            exit 1
-          fi
-          echo "coverage ${total}% (floor ${COVERAGE_FAIL_UNDER}%)"
+          bin/coverage-floor "$RUNNER_TEMP/coverage.out" coverage-exclusions "$COVERAGE_FAIL_UNDER"
 
       - name: what actually ran
         # The claim, in the run summary, where a reader looks before believing a
@@ -697,15 +741,23 @@ jobs:
             echo "| \`goose up\` before any test | 10 migrations applied | \`apply the migrations\` |"
             echo "| whole suite (\`bin/prime\`, then \`-v -race\`) | ${SUITE_FLOOR} PASS lines, 0 SKIP | tier step |"
             echo "| database tier, derived from \`dbtest.\` | ${DATABASE_TIER_FLOOR} PASS lines, 0 SKIP | tier step |"
-            echo "| MFA, session and matrix tests | 23 named, each PASS | security step |"
+            echo "| MFA, session, matrix and client-leak tests | 28 named, each PASS | security step |"
             echo "| \`go vet ./...\` | clean | vet |"
             echo "| \`gofmt -l .\` | empty | gofmt |"
             echo "| \`go.mod\`, \`go.sum\` | no diff after the gate | lockfile |"
-            echo "| coverage | ${COVERAGE_FAIL_UNDER}% floor, 73.2% measured | coverage |"
+            echo "| coverage | ${COVERAGE_FAIL_UNDER}% floor over every statement \`coverage-exclusions\` does not exclude | coverage |"
             echo "| \`MFA_ENCRYPTION_KEY\` | ephemeral per run, masked, printed nowhere | boot |"
             echo
             echo "Floors are decrease detectors, not targets: green means nothing was"
             echo "deleted, skipped or excluded since these numbers were measured."
+            echo
+            echo "**The coverage row carries no measured number, on purpose.** The"
+            echo "\`coverage\` step prints the measured percentage, the excluded set"
+            echo "with its reason and owner, and the floor, in one block, on every"
+            echo "run. A percentage written into this table would be a copy of a"
+            echo "measurement, and the copy already went stale twice — once when"
+            echo "\`client/\` arrived and once when the generated client was"
+            echo "regenerated against a document that had gained three operations."
             echo
             echo "**Require \`gate\` in branch protection, not \`ci (kit: go)\`.** The"
             echo "latter is expected red on two steps for reasons that live in kit's"

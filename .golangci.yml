@@ -1,0 +1,115 @@
+# golangci-lint configuration.
+#
+# It exists for ONE reason: to exclude the generated client from lint. Every other
+# file in this repository is linted with golangci-lint's defaults, and this
+# configuration deliberately does not change that — it enables no linter, disables
+# none, and sets no linter settings. A lint config is where a repository quietly
+# turns a default into a suggestion, and the way not to do that is for the file to
+# be as small as the one thing it has to say.
+#
+# WHY THE GENERATED FILE IS EXCLUDED
+#
+# `client/generated/api.gen.go` is 10,334 lines of `go:generate` output. It is excluded for
+# the reason and not the rule: **it is not hand-written code, so holding it to
+# hand-written standards measures the generator rather than this repository.** The
+# findings a linter produces there are oapi-codegen's; they would be reintroduced
+# by the next `go generate`; and each is somebody's decision to fix upstream rather
+# than here. Linting it would produce a number that goes red on every
+# regeneration and a standing pressure to delete the exclusion — which is how a
+# real hand-written file ends up unlinted, six files later, by exactly the same
+# rule.
+#
+# WHY THE EXCLUSION IS THIS NARROW
+#
+# The path is anchored at BOTH ends. `^client/generated/api\.gen\.go$` cannot match anything
+# else: not `client/client/api.gen.go` (a nested directory, which is the shape a
+# misconfigured `output:` produces), not `client/api.gen.go.bak`, not a
+# hand-written `client/api.go`, and not `internal/httpapi/api.gen.go`. This is the
+# narrowest exclusion that does the job, and it is the narrowest one that stays
+# correct when somebody adds a file to this package.
+#
+# A broad alternative was rejected: `path: client/` would exempt the entire
+# hand-written wrapper — `baseurl.go`, `credentials.go`, `errors.go`, `redact.go`
+# and every test in the package — which is where this repository's own code lives.
+# An exclusion covering the wrapper would exempt the code a reviewer is actually
+# responsible for, in exchange for exempting code nobody is.
+#
+# WHY THE LINTER LIST IS LONG
+#
+# It is spelled out rather than left to "all of them", because the linters golangci
+# -lint enables are a DEFAULT SET that changes between releases. A list that means
+# "whatever is enabled today" silently changes meaning when the tool is upgraded,
+# and a generated file would go from exempt to half-linted with no edit to this
+# file. Naming them makes the exclusion explicit against today's set, and
+# `TestTheLintExclusionIsOneFileAndNotAPrefix` fails if this list and the enabled
+# set stop agreeing — so an upgrade that adds a linter surfaces as a test failure
+# rather than as unlinted generated code.
+#
+# ## What holds this exclusion honest
+#
+# A comment is not a control. `TestTheLintExclusionIsOneFileAndNotAPrefix` in
+# client/lint_exclusion_test.go parses THIS FILE and fails if the exclusion ever
+# stops naming exactly `client/generated/api.gen.go`, so it cannot quietly widen itself and
+# cannot be deleted silently either. That test is what makes the narrowness above
+# a property rather than an intention.
+#
+# NOTE ON DIRECTORY EXCLUSIONS
+#
+# Deliberately absent: `linters.exclusions.paths` is not used, and no
+# `skip-dirs`-style rule appears here. Both would exempt a DIRECTORY rather than a
+# file, which is the broad exclusion this file exists to refuse. If a future
+# generated file needs one, it gets its own anchored rule in the list below and a
+# test asserting that rule names exactly one file.
+#
+# This file does not enable kit's linter set (kit/lint/golangci.yml). That is
+# kit's to give, not this packet's to take: adopting it here would add bodyclose,
+# noctx, errorlint, exhaustive and the rest to a lint run that is expected red on
+# arrival for unrelated reasons (see .github/workflows/ci.yml's header). This
+# packet's scope is the generated client, and a wider lint policy would be a
+# different commit by a different packet.
+
+version: "2"
+
+linters:
+  exclusions:
+    rules:
+      - path: ^client/generated/api\.gen\.go$
+        linters:
+          - dupl
+          - errcheck
+          - funlen
+          - gocritic
+          - gochecknoglobals
+          - gocyclo
+          - gosec
+          - ineffassign
+          - lll
+          - maintidx
+          - misspell
+          - nakedret
+          - prealloc
+          - revive
+          - staticcheck
+          - unparam
+          - unused
+
+# WHY `govet` IS NOT IN THAT LIST
+#
+# It is enabled by default and it is deliberately NOT excluded, because
+# `go vet ./client/` passes on the generated file — verified, not assumed, when
+# this packet was written. `govet` is the one enabled linter that inspects what the
+# code MEANS rather than how it is shaped, and excluding it from a generated file
+# would be excluding the check most likely to catch a generator bug. AGENTS.md
+# names `go vet ./...` as one of this repository's four gates, and the generated
+# client is inside `./...`, so it is vetted in CI regardless of this file.
+#
+# The distinction the rest of the list turns on: every linter on it reports on
+# STYLE or on structure the generator controls the shape of, while `govet` reports
+# on correctness. An exclusion list should carry the first kind and never the
+# second.
+#
+# `TestTheLintExclusionNamesEveryEnabledLinter` is what found the omission: it
+# asked golangci-lint which linters were enabled and `govet` was not on this list.
+# It is worth being explicit that the answer was to REMOVE the test's demand, not
+# to add `govet` to the exclusion — a test that had been satisfied by widening the
+# exclusion would have been the wrong test.
