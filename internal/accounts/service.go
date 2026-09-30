@@ -216,7 +216,7 @@ func (s *Service) AddOwner(ctx context.Context, q db.Querier, accountID, userID 
 		return Membership{}, err
 	}
 	// The event belongs to the registration, not to the membership: there is one
-	// account.created for the account, and writing it here rather than in
+	// identity.account.created for the account, and writing it here rather than in
 	// Provision is what keeps it next to the row it announces.
 	event, err := outbox.NewAccountCreated(s.clock.Now(), account.ID, account.Name, account.Slug, account.Personal, userID)
 	if err != nil {

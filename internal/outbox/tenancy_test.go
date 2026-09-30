@@ -246,11 +246,11 @@ func TestTenancyEventTypesAreThreeSegment(t *testing.T) {
 func TestTenancyEventTypesAreDistinct(t *testing.T) {
 	seen := map[string]string{}
 	for name, typ := range map[string]string{
-		"account.created":     EventAccountCreated,
-		"member.invited":      EventMemberInvited,
-		"member.accepted":     EventMemberAccepted,
-		"member.role_changed": EventMemberRoleChanged,
-		"member.removed":      EventMemberRemoved,
+		"identity.account.created":     EventAccountCreated,
+		"identity.member.invited":      EventMemberInvited,
+		"identity.member.accepted":     EventMemberAccepted,
+		"identity.member.role_changed": EventMemberRoleChanged,
+		"identity.member.removed":      EventMemberRemoved,
 	} {
 		if previous, clash := seen[typ]; clash {
 			t.Errorf("%q and %q are both %q", previous, name, typ)
