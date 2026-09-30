@@ -35,6 +35,9 @@ type options struct {
 	// apiKeyCaller resolves a scoped token to its caller. Absent means the account
 	// routes are session-only and a token presented to one is refused.
 	apiKeyCaller APIKeyCaller
+	// introspector serves POST /v1/introspections. Absent means the route is not
+	// mounted.
+	introspector Introspector
 	// apiKeys is the scoped-token surface. It is separate from oidcClients because
 	// it is a different credential with a different lifetime and a different
 	// storage, and a deployment with one configured and not the other is a real one:

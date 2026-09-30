@@ -373,6 +373,167 @@ func (o options) writeAPIKeyError(w http.ResponseWriter, r *http.Request, err er
 }
 
 // ---------------------------------------------------------------------------
+// POST /v1/introspections
+// ---------------------------------------------------------------------------
+
+// Introspector resolves a presented token to a claim document.
+//
+// It is separate from APIKeys because it is a READ of a credential rather than a
+// management of one, and from APIKeyCaller because that one answers "who is
+// calling" while this one answers "what may this token do" — and a token asking
+// the second question about itself is the case that has no analogue in the first.
+type Introspector interface {
+	Introspect(ctx context.Context, token string, now time.Time) (apikeys.Claims, error)
+}
+
+// WithIntrospection mounts the introspection route.
+//
+// Absent means the route is not mounted at all, and the OIDC provider's own
+// SetIntrospectionFromToken keeps refusing — two different surfaces, two different
+// credentials, and neither falling back to the other.
+func WithIntrospection(i Introspector) Option {
+	return func(o *options) {
+		if i != nil {
+			o.introspector = i
+		}
+	}
+}
+
+// registerIntrospectionRoute mounts it.
+//
+// IT IS NOT ACCOUNT-SCOPED and so it is not in registerTenancyRoutes: there is no
+// account in the path, and the account in the answer is the token's own. The
+// authorization is below and it is two rules, both of which are about the CALLER:
+//
+//	a token may ask about itself and nothing else. A credential that can read
+//	  another credential's scopes is a credential that can discover what a
+//	  compromised service holds, which is reconnaissance an attacker does before
+//	  choosing what to escalate into.
+//	a session may ask about a token in an account it OWNS, and not otherwise.
+//	  Owner because this is the credential inventory of an account, and the same
+//	  argument as minting one applies to reading them.
+func (o options) registerIntrospectionRoute(r chiRouter) {
+	if o.introspector == nil {
+		return
+	}
+	r.Post("/v1/introspections", o.handleIntrospect)
+}
+
+// introspectRequest is the body of POST /v1/introspections.
+//
+// `token` is the value to resolve, and it is the credential rather than an id —
+// because an id would be an enumeration oracle over somebody else's credentials,
+// whereas a value is only useful to somebody who already holds it.
+type introspectRequest struct {
+	Token string `json:"token"`
+}
+
+// handleIntrospect resolves a presented token to its claim document.
+//
+//	POST /v1/introspections  {token}
+//	  →  200 {active, sub, account_id, scopes, scope, jti, name, role, iat, exp}
+//	  →  200 {"active": false}   unknown, revoked, expired, or its owner is no
+//	                             longer a member of the account
+//
+// ONE 200 FOR EVERY REFUSAL OF THE TOKEN. RFC 7662 says an introspection response
+// for a token that cannot be used is `{"active": false}` and nothing else, and
+// the reason is the same one sessions.ErrNotFound exists for: a response that
+// distinguished "revoked" from "never existed" tells an attacker whether a leaked
+// value was still live, which is the second question they ask after "does this
+// work". The status is 200 and not 404 for the same reason — the endpoint
+// succeeded; the answer is that the token is not active.
+//
+// THE CALLER'S OWN STANDING IS A DIFFERENT QUESTION and gets a different status,
+// because it is a different fact: 401 for no credential, 403 for a token asking
+// about somebody else's. Those are decisions about the request, and the caller
+// already knows which one they made.
+func (o options) handleIntrospect(w http.ResponseWriter, r *http.Request) {
+	if o.presentedToken(r) == "" {
+		unauthorized(w, r)
+		return
+	}
+
+	var body *introspectRequest
+	if !decodeBody(w, r, &body) {
+		return
+	}
+
+	caller, ok := o.currentCaller(w, r)
+	if !ok {
+		return
+	}
+
+	claims, err := o.introspector.Introspect(r.Context(), body.Token, time.Now())
+	if err != nil {
+		if errors.Is(err, apikeys.ErrNotFound) || errors.Is(err, apikeys.ErrNoAccountID) {
+			// The two refusals that are not the caller's fault and not a leak:
+			// nothing to say, and the same shape for every reason. ErrNoAccountID is
+			// here because a token with no tenancy key cannot be used against any
+			// account, so "inactive" is the truth and a document with a defaulted sub
+			// would not be.
+			writeJSON(w, http.StatusOK, apikeys.InactiveClaims())
+			return
+		}
+		unexpected(w, r, o.logger, err)
+		return
+	}
+
+	// The caller's standing, checked AFTER the token resolved and only for an active
+	// one — so an unknown token is `{"active": false}` for everybody, including a
+	// caller with no standing at all, and the response cannot be used to find out
+	// whether a value is real.
+	if !o.mayIntrospect(w, r, caller, claims) {
+		return
+	}
+
+	writeJSON(w, http.StatusOK, claims)
+}
+
+// mayIntrospect decides the caller's standing over an ACTIVE claim, writing the
+// refusal and reporting whether the request may proceed.
+//
+// A token may read itself: comparing the token ids is the whole check, and the one
+// that presented the credential is the only one it may ask about. A session may
+// read a token in an account it owns, and the role comes from the membership
+// table on this request — so an owner who has been demoted loses this along with
+// everything else.
+func (o options) mayIntrospect(w http.ResponseWriter, r *http.Request, caller apikeys.Caller, claims apikeys.Claims) bool {
+	// A session caller: the account in the claim is the one being asked about.
+	if caller.Key.ID.IsZero() {
+		accountID, err := apikeys.ResolveAccountID(claims)
+		if err != nil {
+			// Unreachable for an active claim — ClaimsFor refuses one without an
+			// account — and refused rather than defaulted if it ever happens.
+			problemFor(w, r, http.StatusForbidden, CodeForbidden,
+				"this token cannot be attributed to an account")
+			return false
+		}
+		_, role, err := o.tenancy.Get(r.Context(), accountID, caller.User.ID)
+		if err != nil {
+			// The caller is not in that account, and 404 rather than 403 for the
+			// reason every other route does it: a 403 confirms the account exists.
+			problemFor(w, r, http.StatusNotFound, CodeNotFound,
+				"no api key matches that token in an account you can see")
+			return false
+		}
+		if !role.AtLeast(accounts.RoleOwner) {
+			problemFor(w, r, http.StatusForbidden, CodeForbidden,
+				"only an owner may read an api key's grant in this account")
+			return false
+		}
+		return true
+	}
+
+	// A token caller: itself, and only itself.
+	if claims.TokenID != caller.Key.ID.String() {
+		problemFor(w, r, http.StatusForbidden, CodeForbidden,
+			"an api key may only introspect itself")
+		return false
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
 // the credential a request presents
 // ---------------------------------------------------------------------------
 

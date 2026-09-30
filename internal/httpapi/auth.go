@@ -157,6 +157,14 @@ func (o options) registerRoutes(r chiRouter) {
 	if o.oidc != nil {
 		o.registerOIDCRoutes(r)
 	}
+
+	// The introspection surface. Not account-scoped and not conditional on the OIDC
+	// provider, because it introspects an OPAQUE first-party credential and has
+	// nothing to do with the JWT one: the provider's own introspection is still a
+	// refusal, and a deployment with a database and no signing key still answers
+	// this one. Absent without WithIntrospection, for the reason every other route
+	// is: a misconfiguration is a 404, not a 500.
+	o.registerIntrospectionRoute(r)
 }
 
 // chiRouter is the slice of *chi.Mux these routes need. Naming it keeps the

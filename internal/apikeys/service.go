@@ -375,6 +375,66 @@ type UserReader interface {
 // judges it against the same instant the response is timestamped with. The
 // Service's own clock is the default in the HTTP layer, which is the only caller
 // that has one.
+// Introspect resolves a presented token to a claim document, and it is NOT
+// Authenticate with a different return type.
+//
+// The difference is one column and it matters: Introspect does not touch
+// `last_used_at`. Asking "is this token still good" is not using it, and a
+// resource server that introspects on every request — which is the normal shape
+// for an opaque credential — would otherwise turn the column into a heartbeat
+// that says the token is in use when nothing has been done with it. An operator
+// reading "last used 4pm" and finding a CI job that only ever introspected would
+// have no way to tell the difference.
+//
+// ONE ERROR, and it is the same one: a token that cannot be used is not an error
+// here either. The caller renders ErrNotFound as `{"active": false}`, which is
+// RFC 7662's answer and the one that keeps "revoked" and "never existed"
+// indistinguishable.
+func (s *Service) Introspect(ctx context.Context, token string, now time.Time) (Claims, error) {
+	if token == "" {
+		return Claims{}, ErrNotFound
+	}
+	key, err := s.store.ByDigest(ctx, s.read.Queryer(), Digest(token), now)
+	if err != nil {
+		return Claims{}, err
+	}
+	return ClaimsFor(key, now)
+}
+
+// Authenticate turns a presented value into a caller, or refuses it.
+//
+// THREE THINGS COME BACK AND ALL THREE ARE NEEDED: the user (whose identity this
+// is), the key (so a handler can ask what it may do and name it in an audit
+// trail), and the role read from the membership AT THIS INSTANT. The role is the
+// interesting one — it is not stored on the token, so a demotion is visible here
+// with no cache and nothing to invalidate.
+//
+// THE LOOKUP IS HASH-THEN-FIND, and there is no comparison of secrets anywhere on
+// this path. The store never sees the presented value: `Digest` turns anything —
+// an empty string, a session token, a truncated paste — into a well-formed
+// 64-character hex digest, and the query is an ordinary indexed equality on that.
+// So there is no length check to branch on, no early return to skip, and no
+// function whose runtime reveals how much of a guess was right. That is a
+// structural answer rather than a promise about subtle.ConstantTimeCompare, and
+// the difference matters: a constant-time compare is what you reach for when a
+// stored secret is compared byte by byte, and nothing here does that.
+//
+// ONE ERROR FOR EVERY REFUSAL. No such token, a revoked one, an expired one, one
+// whose owner has been removed from the account, a session token presented here,
+// the digest presented as a token, and an empty string are all ErrNotFound. The
+// store's single query is what makes that cheap; the reason it matters is that a
+// caller who can tell "revoked" from "never existed" learns whether a leaked value
+// was live, which is the second question an attacker asks after "does this work".
+//
+// The last_used_at write is AFTER the resolution and cannot fail the request: a
+// busy token must not be a failing one, and the accuracy of a column is worth less
+// than the availability of the credential it describes. Introspect is the
+// exception and does not write it at all — see there.
+//
+// now is a parameter rather than read from the clock so a caller resolving a token
+// judges it against the same instant the response is timestamped with. The
+// Service's own clock is the default in the HTTP layer, which is the only caller
+// that has one.
 func (s *Service) Authenticate(ctx context.Context, token string, now time.Time) (Caller, error) {
 	key, err := s.store.ByDigest(ctx, s.read.Queryer(), Digest(token), now)
 	if err != nil {
