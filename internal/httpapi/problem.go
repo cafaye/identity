@@ -58,6 +58,20 @@ const (
 	// the /oidc/authorize pre-check, and a client debugging it will search for
 	// `invalid_request` in the specifications.
 	CodeInvalidRequest = "invalid_request"
+
+	// CodeServiceUnavailable is 503, and it is the one code in this file that core's
+	// conventions do not name.
+	//
+	// It exists for one situation: a deployment that is configured with a database
+	// and has users enrolled in MFA, but has no MFA_ENCRYPTION_KEY, so it cannot
+	// decrypt a secret to verify a code. The honest answer is "this server cannot do
+	// that right now", and answering it with `internal` would tell an operator their
+	// database is broken and tell a user to retry a request that will never succeed.
+	//
+	// It is flagged in openapi/v1.yaml under "codes this service adds", which is the
+	// reconciliation list the block above describes. If core freezes a name for 503,
+	// this is one line.
+	CodeServiceUnavailable = "service_unavailable"
 )
 
 // titles is the fixed human-readable summary per code. core: "title is a fixed,
@@ -73,11 +87,12 @@ var titles = map[string]string{
 	CodeInternal:         "Internal server error",
 	CodeGone:             "Gone",
 
-	CodeAccountLocked:    "Account locked",
-	CodeMethodNotAllowed: "Method not allowed",
-	CodeInvalidJSON:      "Malformed request body",
-	CodePayloadTooLarge:  "Request body too large",
-	CodeInvalidRequest:   "Invalid request",
+	CodeAccountLocked:      "Account locked",
+	CodeServiceUnavailable: "Service unavailable",
+	CodeMethodNotAllowed:   "Method not allowed",
+	CodeInvalidJSON:        "Malformed request body",
+	CodePayloadTooLarge:    "Request body too large",
+	CodeInvalidRequest:     "Invalid request",
 }
 
 func titleFor(code string) string {

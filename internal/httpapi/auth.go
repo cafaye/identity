@@ -49,6 +49,12 @@ type Auth interface {
 	Login(ctx context.Context, in auth.LoginInput) (auth.LoginResult, error)
 	Authenticate(ctx context.Context, token string) (users.User, error)
 	Logout(ctx context.Context, token string) error
+	// CompleteSecondFactor is the rest of a login for an account with a second
+	// factor, and it is on this interface rather than on a separate one because it
+	// IS the rest of Login: the two halves share the session store and the
+	// transaction, and splitting them would be an invitation to mint a session in
+	// one and not the other.
+	CompleteSecondFactor(ctx context.Context, in auth.CompleteSecondFactorInput) (auth.LoginResult, error)
 }
 
 // WithAuth mounts the v1 routes.
@@ -86,6 +92,19 @@ type sessionResponse struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+// challengeResponse is the 202 from POST /v1/session for an account with a second
+// factor.
+//
+// NO `token` FIELD, and that is the point rather than an omission. A client that
+// reads `token` finds nothing, and the only way to get one is to present a code.
+// The field is not present-and-empty either, because an empty field invites a
+// client to treat "the field exists" as "the login is complete".
+type challengeResponse struct {
+	MFARequired bool      `json:"mfa_required"`
+	Challenge   string    `json:"challenge"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
 // registerRequest is the body of POST /v1/users.
 type registerRequest struct {
 	Email    string `json:"email"`
@@ -109,6 +128,16 @@ func (o options) registerRoutes(r chiRouter) {
 	r.Delete("/v1/session", o.handleLogout)
 	r.Get("/v1/me", o.handleMe)
 
+	// THE SECOND STEP OF A LOGIN, mounted beside the first and deliberately NOT
+	// gated on the MFA management routes' condition.
+	//
+	// A deployment with no MFA_ENCRYPTION_KEY has users who enrolled elsewhere, and
+	// those users must reach this route and be refused at their second factor. A 404
+	// here would say this service has never heard of MFA, and a client that believed
+	// it would be free to treat the absence of a challenge as the absence of a
+	// requirement — which is the bypass, expressed as a routing decision.
+	r.Post("/v1/session/mfa", o.handleCompleteSecondFactor)
+
 	// The account routes need both services: a session to resolve the caller from
 	// and a tenancy service to resolve their role in it. With only one of the two
 	// they are not mounted at all, which is the same rule as above — a
@@ -116,6 +145,11 @@ func (o options) registerRoutes(r chiRouter) {
 	if o.tenancy != nil {
 		o.registerTenancyRoutes(r)
 	}
+
+	// The MFA management surface needs a key, which is why it is a separate Option
+	// from the challenge route above: absent without one, and absent rather than
+	// present-and-500.
+	o.registerMFARoutes(r)
 
 	// The OIDC protocol surface needs a session to render its login page and a
 	// key to sign with. Both are the auth service's, so it hangs off the same
@@ -155,9 +189,25 @@ func (o options) handleRegister(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, userResponse{ID: created.ID.String(), Email: created.Email})
 }
 
-// handleLogin authenticates and starts a session.
+// handleLogin authenticates and starts a session, OR hands back a challenge.
 //
-//	POST /v1/session  {email, password}  →  200 {token, expires_at} + cookie
+//	POST /v1/session  {email, password}
+//	  →  200 {token, expires_at}                     + the session cookie
+//	  →  202 {mfa_required, challenge, expires_at}    + the challenge cookie
+//
+// TWO RESPONSES FROM ONE ENDPOINT, and the split is the security property.
+//
+// THE 202 BRANCH MINTS NO SESSION AND SETS NO SESSION COOKIE. The credentials were
+// correct and the authentication is not finished, which is what 202 means: the
+// request was accepted for processing rather than fulfilled. The cookie that is
+// set on this branch is the CHALLENGE cookie, which authenticates nothing — and it
+// is set before the body, for the same reason the session cookie is.
+//
+// The cookie is set at all for an API client as well as a browser, because the
+// challenge token is in the body and the API client can carry it in its own
+// Authorization header on the next call. The cookie is the browser's convenience;
+// it is not the credential's only home, and nothing trusts it in preference to the
+// value the use case already checked.
 func (o options) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var body *loginRequest
 	if !decodeBody(w, r, &body) {
@@ -175,11 +225,43 @@ func (o options) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if result.MFARequired {
+		o.writeChallenge(w, r, result)
+		return
+	}
+
 	// The cookie is set before the body so that a client which crashes mid-write
 	// is still left signed out rather than holding a token it never saw.
 	o.setSessionCookie(w, result.Token, result.ExpiresAt)
 	writeJSON(w, http.StatusOK, sessionResponse{Token: result.Token, ExpiresAt: result.ExpiresAt})
 }
+
+// writeChallenge answers a login that needs a second factor.
+//
+// It cannot fall through to the session response, and that is why it is a separate
+// function rather than an if inside one: there is no field of LoginResult on this
+// branch from which a session could be obtained, because LoginResult.Token is the
+// empty string here.
+func (o options) writeChallenge(w http.ResponseWriter, r *http.Request, result auth.LoginResult) {
+	if result.Challenge == nil || result.Challenge.Token == "" {
+		// Said out loud rather than rendered as an empty 202. A 202 with no
+		// challenge token would leave a client in a state it cannot finish and
+		// cannot diagnose, which is the one outcome worse than a 500.
+		unexpected(w, r, o.logger, errNoChallengeToken)
+		return
+	}
+
+	o.setMFAChallengeCookie(w, result.Challenge.Token, result.Challenge.ExpiresAt)
+	writeJSON(w, http.StatusAccepted, challengeResponse{
+		MFARequired: true,
+		Challenge:   result.Challenge.Token,
+		ExpiresAt:   result.Challenge.ExpiresAt,
+	})
+}
+
+// errNoChallengeToken is what writeChallenge reports when the use case says a
+// second factor is required and hands back nothing to present one against.
+var errNoChallengeToken = errors.New("a login reported that a second factor is required but returned no challenge")
 
 // handleLogout revokes the current session.
 //

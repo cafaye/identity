@@ -216,6 +216,7 @@ type fixture struct {
 	sessions *fakeSessions
 	events   *fakeEvents
 	tenancy  *fakeTenancy
+	mfa      *fakeSecondFactor
 	uow      *fakeUnitOfWork
 	reader   *fakeReader
 	clock    *clock.Fake
@@ -256,6 +257,7 @@ func newFixture() *fixture {
 	f.reader = &fakeReader{q: markerQuerier{name: "reader"}}
 	f.uow = &fakeUnitOfWork{querier: markerQuerier{name: "transaction"}}
 
+	f.mfa = newFakeSecondFactor()
 	f.svc = NewService(
 		f.uow,
 		f.reader,
@@ -263,6 +265,7 @@ func newFixture() *fixture {
 		f.sessions,
 		f.events,
 		f.tenancy,
+		f.mfa,
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),

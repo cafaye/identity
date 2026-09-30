@@ -61,11 +61,18 @@ type fakeAuth struct {
 	loginErr    error
 	authErr     error
 	logoutErr   error
+	// secondFactorErr is returned by CompleteSecondFactor.
+	secondFactorErr error
+	// secondFactor is the result CompleteSecondFactor returns.
+	secondFactor auth.LoginResult
 
 	// recorded inputs
 	registered []auth.RegisterInput
 	loggedIn   []auth.LoginInput
 	loggedOut  []string
+	// completed records the challenges CompleteSecondFactor was handed, so a test
+	// can prove which token the handler read and from where.
+	completed []auth.CompleteSecondFactorInput
 	// lastAuthToken is the credential Authenticate was handed, so a test can
 	// prove which surface the handler read it from.
 	lastAuthToken string
@@ -82,7 +89,22 @@ func newFakeAuth() *fakeAuth {
 			Token:     "a-session-token",
 			ExpiresAt: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC),
 		},
+		secondFactor: auth.LoginResult{
+			User:      auth.RegisteredUser{ID: uid, Email: "kaka@example.com"},
+			Token:     "a-second-factor-token",
+			ExpiresAt: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC),
+		},
 	}
+}
+
+func (f *fakeAuth) CompleteSecondFactor(_ context.Context, in auth.CompleteSecondFactorInput) (auth.LoginResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.completed = append(f.completed, in)
+	if f.secondFactorErr != nil {
+		return auth.LoginResult{}, f.secondFactorErr
+	}
+	return f.secondFactor, nil
 }
 
 func (f *fakeAuth) Register(_ context.Context, in auth.RegisterInput) (auth.RegisteredUser, error) {
@@ -1075,6 +1097,9 @@ func (f *fakeAuth) lastAuthenticatedToken() string {
 type panickingAuth struct{}
 
 func (panickingAuth) Register(context.Context, auth.RegisterInput) (auth.RegisteredUser, error) {
+	panic("handler exploded")
+}
+func (panickingAuth) CompleteSecondFactor(context.Context, auth.CompleteSecondFactorInput) (auth.LoginResult, error) {
 	panic("handler exploded")
 }
 func (panickingAuth) Login(context.Context, auth.LoginInput) (auth.LoginResult, error) {

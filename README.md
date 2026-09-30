@@ -46,6 +46,16 @@ Four direct dependencies, each with a cause:
   storage implementation over this service's own tables and a login UI bound to
   this service's own sessions. `refs/oidc` (v3.51.10) is the library, read for
   its examples.
+- `github.com/pquerna/otp` — TOTP, RFC 6238. The algorithm is the specification, and a
+  private implementation of a specification is a vulnerability with tests: this
+  library owns the base32 of the shared secret, the HMAC, the dynamic truncation,
+  the six-digit zero-padding and the constant-time comparison, and `internal/mfa`
+  never computes any of them. What `internal/mfa` owns is the three decisions the
+  specification does not make: which steps are candidates (the library's own
+  windowed `ValidateCustom` returns a bool and the replay guard needs to know which
+  step matched), how long a code is accepted, and whether a step has been spent.
+  It brings `github.com/boombuler/barcode` indirectly, for a QR-code method this
+  service does not call. Arrives with the MFA packet.
 - `go-jose/v4` — **forced, not chosen.** `op.SigningKey` returns a
   `jose.SignatureAlgorithm` and `op.Key.Key()` holds a `jose` key, so the
   library's storage interface cannot be implemented without importing it. It
@@ -92,6 +102,8 @@ service quietly listening on the wrong port.
 | `OIDC_SIGNING_KEY` | *(unset)* | PEM-encoded RSA private key, ≥ 2048 bits. PKCS#1 and PKCS#8 both load. |
 | `OIDC_SIGNING_KEY_ID` | *(unset)* | The `kid` published in the JWKS and signed into every token. 1-64 characters of `A-Z a-z 0-9 . _ -`. |
 | `OIDC_ALLOW_INSECURE` | `false` | Permits an `http` issuer. For `localhost` and compose stacks only. |
+| `MFA_ENCRYPTION_KEY` | *(unset)* | base64url, **exactly 32 bytes**. Seals the TOTP secret at rest. Never generated. Unset means MFA is not turned on: the management routes are absent and the login challenge is still enforced. A value of the wrong length is a startup failure. |
+| `MFA_ISSUER` | `cafaye identity` | The account label an authenticator app displays. A display string, not a secret; changing it does not affect any confirmed credential. |
 
 ## Endpoints
 
@@ -101,12 +113,18 @@ service quietly listening on the wrong port.
 | `GET /readyz` | `200 {"status":"ok","deps":"postgres"}` | Readiness. 200 when every dependency answers, `503 {"status":"unavailable",...}` otherwise, with each probe bounded at 2s. |
 | `POST /v1/users` | `201 {"id","email"}` | Register. `409 conflict` if the address is taken, `422 validation_failed` with `errors[]` on a bad field, `400 invalid_json` on a malformed body, `413 payload_too_large` past 4 KB. |
 | `POST /v1/session` | `200 {"token","expires_at"}` | Log in. Sets the `__Host-session` cookie to the same token. `401 unauthorized` for any unusable credential, `423 account_locked` with `Retry-After` while locked. |
+| `POST /v1/session/mfa` | `200 {"token","expires_at"}` | Answer a second factor and **only then** get the session. `{challenge?, code}` — the challenge from a `202`, and a TOTP code or a recovery code. | |
 | `DELETE /v1/session` | `204` | Revoke the current session and clear the cookie. `401` if no credential was presented. |
 | `GET /v1/me` | `200 {"id","email"}` | The authenticated user. `401` with no usable credential. |
 | `POST /v1/accounts/:id/oidc-clients` | `201 {id, client_id, client_secret, …}` | Register a relying party. **Owner only.** `client_secret` is returned here and never again. |
 | `GET /v1/accounts/:id/oidc-clients` | `200 [{id, client_id, name, …}]` | The account's registrations, newest first. `[]` and not `null`. **Owner only.** |
 | `GET /v1/accounts/:id/oidc-clients/:clientId` | `200 {id, client_id, …}` | One registration. `clientId` is the row id, not the `client_id` the product presents. **Owner only.** |
 | `DELETE /v1/accounts/:id/oidc-clients/:clientId` | `204` | Revoke a registration, and every access token issued against it, in one transaction. `409 conflict` if already revoked. **Owner only.** |
+| `GET /v1/mfa` | `200 {"enabled", …}` | Whether the caller has a second factor, when they enrolled, and how many recovery codes are left. `200` with `{"enabled":false}` when they have none — not a 404. |
+| `POST /v1/mfa/enrollments` | `201 {"enrollment_id","secret","provisioning_uri",…}` | Generate a TOTP secret and store it **unconfirmed**. `secret` and `provisioning_uri` are returned here and never again. `{code}` is required to **replace** an existing factor. |
+| `POST /v1/mfa/enrollments/:id/confirm` | `200 {"enabled","recovery_codes",…}` | Prove you can produce a code, which makes MFA live and **revokes every session the user holds**. `recovery_codes` is returned here and never again. |
+| `POST /v1/mfa/recovery-codes` | `200 {"recovery_codes",…}` | Issue a new set and destroy the old one, in one transaction. Requires a factor. |
+| `DELETE /v1/mfa` | `204` | Turn MFA off. Requires a factor, and revokes every session. `409 conflict` if MFA is not on. |
 | anything else on `/v1` | `404 not_found` | A problem document, not chi's default plain text. |
 
 Every non-2xx is `application/problem+json` per core's error envelope, including
@@ -124,6 +142,222 @@ list or a 200 that looks identical to a healthy probe.
 Probe failures are logged with the underlying error and **never** returned to the
 caller: an unauthenticated request to `/readyz` must not be a way to learn that
 a database host is `10.0.0.5` or that a password was rejected.
+
+### Multi-factor authentication
+
+TOTP with recovery codes. The only thing MFA is for is being hostile to somebody
+who has stolen a password, so every decision below is about that.
+
+**A correct password does not mint a session.** `POST /v1/session` answers **202**
+for an account with a second factor and **200** for one without:
+
+```
+POST /v1/session {"email","password"}
+  → 200 {"token","expires_at"}                  no second factor; here is your session
+  → 202 {"mfa_required":true,"challenge","expires_at"}   one is required
+
+POST /v1/session/mfa {"challenge","code"}
+  → 200 {"token","expires_at"}
+```
+
+The `202` body has **no `token` key at all**, not an empty one, and no session
+cookie is set. `POST /v1/session/mfa` is the only route in this service that turns
+a second factor into a session, and it mints the session inside the same
+transaction that consumes the challenge — so a challenge cannot be answered twice
+and a code cannot buy two sessions.
+
+The challenge travels in **the cookie or the body**, and both are supported on
+purpose: core's conventions say "no cookies for API traffic" and
+`POST /v1/session` already returns the token in the body as well as the cookie, so
+a second step that read the challenge only from a cookie would leave every
+non-browser client unable to finish a two-factor login.
+
+#### Enrolling
+
+Four requests, and the middle one is the point.
+
+1. `GET /v1/mfa` — is there already a second factor, and how many recovery codes
+   are left? The count is here so a client can say "2 left — print a new set"
+   while there are still two.
+2. `POST /v1/mfa/enrollments` — generates a secret and stores it **unconfirmed**,
+   returning the base32 `secret` and an `otpauth://` `provisioning_uri`. Neither is
+   ever returned again: a user who loses them starts a new enrollment, which mints
+   a new secret. The enrollment expires in ten minutes and is **not MFA** — the
+   login path reads only confirmed rows, which is what makes "stored but never
+   confirmed" mean "authenticates nothing".
+3. `POST /v1/mfa/enrollments/{id}/confirm {"code"}` — proves you can produce a
+   code. This makes MFA live, issues ten recovery codes (returned once, and there is
+   no endpoint that re-reads them), emits `identity.mfa.enabled`, and **revokes
+   every session the user holds**, including the one this was done from.
+4. Done. Every later `POST /v1/session` answers 202 until a code is presented.
+
+**Why enabling revokes every session.** A session minted under a one-factor policy
+was minted on a password alone. Leaving it alive after the user opts into a second
+factor means the attacker holding it does not have to solve the new problem at all.
+It costs the user every other device they were signed in on, and that is the price
+of the change meaning something. Disabling revokes every session for the mirror
+reason: a user who turns MFA off has very often had it turned off *for* them.
+
+#### Replacing the secret
+
+`POST /v1/mfa/enrollments` on an account that already has a credential starts a
+**rotation**, and it takes a second factor. The old secret stays **live until the
+replacement is confirmed**, so an abandoned rotation costs nothing; on confirmation
+the old credential is deleted, its recovery codes go with it, and both
+`identity.mfa.enabled` events fire — a rotation is a genuine change, and a consumer
+that only heard about the first enrollment would be holding a stale picture.
+
+#### Disabling
+
+`DELETE /v1/mfa {"code"}` requires a second factor. A password is not accepted and
+there is no path through this service that would let one be. A recovery code works,
+which is the escape hatch a user with a lost phone needs and the reason recovery
+codes exist.
+
+#### The skew window
+
+**One step either side**, so a TOTP code is live for **90 seconds** rather than 30.
+
+Zero skew would be tighter and is wrong in practice: it refuses any code typed in
+the seconds either side of a step boundary, which is exactly when a user is most
+likely to be reading digits off a screen — and the users it refuses are the ones
+with the worst network and the least accurate autocorrect. A second factor with a
+visible failure rate does not get retried; it gets turned off, and a user with MFA
+off is worse off than a user with MFA and a support ticket.
+
+Two steps or more is the other error, and it is the one RFC 6238's implementers
+drift towards. Every step of skew is thirty more seconds during which a phished or
+shoulder-surfed code still works, and one more six-digit value an attacker gets to
+guess. The window is the *only* thing that grows with skew, so it is held at the
+smallest value that tolerates real drift.
+
+What one step does not buy is worth stating rather than hiding: it tolerates up to
+**thirty seconds of clock drift in either direction and no more**. A phone
+forty-five seconds fast spends half of every period showing a code two steps ahead,
+and that code is refused — a fifteen-second wait, every thirty seconds, for that
+phone. No skew value fixes it without a window wide enough to be a security
+decision rather than a tolerance. What makes the ninety seconds survivable is the
+replay guard: a captured code is good for **exactly one use**, however long it
+stays inside the window.
+
+#### Replay, and why the guard is a set
+
+The standard attack against TOTP is a photograph of the code and a race to use it,
+and it is the thing most implementations get wrong. This service remembers the
+**exact steps consumed**, in a table whose primary key is
+`(credential_id, step)`:
+
+- It refuses a step that was **spent** and accepts one that was **not**, in any
+  order. A single "highest step accepted" bigint cannot make that distinction: below
+  its mark it does not know whether a step was spent or merely old, so it refuses
+  correct codes whenever a phone's clock is corrected backwards, a user switches to
+  a backup authenticator that is behind, or a device re-syncs time mid-window.
+- It is atomic without a lock. `INSERT … ON CONFLICT DO NOTHING` is one statement,
+  so fifty requests carrying the same code resolve to one winner and forty-nine
+  refusals with nothing to roll back.
+- It is bounded. Every acceptance prunes the steps below the window in the same
+  transaction, so the table is the size of the enrolled population rather than the
+  size of the login history.
+
+The cost of claiming the step *before* the session exists is stated where it is
+paid, in `mfa.VerifyFactor`: a database failure between the claim and the session
+write leaves the step spent and the user waiting thirty seconds for the next code.
+The alternative — claiming only inside the session's transaction — means a replayed
+code never reaches the failure counter at all, because the claim and the refusal
+would roll back together, and a code that cannot be counted is one an attacker may
+present without limit.
+
+#### The lockout is per-factor
+
+`mfa_credentials.failed_attempts` is the second factor's counter.
+`users.failed_login_attempts` is the password's. They are separate rows, and that
+separation is the property: **five TOTP guesses have not spent five password
+guesses, and five wrong passwords have not moved the second factor's.** Both run
+`sessions.Lockout`'s arithmetic — one implementation, two counters — because a
+second implementation in `internal/mfa` would be a second place for the thresholds
+to drift, and the drift would be invisible until a user was locked out for the
+wrong number of minutes.
+
+Both are five attempts and fifteen minutes, deliberately the same numbers: a user
+who mistypes three times should not be punished differently depending on which
+field they got wrong. What differs is the counter. The second factor's lockout is
+`423 account_locked` with `Retry-After`, exactly as the password's is.
+
+One honest interaction: the challenge lives ten minutes and the lock lasts fifteen,
+so a user who trips the lockout waits longer than their challenge lives and has to
+start the login again. The alternative — a challenge TTL longer than the lockout —
+would mean holding a permission to finish a sign-in for a quarter of an hour.
+
+#### What is stored, and what a database dump yields
+
+| Column | Stored | A dump alone yields |
+|---|---|---|
+| `mfa_credentials.secret_ciphertext` | AES-256-GCM under `MFA_ENCRYPTION_KEY`, with the user id as AAD, `v1`-prefixed base64url | Nothing presentable. The key is in the environment, not in the row. |
+| `mfa_recovery_codes.code_digest` | SHA-256 of an 80-bit `crypto/rand` value | Nothing. 2⁸⁰ candidates is not a computation. |
+| `mfa_challenges.token_digest` | `sessions.Digest` — SHA-256 of a 256-bit token | Nothing. Same construction as every other credential column here. |
+
+**There is no column in this schema that holds a working second factor**, and
+`TestADatabaseDumpYieldsNoWorkingSecondFactor` is the test that says so over a real
+Postgres rather than in a comment.
+
+**Why the TOTP secret is encrypted and not hashed.** Every other credential column
+in this service is a one-way function of the presented value, and a TOTP secret is
+the exception. The authenticator computes `HMAC(secret, counter)` and so does this
+service, so the secret has to be **recovered**, not verified: a digest of it would
+verify against nothing, exactly as a digest of a password is useless when the
+protocol asks for the password itself. Encryption is the only transformation that
+satisfies both halves.
+
+**The trade-off, stated because it is the cost of that choice.** Encryption is
+recoverable by anyone holding the key, so the boundary is the key and not the row.
+A hash has no such boundary — it is one-way forever. What this service gives up is
+the ability to survive losing `MFA_ENCRYPTION_KEY`: on a lost key every sealed
+secret is unreadable, every enrolled user fails **closed** at their second factor,
+and the only way back is a recovery code or a support ticket. That is a real
+operational cost, and it is why the key belongs in the same secret store as
+`OIDC_SIGNING_KEY` and is **never generated at boot** — a generated key would mean
+every restart invalidates every enrolled user's secret, and a restart is not
+something anybody decides to do. `MFAEncryptionKeyConfigured` and
+`ErrNoMFAEncryptionKey` keep the absent case a supported state rather than a
+silent one.
+
+**Why recovery codes are SHA-256 and not argon2id.** Eighty bits of `crypto/rand`
+has no structure to guess, so a memory-hard hash would buy nothing the entropy has
+not already bought and would cost tens of milliseconds on every sign-in that
+reaches for it. Argon2id exists to make **guessing** expensive and there is nothing
+here to guess. Eighty bits is a **floor**: a six-digit recovery code hashed with
+SHA-256 would be walked in microseconds, and the dump would be a set of working
+second factors.
+
+#### Configuring it
+
+`MFA_ENCRYPTION_KEY` is base64url, **exactly 32 bytes**, read from the environment.
+Present-but-unreadable is a startup failure and not a warning, because an operator
+who pasted a 16-byte key believes they have 128 bits of entropy protecting every
+second factor on the platform.
+
+Absent is a supported state, and it degrades in **one direction only**:
+
+- The management routes (`/v1/mfa` and everything under it) are **absent** — a
+  `404`. A user must not be talked into enrolling a factor this process could not
+  later verify.
+- `POST /v1/session/mfa` is **still mounted**, because it needs no key: deciding
+  that an account has a second factor is a query on a boolean column. A user who
+  enrolled elsewhere is refused at their second factor rather than being let in on
+  their password, and the absence of the management routes says nothing about
+  whether this one exists.
+
+A third outcome — a user with MFA trying to disable it on a keyless deployment —
+gets `503 service_unavailable` with a sentence saying what is wrong, because a user
+told only "try later" retries forever and an operator told `internal` goes looking
+for a database problem that is not there.
+
+#### What is NOT built
+
+No **"trust this device"** cookie and no re-authentication grace period. A trusted
+device is a real feature and a real attack surface — it is a bearer token with no
+expiry and no second factor behind it — and it belongs in its own packet with the
+trade-off written down. Until then, every sign-in needs both factors.
 
 ### The OpenID Connect provider
 
@@ -191,6 +425,7 @@ cmd/identity/main.go   thin entrypoint: load config, build the app, serve, drain
 internal/config/       environment in, validated Config out
 internal/httpapi/      the router, the probes, and the v1 auth surface
 internal/auth/         register, login, resolve — the use cases and their ordering
+internal/mfa/          the second factor: credentials, challenges, codes, lockout
 internal/users/        accounts and the email-uniqueness rules
 internal/sessions/     session tokens, hashing and revocation
 internal/oidc/         the OIDC provider: storage adapter, registrations, the key
@@ -226,8 +461,9 @@ a failure deadline (PLAN.md §3).
 
 goose SQL files in `migrations/`, numbered and annotated. `goose` is a CLI
 tool, not a module dependency. `00001_init.sql` establishes the convention and
-`00002`–`00004` create `users`, `sessions` and `outbox_events`. Migrations are a
-deploy step, not a boot step — see [migrations/README.md](migrations/README.md).
+`00002`–`00004` create `users`, `sessions` and `outbox_events`, `00005`–`00008`
+the tenancy and social-login tables, `00009` the OIDC ones, and `00010` the four
+MFA tables. Migrations are a deploy step, not a boot step — see [migrations/README.md](migrations/README.md).
 
 ## Image
 
@@ -242,9 +478,9 @@ docker run --rm -p 8080:8080 identity
 ## Not built yet
 
 Everything below is a later packet, and none of it is stubbed to look finished:
-email verification, password reset, MFA, scoped API tokens, the admin API, and
-key rotation. No self-service password recovery — a user who forgets a password
-today has no path back in.
+email verification, password reset, scoped API tokens, the admin API, and key
+rotation. No self-service password recovery — a user who forgets a password today
+has no path back in.
 
 Inside the OIDC provider, specifically not built: refresh tokens (access tokens
 live fifteen minutes and cannot be renewed), the implicit flow, client
@@ -271,7 +507,7 @@ a product arrives with the scoped API tokens packet.
 - [x] OAuth (social login) via goth
 - [x] Accounts, memberships, roles, invitations
 - [x] OIDC provider (zitadel/oidc)
-- [ ] MFA: TOTP + recovery codes
+- [x] MFA: TOTP + recovery codes
 - [ ] Scoped API tokens
 - [ ] Admin API
 - [x] Authorization matrix suite (route table × role × anonymous)

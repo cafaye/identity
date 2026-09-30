@@ -85,6 +85,14 @@ exposes:
     # record, in the direction core has to move.
     - identity.oidc_client.created
     - identity.oidc_client.revoked
+    # From the MFA packet. These two are core's catalog rows under these exact
+    # names (docs/event-naming.md, "the user"), so unlike the tenancy ones there
+    # is no divergence to record. The SUBJECT is the user, and for this pair that
+    # is not a judgement call the way the tenancy events' is: a membership change
+    # is about an account's member list, but a factor changing is about one person
+    # and the device they carry.
+    - identity.mfa.enabled
+    - identity.mfa.disabled
 
     # Not yet emitted, and deliberately absent rather than declared and unimplemented:
     #   user.email_verified   the email-verification packet
@@ -93,15 +101,13 @@ exposes:
     #   member.joined         the accounts and tenancy packet
     #   member.removed        the accounts and tenancy packet
     #   member.role_changed   the accounts and tenancy packet
-    #   mfa.enabled           the MFA packet
-    #   mfa.disabled          the MFA packet
     #   session.revoked       a later packet; DELETE /v1/session does not emit it yet
     #   identity.api_key.created  the scoped API tokens packet
     #   identity.api_key.revoked  the scoped API tokens packet
     #
-    # Also absent, and the omission is deliberate rather than pending: the OIDC
-    # packet lands in THIS file's `events` list above rather than in this comment,
-    # because the code emits them.
+    # Also absent, and the omission is deliberate rather than pending: the OIDC and
+    # MFA packets land in THIS file's `events` list above rather than in this
+    # comment, because the code emits them.
     #
     # core asserts that a catalog row and a publisher entry are the same fact
     # stated twice, so declaring one of these before the code emits it would fail

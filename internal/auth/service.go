@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cafaye/identity/internal/accounts"
+	"github.com/cafaye/identity/internal/mfa"
 	"github.com/cafaye/identity/internal/outbox"
 	"github.com/cafaye/identity/internal/platform/clock"
 	"github.com/cafaye/identity/internal/platform/db"
@@ -45,18 +46,15 @@ var (
 	ErrUnauthenticated = errors.New("authentication required")
 )
 
-// LockedError is a login refused because the account is locked. It is a distinct
-// type because the response has to say how long to wait, and because revealing a
-// lock *does* confirm the account exists — which is why the 423 is the one place
-// login is allowed to leak that much.
-type LockedError struct {
-	// RetryAfter is how much longer the caller must wait. Never negative.
-	RetryAfter time.Duration
-}
-
-func (e *LockedError) Error() string {
-	return fmt.Sprintf("account is locked; retry after %s", e.RetryAfter)
-}
+// LockedError is a login refused because the account is locked.
+//
+// It is an ALIAS, not a type of its own. The type lives in internal/sessions
+// because the second factor's lockout is the same shape — same policy, same
+// response, one 423 — and the HTTP layer matches the type rather than the source
+// so that a caller who exhausts five TOTP guesses and a caller who exhausts five
+// passwords are told the same thing. Declaring it here as well would give the
+// layer two types to match and a bug the day it matched the wrong one.
+type LockedError = sessions.LockedError
 
 // DefaultSessionTTL is how long a session lasts when nothing overrides it.
 const DefaultSessionTTL = 30 * 24 * time.Hour
@@ -82,6 +80,29 @@ type SessionStore interface {
 	Create(ctx context.Context, q db.Querier, n sessions.NewSession) (sessions.Session, error)
 	ByToken(ctx context.Context, q db.Querier, token string, now time.Time) (sessions.Session, error)
 	Revoke(ctx context.Context, q db.Querier, sessionID id.UUID) error
+}
+
+// SecondFactor is the part of internal/mfa that login needs, and it is REQUIRED.
+//
+// It is an interface declared here, at the consumer, for the same reason
+// UserStore and SessionStore are, and it is the fourth thing Login cannot work
+// without. The alternative — a nil check, or a default that answers "no" — is how
+// a service ends up issuing single-factor sessions for users whose accounts have
+// a second factor, and that failure is silent by construction: every login works,
+// every login is one factor short, and nothing in the logs says so. NewService
+// refuses a nil one, and Login refuses to mint a session without it.
+//
+// Three methods, and each one is a decision rather than a lookup:
+//
+//	Enabled          is this user's account two-factor right now
+//	CreateChallenge  record a correct password with no session behind it
+//	VerifyChallenge  check a code and claim what it spent
+//	Commit           finish the acceptance, inside the session's transaction
+type SecondFactor interface {
+	Enabled(ctx context.Context, q db.Querier, userID id.UUID) (bool, error)
+	CreateChallenge(ctx context.Context, in mfa.CreateChallengeInput) (mfa.NewChallenge, error)
+	VerifyChallenge(ctx context.Context, token, code string, now time.Time) (mfa.Claim, error)
+	Commit(ctx context.Context, q db.Querier, claim mfa.Claim, now time.Time) error
 }
 
 // EventAppender is the part of outbox.Store that registration needs.
@@ -118,18 +139,33 @@ type Service struct {
 	sessions   SessionStore
 	events     EventAppender
 	tenancy    PersonalAccountProvisioner
+	mfa        SecondFactor
 	hasher     *users.Hasher
 	clock      clock.Clock
 	sessionTTL time.Duration
 }
 
+// ErrNoSecondFactor means this auth service has no second-factor dependency
+// wired, so it cannot answer the question "does this user's account have a second
+// factor" and therefore cannot know whether a correct password may mint a
+// session.
+//
+// It is an error and not a degraded single-factor mode, and the direction of the
+// refusal is the whole point: a login that proceeds without being able to check is
+// exactly the bypass MFA exists to prevent. main wires the real dependency
+// whenever it has a database, so reaching this is a wiring bug at a call site
+// rather than a supported configuration.
+var ErrNoSecondFactor = errors.New("logging in: no second-factor service is configured")
+
 // NewService wires the use cases. A non-positive sessionTTL means
 // DefaultSessionTTL.
 //
-// uow is used for the two writes that must be atomic with each other — the user,
-// its personal account, the ownership and the two events; and the session and
-// its clearing of the failure counter. read is used for everything else, so
-// those lookups do not pay for a transaction.
+// uow is used for the writes that must be atomic with each other — the user, its
+// personal account, the ownership and the two events; and the session, the
+// challenge it answers and the two failure counters it clears. read is used for
+// everything else, so those lookups do not pay for a transaction.
+//
+// secondFactor is required. See ErrNoSecondFactor.
 func NewService(
 	uow UnitOfWork,
 	read db.QuerierSource,
@@ -137,6 +173,7 @@ func NewService(
 	sessionStore SessionStore,
 	events EventAppender,
 	tenancy PersonalAccountProvisioner,
+	secondFactor SecondFactor,
 	hasher *users.Hasher,
 	clk clock.Clock,
 	sessionTTL time.Duration,
@@ -151,6 +188,7 @@ func NewService(
 		sessions:   sessionStore,
 		events:     events,
 		tenancy:    tenancy,
+		mfa:        secondFactor,
 		hasher:     hasher,
 		clock:      clk,
 		sessionTTL: sessionTTL,
@@ -272,15 +310,49 @@ type LoginInput struct {
 	IP        *netip.Addr
 }
 
-// LoginResult is a successful login: the public projection of the user, plus the
-// one time the raw token is available.
+// LoginResult is what a successful login returns.
+//
+// It is one type with three shapes rather than three types, and the shape is
+// decided by MFARequired and by nothing else:
+//
+//	MFARequired false  Token is a session token, Challenge is nil
+//	MFARequired true   Token is EMPTY, Challenge is not nil
+//
+// THE EMPTY TOKEN IS THE POINT, and it is the shape of the mistake this whole
+// package exists to prevent. A caller that ignores MFARequired and reads Token
+// gets the empty string, which authenticates nothing, rather than a working
+// credential. There is no field of this struct from which a session can be
+// obtained without the second factor having been presented, and
+// TestAResultThatRequiresASecondFactorCarriesNoSessionToken is the assertion.
 type LoginResult struct {
-	User      RegisteredUser
+	User RegisteredUser
+	// Token and ExpiresAt are the SESSION's, and both are zero unless
+	// MFARequired is false.
+	Token     string
+	ExpiresAt time.Time
+
+	// MFARequired says the password was correct and this account has a second
+	// factor. No session exists yet, and ExpiresAt is the CHALLENGE's expiry
+	// rather than a session's, which is why it is repeated here rather than left
+	// confusing: a client that reads ExpiresAt without reading MFARequired is
+	// holding a challenge's deadline, and the only honest thing it can do with it
+	// is nothing until it has the second factor.
+	MFARequired bool
+	// Challenge is the login that is halfway through. nil whenever a session was
+	// minted.
+	Challenge *Challenge
+}
+
+// Challenge is a login waiting on its second factor.
+type Challenge struct {
+	// Token is presented once, at the end of the challenge, and is stored only as
+	// a digest. The same reasoning as an OIDC client secret: a secret this service
+	// can produce again is a secret this service is storing.
 	Token     string
 	ExpiresAt time.Time
 }
 
-// Login authenticates an email and password and mints a session.
+// Login authenticates an email and password.
 //
 // The order of the checks is the security property, so it is spelled out:
 //
@@ -294,7 +366,23 @@ type LoginResult struct {
 //  4. Verify the password.
 //  5. On a mismatch, count the failure, persist it, and return
 //     ErrInvalidCredentials.
-//  6. On a match, mint the session and clear the failure run in one transaction.
+//  6. On a match: ask whether this account has a CONFIRMED second factor.
+//     If it does, mint a CHALLENGE and return MFARequired — no session, no token,
+//     nothing that authenticates anything.
+//  7. Otherwise mint the session and clear the password's failure run in one
+//     transaction.
+//
+// STEP 6 IS THE LINE THIS PACKET IS ABOUT, and it sits where it does on purpose:
+// after the password has been verified and before the session is created. A
+// challenge is not a session, and a session created here for an account with a
+// second factor is a login with one factor where there should be two — which is
+// not a weaker version of MFA, it is the absence of it.
+//
+// Note what step 6 does NOT do: it does not clear the password's failure run. The
+// password was right, but the login is not finished, and the run is cleared in
+// CompleteSecondFactor, in the transaction that mints the session. Clearing it
+// here would let five wrong passwords cost an attacker nothing while they work on
+// the second factor.
 func (s *Service) Login(ctx context.Context, in LoginInput) (LoginResult, error) {
 	email := users.NormalizeEmail(in.Email)
 	if err := validateLogin(email, in.Password); err != nil {
@@ -335,7 +423,148 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (LoginResult, error)
 		return LoginResult{}, ErrInvalidCredentials
 	}
 
+	required, err := s.requiresSecondFactor(ctx, user.ID)
+	if err != nil {
+		return LoginResult{}, err
+	}
+	if required {
+		return s.startChallenge(ctx, user, in, now)
+	}
+
 	return s.startSession(ctx, user, in, now)
+}
+
+// requiresSecondFactor asks internal/mfa whether this account has a live second
+// factor, and refuses to guess.
+func (s *Service) requiresSecondFactor(ctx context.Context, userID id.UUID) (bool, error) {
+	if s.mfa == nil {
+		return false, ErrNoSecondFactor
+	}
+	required, err := s.mfa.Enabled(ctx, s.read.Queryer(), userID)
+	if err != nil {
+		return false, fmt.Errorf("checking whether this account has a second factor: %w", err)
+	}
+	return required, nil
+}
+
+// startChallenge records a correct password with no session behind it.
+//
+// It is a separate function from startSession rather than a branch inside one,
+// because the two write different things and a merge would make "which of these
+// ran" a question about a boolean.
+func (s *Service) startChallenge(ctx context.Context, user users.User, in LoginInput, now time.Time) (LoginResult, error) {
+	challenge, err := s.mfa.CreateChallenge(ctx, mfa.CreateChallengeInput{
+		UserID:    user.ID,
+		UserAgent: in.UserAgent,
+		IP:        in.IP,
+	})
+	if err != nil {
+		return LoginResult{}, fmt.Errorf("creating a second-factor challenge: %w", err)
+	}
+
+	// No session. No token. Nothing that authenticates anything.
+	//
+	// ExpiresAt IS SET, to the CHALLENGE's expiry. It is the same field a session
+	// uses, so leaving it zero would be a second, subtler version of the same bug —
+	// a client reading `expires_at` would see the epoch and have to special-case it.
+	// Repeating the challenge's deadline here means a client that reads only
+	// ExpiresAt is holding a value it can use, and the value it can use is the
+	// honest one: when this login has to be finished.
+	return LoginResult{
+		User:        RegisteredUser{ID: user.ID, Email: user.Email},
+		ExpiresAt:   challenge.ExpiresAt,
+		MFARequired: true,
+		Challenge:   &Challenge{Token: challenge.Token, ExpiresAt: challenge.ExpiresAt},
+	}, nil
+}
+
+// CompleteSecondFactorInput is a challenge token and the code that answers it.
+type CompleteSecondFactorInput struct {
+	// ChallengeToken is the token from the Login that returned MFARequired.
+	ChallengeToken string
+	// Code is a TOTP code or a recovery code. One field for both, because the
+	// consequence of being wrong is identical and two fields would invite a client
+	// to put a recovery code in the TOTP field and be told it was malformed rather
+	// than not accepted.
+	Code string
+}
+
+// CompleteSecondFactor answers a challenge and, only then, mints the session.
+//
+// THE ORDER IS THE WHOLE THING:
+//
+//  1. VerifyFactor (through mfa) matches the code and CLAIMS what it spent,
+//     counting a failure and writing the counter itself if it does not match.
+//  2. One transaction: consume the challenge, create the session, clear BOTH
+//     failure counters.
+//
+// There is no branch, and there is no path through this method that returns a
+// session without step 1 having succeeded. That is what makes the service's
+// second factor a second factor.
+//
+// The two counters clear together and in this transaction for the reason the
+// password's clears with the session in startSession: a counter that clears
+// without the login it was counting towards completing hands an attacker a free
+// reset every time they get it wrong. The second factor's counter lives on a
+// different row from the password's, and both are cleared here — a successful
+// two-factor login restarts both runs and neither one survives on its own.
+func (s *Service) CompleteSecondFactor(ctx context.Context, in CompleteSecondFactorInput) (LoginResult, error) {
+	if s.mfa == nil {
+		return LoginResult{}, ErrNoSecondFactor
+	}
+	if in.ChallengeToken == "" {
+		return LoginResult{}, ErrUnauthenticated
+	}
+
+	now := s.clock.Now()
+
+	// Outside the transaction, and deliberately: this writes the second factor's
+	// failure counter when the code is wrong, and a counter rolled back along with
+	// the refusal it provoked is not a counter.
+	claim, err := s.mfa.VerifyChallenge(ctx, in.ChallengeToken, in.Code, now)
+	if err != nil {
+		return LoginResult{}, err
+	}
+
+	token, digest, err := sessions.NewToken()
+	if err != nil {
+		return LoginResult{}, fmt.Errorf("minting a session token: %w", err)
+	}
+	expiresAt := now.Add(s.sessionTTL)
+
+	err = s.uow.Do(ctx, func(ctx context.Context, q db.Querier) error {
+		// The session is created first, for the reason startSession gives: if it
+		// fails the transaction rolls back and the challenge is still live, so the
+		// user can press "try again" rather than being told their login has
+		// expired. The order of the other two is not load-bearing — they are both
+		// accounting and the transaction covers all three.
+		if _, err := s.sessions.Create(ctx, q, sessions.NewSession{
+			UserID:      claim.UserID(),
+			TokenDigest: digest,
+			ExpiresAt:   expiresAt,
+		}); err != nil {
+			return err
+		}
+		// Consumes the challenge and clears the second factor's failure run.
+		if err := s.mfa.Commit(ctx, q, claim, now); err != nil {
+			return err
+		}
+		return s.users.ClearFailures(ctx, q, claim.UserID())
+	})
+	if err != nil {
+		return LoginResult{}, err
+	}
+
+	user, err := s.users.ByID(ctx, s.read.Queryer(), claim.UserID())
+	if err != nil {
+		return LoginResult{}, fmt.Errorf("loading the user behind a second-factor login: %w", err)
+	}
+
+	return LoginResult{
+		User:      RegisteredUser{ID: user.ID, Email: user.Email},
+		Token:     token,
+		ExpiresAt: expiresAt,
+	}, nil
 }
 
 // startSession mints the session and clears the failure run together.

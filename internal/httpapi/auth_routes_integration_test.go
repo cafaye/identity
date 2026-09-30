@@ -55,6 +55,10 @@ func authServiceWithSessionTTL(pool *pgxpool.Pool, clk clock.Clock, sessionTTL t
 		sessions.NewStore(pool),
 		outbox.NewStore(pool),
 		realTenancy(pool, clk),
+		// The REAL second-factor use cases, over the same pool. A double here would
+		// make every test in this file pass with a login that skips the challenge,
+		// which is the one bug this packet exists to prevent.
+		testMFAService(pool, clk),
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),
@@ -539,6 +543,7 @@ func TestEndToEndWriteFailureIs500AndLeaksNothing(t *testing.T) {
 		sessions.NewStore(pool),
 		outbox.NewStore(pool),
 		realTenancy(pool, clk),
+		testMFAService(pool, clk),
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),

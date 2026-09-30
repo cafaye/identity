@@ -8,6 +8,110 @@ All notable changes to identity are recorded here. The format follows
 
 ### Added
 
+- `internal/mfa` — the second factor: TOTP enrollment, the challenge a login waits
+  on, recovery codes, and the lockout that stops somebody who has stolen a password
+  from finishing the job with six digits of guessing. `github.com/pquerna/otp`
+  v1.4.0 owns RFC 6238; this package owns the three decisions the specification
+  does not make, which are which steps are candidates, how long a code is
+  accepted, and whether a step has been spent.
+  - **A correct password does not mint a session.** `POST /v1/session` answers
+    `202 {mfa_required, challenge, expires_at}` for an account with a second
+    factor and `200 {token, expires_at}` for one without. The 202 body has no
+    `token` key at all — not an empty one — and `LoginResult.Token` is the empty
+    string, so a caller that ignores `MFARequired` gets nothing rather than a
+    working credential. `POST /v1/session/mfa` is the only route in this service
+    that turns a second factor into a session, and it goes through
+    `auth.Service.CompleteSecondFactor`, which mints the session inside the same
+    transaction that consumes the challenge.
+  - Enrollment is two steps and the first is not MFA. `POST /v1/mfa/enrollments`
+    generates a secret with `crypto/rand` through the library, returns it once
+    with its `otpauth://` URI, and stores it **unconfirmed**. A pending row
+    authenticates nothing, the login path reads only confirmed rows, and it
+    expires in ten minutes. Confirmation requires a code from that secret, and a
+    confirm that arrives twice does not confirm twice or mint a second set of
+    recovery codes.
+  - **A code cannot be accepted twice, and the guard is a SET.** The obvious
+    implementation — one "highest step accepted" bigint — refuses steps it cannot
+    distinguish from spent-but-old ones, which is a user with a phone whose clock
+    moved backwards being told their correct code is wrong. A primary key on
+    `(credential_id, step)` plus `INSERT ... ON CONFLICT DO NOTHING` refuses a step
+    that was spent and accepts one that was not, in any order, atomically without a
+    lock, and is pruned to a handful of rows per credential by a `DELETE` in the
+    same transaction. `TestClaimStepIsAtomicUnderConcurrency` puts fifty
+    simultaneous claims on one step and requires exactly one winner.
+  - **The skew window is one step either side**, so a code is live for ninety
+    seconds rather than thirty. Zero would refuse a code typed near a step
+    boundary, which is the user with the worst thumbs and the worst network — and a
+    second factor with a visible failure rate gets turned off rather than retried.
+    Two steps or more is ninety more seconds of a phished code's life and one more
+    six-digit value to guess, and the window is the only thing that grows with skew.
+    What one step does not buy is stated in `mfa.SkewSteps`: it tolerates thirty
+    seconds of drift and no more, and a phone forty-five seconds fast waits fifteen
+    seconds every period.
+  - Recovery codes: ten, each 80 bits of `crypto/rand`, shown once and stored only
+    as a SHA-256 digest. Eighty bits is a **floor**, not a round number — a
+    six-digit code hashed with SHA-256 is walked in microseconds, which would make
+    a database dump a set of credentials. Accepted in place of a TOTP code,
+    single-use under concurrency, and the response says how many are left, which is
+    the packet's "tell them before they get there".
+  - **Adding a factor is authorized by a session; removing or replacing one
+    requires a factor.** An enrollment makes the account harder to get into and
+    there is nothing to prove beyond being signed in — a thief holding the session
+    adds one and is locked out of the account they are in. Disabling, rotating the
+    secret and regenerating the codes all take a TOTP code or a recovery code, and
+    there is no route to any of them without one.
+  - **Enabling MFA revokes every session**, including the caller's own. That answers
+    the question of what happens to a session issued before MFA was: it stops
+    working. A session minted under a one-factor policy was minted on a password
+    alone, and leaving it alive means the attacker holding it does not have to
+    solve the new problem. Disabling revokes every session too, because a user who
+    turns MFA off has very often had it turned off *for* them.
+  - Rotation keeps the old secret **live until the replacement is confirmed**, so
+    an abandoned rotation costs the user nothing; on confirmation the old credential
+    is deleted rather than superseded, because not having the secret is the only
+    reliable way to stop its codes being accepted.
+  - A login that is halfway through while the user enables, rotates or disables MFA
+    on another device is handled by reading the credential **at verification time**
+    rather than caching its id: disabling means no session, rotating means the old
+    code is refused, and enabling means the pending row is still not a factor.
+  - `identity.mfa.enabled` and `identity.mfa.disabled` — core's catalog names,
+    three-segment, subject the user. Neither payload carries a secret, a digest of
+    one, a code or an `otpauth://` URI, and `TestMFAEventPayloadsCarryNoCredential`
+    asserts the absence of each plus the exact key set.
+  - The OIDC login page has a second step. A correct password for an enrolled user
+    renders a code form, mints no authorization code, and sets no session cookie.
+  - `MFA_ENCRYPTION_KEY` seals the TOTP secret, and `MFA_ISSUER` names the account
+    in an authenticator app. The key is read from the environment and **never
+    generated**: a key generated at boot would mean every restart invalidates every
+    enrolled user's secret, and a restart is not something anybody decides to do.
+
+### Changed
+
+- `auth.NewService` takes a **required** `SecondFactor`. A login that cannot ask
+  whether an account has a second factor now returns `ErrNoSecondFactor` instead
+  of minting a session — that failure is silent by construction otherwise, since
+  every login works and every login is one factor short.
+- `POST /v1/session` may answer `202`. Clients that switch on the status code see
+  the difference; clients that read `token` find no key on that response.
+- `sessions.LockedError` moved to `internal/sessions`, next to the `Lockout` that
+  produces it, with `auth.LockedError` kept as a type alias. The second factor's
+  lockout is the same type, so the HTTP layer matches one error for both factors
+  rather than two it has to know the origin of.
+- `sessions.Store` gained `RevokeAllForUser`, one statement rather than a loop.
+- `httpapi.WithMFA` mounts the management routes and **requires**
+  `MFA_ENCRYPTION_KEY`. `POST /v1/session/mfa` is mounted with the auth surface and
+  does not, because a deployment with a database and no key must still refuse a
+  user who enrolled elsewhere rather than letting them in on their password.
+- `CodeServiceUnavailable` (`service_unavailable`) is the one problem code this
+  service adds to core's set, used only for "this deployment cannot verify a second
+  factor". Flagged in `openapi/v1.yaml`.
+
+### Not built
+
+- No "trust this device" cookie, and no re-authentication grace period. A trusted
+  device is a real feature and a real attack surface, and it belongs in its own
+  packet with the trade-off written down.
+
 - `internal/oidc` — `identity` as a first-class OpenID Connect **provider**, so
   any product signs users in against cafaye itself rather than configuring Google
   OAuth per product, and the JWT verification every other cafaye service already

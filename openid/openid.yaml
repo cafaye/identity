@@ -113,6 +113,24 @@ info:
     The page names the product asking. It has to: a login page that cannot say
     which application wants a password is the setup for a credential-phishing page
     on this service's own domain.
+
+    ## A second factor is a second step on this page
+
+    A correct password on an account that has enrolled a second factor does not
+    sign anybody in. This page renders its second step — a code box, which takes
+    a TOTP code or a recovery code — and no authorization code is minted until
+    that is answered.
+
+    This is the same use case `POST /v1/session/mfa` is, and the same guarantee: a
+    product integrating against this provider cannot obtain a token for a user
+    with multi-factor authentication by knowing their password. A user who fails
+    the second step is shown the form again with one sentence that does not say
+    which part was wrong.
+
+    The contract a client sees from outside does not move. `/oidc/authorize` still
+    answers 302 to this page, this page still answers 302 to the client with a
+    `code`, and no discovery metadata changes — a browser flow is a browser flow,
+    and the number of fields in a form is not part of the protocol.
   contact:
     name: identity
     url: https://github.com/cafaye/identity
@@ -594,6 +612,17 @@ paths:
         path, sets the `__Host-session` cookie, and hands the browser to the
         authorize callback.
 
+        **The body is one of two shapes**, because the page is one operation with
+        two steps: `{state, email, password}` on the first, and `{state, code}` on
+        the second. Which one is expected is not in the request — it is in what the
+        browser holds. A correct password for an account with a second factor
+        returns the code form with a fresh `state` and a per-request challenge
+        cookie, and the session cookie is NOT set. A correct code returns the 302
+        below.
+
+        `code` is a TOTP code or a recovery code in the same field, and the page
+        never says which of the two a wrong value failed to be.
+
         A wrong password and an unregistered address are one 401 with one
         sentence. This is the most attractive enumeration oracle on the platform —
         unauthenticated, takes an email, and the first thing anybody types into it
@@ -606,17 +635,29 @@ paths:
           application/x-www-form-urlencoded:
             schema:
               type: object
-              required: [state, email, password]
+              required: [state]
               properties:
                 state:
                   type: string
-                  description: The value from the form, checked against the `__Host-` cookie.
+                  description: |
+                    The value from the form, checked against the `__Host-` cookie.
+
+                    Re-minted on every step. A sealed value still in the cookie
+                    after it has been spent is a CSRF token that works twice.
                 email:
                   type: string
                   format: email
+                  description: The password step only.
                 password:
                   type: string
                   format: password
+                  description: The password step only.
+                code:
+                  type: string
+                  description: |
+                    The second-factor step only. A six-digit TOTP code or a
+                    recovery code. Never echoed back, never logged, and never
+                    reflected into the page's own error text.
       responses:
         '302':
           description: |
@@ -625,22 +666,58 @@ paths:
           headers:
             Location:
               schema: { type: string, format: uri }
+        '200':
+          description: |
+            The second-factor step. The code form, redrawn with a fresh `state`.
+
+            A `200` and not an error: nothing has failed yet, the credentials were
+            right, and the authentication is unfinished — the same thing the
+            `POST /v1/session` 202 means, expressed as a page.
+          content:
+            text/html:
+              schema:
+                type: string
         '400':
           description: |
-            The state does not match the cookie, or the form is not JSON this page
+            The state does not match the cookie, or the form is not one this page
             accepts. A cross-site POST arrives here.
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
         '401':
-          description: Wrong password, or an address nobody is registered under.
+          description: |
+            A wrong password, an unregistered address, or a code that was not
+            accepted. The first two are one answer in one sentence; the third is
+            one answer in a different sentence, because it happens on the page
+            rather than in it.
+          content:
+            text/html:
+              schema:
+                type: string
+        '422':
+          description: The form was submitted with an empty address or password.
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
-        '422':
-          description: The form was submitted with an empty address or password.
+        '423':
+          description: |
+            Too many consecutive failures against this account. The page says how
+            long to wait; there is no `Retry-After` to read, because there is no
+            client here to read it.
+
+            This is the same lockout `POST /v1/session` uses, on the same counter,
+            so a user who trips it on the login page trips it in the API too.
+          content:
+            text/html:
+              schema:
+                type: string
+        '503':
+          description: |
+            The page is unreachable: this deployment has no `MFA_ENCRYPTION_KEY`,
+            so it cannot verify the code it is being asked for. It fails closed
+            and says why.
           content:
             application/problem+json:
               schema:

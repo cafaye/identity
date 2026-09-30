@@ -13,6 +13,7 @@ import (
 	"github.com/alexedwards/argon2id"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/cafaye/identity/internal/mfa"
 	"github.com/cafaye/identity/internal/outbox"
 	"github.com/cafaye/identity/internal/platform/clock"
 	"github.com/cafaye/identity/internal/platform/db"
@@ -28,9 +29,19 @@ import (
 
 func newIntegrationService(t *testing.T) (*Service, *pgxpool.Pool, *clock.Fake) {
 	t.Helper()
+	svc, pool, clk, _ := newIntegrationServiceWithMFA(t)
+	return svc, pool, clk
+}
+
+// newIntegrationServiceWithMFA is newIntegrationService and also hands back the
+// second-factor service, so the tests that need to ENROLL a user can reach it
+// without building a second, differently-wired copy of the same things.
+func newIntegrationServiceWithMFA(t *testing.T) (*Service, *pgxpool.Pool, *clock.Fake, *mfa.Service) {
+	t.Helper()
 
 	pool := dbtest.Schema(t)
 	clk := clock.NewFake(start)
+	second := realSecondFactor(t, pool, clk)
 
 	svc := NewService(
 		db.TxRunner{Pool: pool},
@@ -39,13 +50,14 @@ func newIntegrationService(t *testing.T) (*Service, *pgxpool.Pool, *clock.Fake) 
 		sessions.NewStore(pool),
 		outbox.NewStore(pool),
 		realTenancy(pool, clk),
+		second,
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),
 		clk,
 		24*time.Hour,
 	)
-	return svc, pool, clk
+	return svc, pool, clk, second
 }
 
 func TestIntegrationRegisterCommitsTheUserAndTheEventTogether(t *testing.T) {
@@ -258,6 +270,7 @@ func TestIntegrationLockIsVisibleToAnotherServiceInstance(t *testing.T) {
 		sessions.NewStore(pool),
 		outbox.NewStore(pool),
 		realTenancy(pool, clock.NewFake(start)),
+		realSecondFactor(t, pool, clock.NewFake(start)),
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),
@@ -300,6 +313,7 @@ func TestIntegrationRegisterIsAtomicWhenTheEventIsRejected(t *testing.T) {
 		// both events have to disappear together.
 		failingEvents,
 		realTenancy(pool, clock.NewFake(start)),
+		realSecondFactor(t, pool, clock.NewFake(start)),
 		users.NewHasherWithParams(&argon2id.Params{
 			Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 		}),

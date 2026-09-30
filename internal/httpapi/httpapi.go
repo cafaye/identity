@@ -34,6 +34,12 @@ type options struct {
 	tenancy          Tenancy
 	oidc             OIDC
 	oidcClients      OIDCClients
+	// mfa is the MANAGEMENT surface — the routes that read and write a TOTP secret.
+	// It needs MFA_ENCRYPTION_KEY and is absent without it.
+	//
+	// The login's second step is NOT here: it goes through Auth, because
+	// auth.Service is where a session is minted. See the note in mfa.go.
+	mfa MFAManage
 }
 
 // Option customises the handler built by New.
