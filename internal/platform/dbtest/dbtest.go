@@ -122,7 +122,7 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if _, err := pool.Exec(ctx, `TRUNCATE TABLE outbox_events, connected_accounts, sessions, account_invitations, account_users, accounts, users CASCADE`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE mfa_challenges, mfa_used_totp_steps, mfa_recovery_codes, mfa_credentials, oidc_access_tokens, oidc_auth_requests, oidc_clients, outbox_events, connected_accounts, sessions, account_invitations, account_users, accounts, users CASCADE`); err != nil {
 		t.Fatalf("truncating: %v", err)
 	}
 }
@@ -146,9 +146,10 @@ func Reset(t *testing.T, pool *pgxpool.Pool) {
 // stay in step with them.
 //
 // 00009 added three more tables and no new enum type, so the two CREATE TYPE
-// statements below are still the whole list. A registration's grant types and
-// scopes are text arrays validated in Go, because those closed sets are a code
-// fact — adding a scope must not be a migration.
+// statements below are still the whole list. 00010 added four more and no enum
+// either. A registration's grant types and scopes are text arrays validated in Go,
+// because those closed sets are a code fact — adding a scope must not be a
+// migration.
 func Schema(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
@@ -235,6 +236,22 @@ func Schema(t *testing.T) *pgxpool.Pool {
 			FOREIGN KEY (client_row_id) REFERENCES ` + schema + `.oidc_clients (id) ON DELETE CASCADE`,
 		`ALTER TABLE ` + schema + `.oidc_access_tokens ADD CONSTRAINT oidc_access_tokens_subject_fkey
 			FOREIGN KEY (subject) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
+		// The MFA tables. No enum types, no AAD, nothing the LIKE clause cannot
+		// copy; the three foreign keys below point at the private schema rather
+		// than at public.users, which is the whole reason they are written out
+		// instead of inherited.
+		`CREATE TABLE ` + schema + `.mfa_credentials (LIKE public.mfa_credentials INCLUDING ALL)`,
+		`CREATE TABLE ` + schema + `.mfa_recovery_codes (LIKE public.mfa_recovery_codes INCLUDING ALL)`,
+		`CREATE TABLE ` + schema + `.mfa_used_totp_steps (LIKE public.mfa_used_totp_steps INCLUDING ALL)`,
+		`CREATE TABLE ` + schema + `.mfa_challenges (LIKE public.mfa_challenges INCLUDING ALL)`,
+		`ALTER TABLE ` + schema + `.mfa_credentials ADD CONSTRAINT mfa_credentials_user_id_fkey
+			FOREIGN KEY (user_id) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.mfa_recovery_codes ADD CONSTRAINT mfa_recovery_codes_credential_id_fkey
+			FOREIGN KEY (credential_id) REFERENCES ` + schema + `.mfa_credentials (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.mfa_used_totp_steps ADD CONSTRAINT mfa_used_totp_steps_credential_id_fkey
+			FOREIGN KEY (credential_id) REFERENCES ` + schema + `.mfa_credentials (id) ON DELETE CASCADE`,
+		`ALTER TABLE ` + schema + `.mfa_challenges ADD CONSTRAINT mfa_challenges_user_id_fkey
+			FOREIGN KEY (user_id) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
 	}
 	for _, stmt := range stmts {
 		if _, err := admin.Exec(ctx, stmt); err != nil {

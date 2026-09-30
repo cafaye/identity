@@ -45,18 +45,15 @@ var (
 	ErrUnauthenticated = errors.New("authentication required")
 )
 
-// LockedError is a login refused because the account is locked. It is a distinct
-// type because the response has to say how long to wait, and because revealing a
-// lock *does* confirm the account exists — which is why the 423 is the one place
-// login is allowed to leak that much.
-type LockedError struct {
-	// RetryAfter is how much longer the caller must wait. Never negative.
-	RetryAfter time.Duration
-}
-
-func (e *LockedError) Error() string {
-	return fmt.Sprintf("account is locked; retry after %s", e.RetryAfter)
-}
+// LockedError is a login refused because the account is locked.
+//
+// It is an ALIAS, not a type of its own. The type lives in internal/sessions
+// because the second factor's lockout is the same shape — same policy, same
+// response, one 423 — and the HTTP layer matches the type rather than the source
+// so that a caller who exhausts five TOTP guesses and a caller who exhausts five
+// passwords are told the same thing. Declaring it here as well would give the
+// layer two types to match and a bug the day it matched the wrong one.
+type LockedError = sessions.LockedError
 
 // DefaultSessionTTL is how long a session lasts when nothing overrides it.
 const DefaultSessionTTL = 30 * 24 * time.Hour

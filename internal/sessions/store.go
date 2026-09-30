@@ -112,6 +112,27 @@ func (s *Store) Revoke(ctx context.Context, q db.Querier, sessionID id.UUID) err
 	return nil
 }
 
+// RevokeAllForUser deletes every session belonging to a user, in one statement.
+//
+// It exists for the two events in this service that mean "a session that was
+// already in somebody's browser is no longer a credential": MFA being enabled
+// and MFA being disabled. Both are answers to the same question — a session minted
+// under the old security posture should not outlive the change — and both would
+// otherwise need a SELECT followed by a DELETE per row, in a loop, inside the
+// transaction that made the change. A loop is a partial write waiting to happen.
+//
+// Revoking zero sessions is a success, not an error. A user who has never signed
+// in, and a user whose last session expired an hour ago, are both in the state
+// this is called for and both are already where it wants them to be.
+func (s *Store) RevokeAllForUser(ctx context.Context, q db.Querier, userID id.UUID) error {
+	const query = `DELETE FROM sessions WHERE user_id = $1`
+
+	if _, err := q.Exec(ctx, query, userID); err != nil {
+		return fmt.Errorf("deleting a user's sessions: %w", err)
+	}
+	return nil
+}
+
 // nullString turns an empty user agent into SQL NULL. An empty string and "not
 // recorded" are the same answer here, and NULL is the one that says so.
 func nullString(s string) any {
