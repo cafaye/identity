@@ -63,6 +63,24 @@ Direct dependencies, each with a cause:
   step matched), how long a code is accepted, and whether a step has been spent.
   It brings `github.com/boombuler/barcode` indirectly, for a QR-code method this
   service does not call. Arrives with the MFA packet.
+- `github.com/oapi-codegen/runtime` — **for the generated client only, and this is
+  the one that corrects MD6.** MD6 said the Go client "reaches `identity`'s existing
+  stack with no new dependency at runtime", on the grounds that oapi-codegen is a
+  `go:generate` tool rather than a library a user imports. **The GENERATOR is right
+  and is not a dependency**: the `//go:generate` line is pinned to `v2.8.0` and
+  `go run <module>@<version>` resolves in module-aware mode, so oapi-codegen never
+  appears in `go.mod` at all. **The code it EMITS is a dependency**, and it imports
+  this module for parameter binding and for its `UUID` and `Email` types. That brings
+  two more (`apapsch/go-jsonmerge/v2` and `google/uuid`), so three in total.
+
+  **None of the three reaches the service's binary.** `client/` is not imported by
+  `./cmd/identity` and never should be: a service that called its own API over HTTP
+  would add a network hop to itself and depend on a client to do what its own stores
+  already do. `go list -deps ./cmd/identity | grep oapi-codegen` is empty, and
+  `TestTheServiceBinaryDoesNotReachTheGeneratedClient` holds that as a check rather
+  than a claim. The full reasoning, including what it costs the coverage floor, is
+  [DECISIONS.md](DECISIONS.md) D2.
+
 - `go-jose/v4` — **forced, not chosen.** `op.SigningKey` returns a
   `jose.SignatureAlgorithm` and `op.Key.Key()` holds a `jose` key, so the
   library's storage interface cannot be implemented without importing it. It
@@ -699,6 +717,7 @@ internal/oauth/        the social-login client side: state, token cipher, regist
 internal/outbox/       transactional event envelope, SKIP LOCKED claim, publisher
 internal/platform/db/  the pgx pool, and the readiness ping
 internal/platform/ci/  the test that keeps .github/workflows/ci.yml honest
+client/               THE GO CLIENT — a generated transport and the wrapper over it
 migrations/            goose SQL files
 ```
 
@@ -706,6 +725,71 @@ migrations/            goose SQL files
 but process lifetime: everything testable lives in `internal/`, and the pieces
 `main` does own — the socket, the drain, the signal handling — are in an `app`
 type that the tests drive directly.
+
+`client/` is the one directory that is not under `internal/`, and that is the whole
+reason for it: **`internal/` is by definition unimportable, and a client no consumer
+can import is not a client.** It is not reachable from `./cmd/identity` either, which
+is what keeps the client's dependencies out of the service's binary.
+
+## The Go client
+
+`client/` is the third of the fleet's clients, after `cafaye-ts` and `cafaye-py`, and
+the one where the generator is right. Two layers, and the split is MD6's:
+
+```
+client/generated/api.gen.go   GENERATED, COMMITTED. oapi-codegen v2.8.0 over
+                              openapi/v1.yaml: 20 typed operations and a Client
+client/generate.go            the //go:generate line, pinned to v2.8.0
+client/oapi-codegen.yaml      the generator's configuration
+client/transport.go           the interface the generated client satisfies
+client/client.go              the hand-written client: 20 typed methods
+client/credentials.go         which credential this is, and where it may be sent
+client/baseurl.go             where requests go, in a documented order
+client/errors.go              RFC 9457 problem to typed error, typed fallback
+client/redact.go              the scrubber, and the all-or-nothing rule
+client/safetolog.go           a redacting formatter for the generated secret types
+```
+
+**Why Go generates and Python does not is a ruling, not an accident**, and it is
+written down in [DECISIONS.md](DECISIONS.md) D2 so the next person does not read the
+inconsistency as a mistake. In short: Go has a mature OpenAPI 3.1 generator whose
+output is ordinary Go — structs, an interface, an `*http.Response` — so generation is
+a build-time concern. Python's generators impose a runtime one: hey-api's is v0.0.24
+and emits parameterless methods with unsubstituted path templates, and
+openapi-generator's Python output is beta on 3.1 and inverts `const` discriminants to
+`any`. A hand-written Python client has the smaller attack surface, and it is not a
+close call.
+
+**Four things the wrapper owns**, because the generated client cannot: which credential
+this is, where requests go, RFC 9457 mapping, and being the public surface.
+
+**Base URLs have no default.** `ResolveBaseURL` consults, in order: the `BaseURL`
+option, `$CAFAYE_IDENTITY_BASE_URL`, `$CAFAYE_BASE_URL`, and then **throws**. The
+document's own `servers:` entry is deliberately not a default — it would send a
+self-hoster's traffic to somebody else's deployment and it would *succeed*, so nothing
+would look wrong until somebody read a log.
+
+**A credential reaches no string a human reads.** Every string the client builds out
+of anything a caller or a service supplied goes through `Redactor.String`, redaction is
+all-or-nothing, and the credential lives inside **closures** rather than in struct
+fields — `fmt` prints an exported field by value under `%#v`, and that verb does not
+consult `String()`, so a `token string` field is a leak no method can intercept.
+
+**An unknown problem code is a typed error**, so `errors.As(err, &ProblemError)` works
+against every code including the four this document already describes that core's
+reserved list does not have.
+
+**Regenerating is a gate, not a suggestion:**
+
+```sh
+go generate ./client/     # writes client/generated/api.gen.go
+```
+
+`TestTheCommittedGeneratedFileIsWhatThePinnedGeneratorProduces` runs that same
+generator over the same document into a temporary directory and fails when the
+committed file differs, and CI fails the build when four named security tests do not
+PASS by name — among them the credential-leak test, the unknown-problem-code test, the
+regeneration gate and the lint-exclusion narrowness check.
 
 ## Testing
 

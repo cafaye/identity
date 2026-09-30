@@ -492,7 +492,12 @@ jobs:
             TestNewAppWithoutMFAKeyMountsNoManagementRoutesAndStillChallenges \
             TestConfirmingRevokesEverySessionIssuedBeforeMFA \
             TestOIDCRedirectURINotOnTheAllowList \
-            TestEveryRouteIsInTheMatrix; do
+            TestEveryRouteIsInTheMatrix \
+            TestTheClientNeverPrintsACredential \
+            TestTheGeneratedSecretBearingTypesAreSafeToPrint \
+            TestAnUnknownProblemCodeStillProducesATypedError \
+            TestTheCommittedGeneratedFileIsWhatThePinnedGeneratorProduces \
+            TestTheLintExclusionIsOneFileAndNotAPrefix; do
             # The trailing " (" is what makes this exact: `--- PASS: TestFooBar`
             # must not satisfy a check written for `TestFoo`, and go test always
             # puts the duration after the name.
@@ -697,7 +702,7 @@ jobs:
             echo "| \`goose up\` before any test | 10 migrations applied | \`apply the migrations\` |"
             echo "| whole suite (\`bin/prime\`, then \`-v -race\`) | ${SUITE_FLOOR} PASS lines, 0 SKIP | tier step |"
             echo "| database tier, derived from \`dbtest.\` | ${DATABASE_TIER_FLOOR} PASS lines, 0 SKIP | tier step |"
-            echo "| MFA, session and matrix tests | 23 named, each PASS | security step |"
+            echo "| MFA, session, matrix and client-leak tests | 28 named, each PASS | security step |"
             echo "| \`go vet ./...\` | clean | vet |"
             echo "| \`gofmt -l .\` | empty | gofmt |"
             echo "| \`go.mod\`, \`go.sum\` | no diff after the gate | lockfile |"
