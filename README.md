@@ -116,6 +116,16 @@ service quietly listening on the wrong port.
 
 | Route | Response | Meaning |
 |---|---|---|
+| `POST /v1/accounts` | `201 {…}` | Create an account. **Not in `openapi/v1.yaml` — see the gap below.** |
+| `GET /v1/accounts` | `200 [{…}]` | The accounts this **user** belongs to. **Not in `openapi/v1.yaml` — see the gap below.** |
+| `GET /v1/accounts/:id` | `200 {…}` | One account. **Not in `openapi/v1.yaml` — see the gap below.** |
+| `PATCH /v1/accounts/:id` | `200 {…}` | Rename. **Not in `openapi/v1.yaml` — see the gap below.** |
+| `DELETE /v1/accounts/:id` | `204` | Delete, with everything under it. **Not in `openapi/v1.yaml` — see the gap below.** |
+| `GET /v1/accounts/:id/members` | `200 [{…}]` | The account's members. **Not in `openapi/v1.yaml` — see the gap below.** |
+| `POST /v1/accounts/:id/invitations` | `201 {…}` | Invite somebody. **Not in `openapi/v1.yaml` — see the gap below.** |
+| `PATCH /v1/accounts/:id/members/:userId` | `200 {…}` | Change a role. **Not in `openapi/v1.yaml` — see the gap below.** |
+| `DELETE /v1/accounts/:id/members/:userId` | `204` | Remove somebody. **Not in `openapi/v1.yaml` — see the gap below.** |
+| `POST /v1/invitations/accept` | `200 {…}` | Accept an invitation, signed in as the invited user. **Not in `openapi/v1.yaml` — see the gap below.** |
 | `GET /healthz` | `200 {"status":"ok"}` | Liveness. Always 200 while the process serves — it never touches a dependency, so a database outage cannot get the process restarted out from under in-flight work. |
 | `GET /readyz` | `200 {"status":"ok","deps":"postgres"}` | Readiness. 200 when every dependency answers, `503 {"status":"unavailable",...}` otherwise, with each probe bounded at 2s. |
 | `POST /v1/users` | `201 {"id","email"}` | Register. `409 conflict` if the address is taken, `422 validation_failed` with `errors[]` on a bad field, `400 invalid_json` on a malformed body, `413 payload_too_large` past 4 KB. |
@@ -142,6 +152,28 @@ Every non-2xx is `application/problem+json` per core's error envelope, including
 `404` and `405`. The `trace_id` in the body always matches the `X-Trace-Id`
 response header, and internal failures are logged with that id rather than
 described to the caller.
+
+### **The table above is bigger than the OpenAPI document, and that is a known gap**
+
+The ten rows marked *"Not in `openapi/v1.yaml`"* are served, gated, in the
+authorization matrix and — for seven of them — carry a declared scope, and they
+appear in **no committed document**. Neither `openapi/v1.yaml` nor
+`openid/openid.yaml` describes them, and before this packet they were not in this
+table either. Two OIDC operations are in the same position: `POST /oidc/authorize`
+and `POST /oidc/userinfo` are mounted deliberately, and `openid/openid.yaml`
+declares only the `GET` on each.
+
+`internal/httpapi/openapi_drift_test.go` is the check that found this, and it holds
+the documents to the router in both directions by **method and path**. It is
+recorded as **[D1](DECISIONS.md)** and the question is open: these are contract
+surface to document, or routes to rule out of the contract in writing. Until that
+is answered, `knownDrift` in that file holds all twelve, pinned so the list can
+neither grow nor be emptied — a new undocumented route is a failing test whether
+or not anybody remembers the file.
+
+What this means for a caller, plainly: **a client generated from this service's
+documents has no method for any of those twelve operations.** They work; they are
+just not in the menu. That is the gap, and it is the reason the check exists.
 
 The `/v1` routes exist only when `DATABASE_URL` is set. Without it they are
 absent, so a missing database is a clear `404` rather than a pile of `500`s.
@@ -695,9 +727,46 @@ Migrations are a deploy step, so they are not a test step — `goose up` is its 
 command above the suite, and a suite run against an unmigrated database fails
 loudly with `relation "public.users" does not exist` rather than skipping.
 
-With no `TEST_DATABASE_URL`: **776 PASS lines, 309 SKIP, and 1 FAIL** — the fail
-is `TestTheDatabaseTierActuallyRan`, and it is the point. With it:
-**1254 PASS lines, 0 SKIP, 0 FAIL**, 73.2% coverage, no data races under `-race`.
+With no `TEST_DATABASE_URL`: **961 PASS lines, 364 SKIP, and 2 FAIL** — both
+fails are `TestTheDatabaseTierActuallyRan`, one in `internal/mfa` and one in
+`internal/apikeys`, and both are the point. With it:
+**1544 PASS lines, 0 SKIP, 0 FAIL**, no data races under `-race`.
+
+(Those figures were measured on this tree. The numbers this section used to
+carry — 776/309/1 and 1254 — were already stale before the tripwire packet: at
+`bff6333`, the same commands gave 923/364/2 and 1506. A stale count in a
+document about what the suite proves is the same class of problem as a stale
+route list, so it is worth writing down that it happened.)
+
+### **The document-versus-router tripwire**
+
+`internal/httpapi/openapi_drift_test.go` is the check that holds
+`openapi/v1.yaml` and `openid/openid.yaml` to the router, in both directions, by
+**method and path** — never by count, because one operation added and one removed
+leaves the count alone. It is the last such check owed in the fleet, and it is the
+one that found the twelve undocumented operations described above.
+
+Four things about it are worth knowing before you touch a route:
+
+- **The method comes from chi's own walk of the tree `New` assembles**, never
+  from the path string. billing's first drift check compared paths and never
+  `route.verb`, so `PUT /v1/customers/{id}` was served in a money-handling
+  service with nothing written down about it — one path on each side, and the
+  comparison reported agreement. That shape is live here today.
+- **Both documents are read** and the union is the contract. Nine of the eleven
+  `/oidc/*` and `/.well-known/*` routes are documented in the sibling document,
+  so a check reading only `openapi/v1.yaml` would have had to declare all eleven
+  undocumented, which is false about nine of them.
+- **There is no prefix filter.** Every route is either in a document or named,
+  and a route that is neither fails the suite. `strings.HasPrefix(path, "/v1")`
+  is a guess about intent, and it cannot see a method.
+- **The document is parsed without a YAML dependency.** `go.mod` has none and
+  this adds none; the reader takes the `paths:` block by indentation, states the
+  subset it understands, and raises on every way it could under-read. Two empty
+  sets agree, and that is how a check over nothing goes green.
+
+So adding a route means adding its document entry, with an `operationId` — that
+is the name of the method on every generated client in the fleet. The gate says so.
 
 That difference is the only thing that tells "ran" from "skipped" from the
 outside, and the wall-clock is where it shows. Same command, same machine, only

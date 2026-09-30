@@ -159,6 +159,51 @@ documented is invisible to a generated client and a scope documented on a route
 that does not gate it is a promise this service does not keep. Both directions are
 walked by a test in `internal/httpapi`.
 
+**The documents are held to the router, in both directions, by method AND path.**
+`internal/httpapi/openapi_drift_test.go` is the check, and it is the last one
+missing in the fleet. Three things about it are not negotiable:
+
+- **The method is read from chi's own walk of the tree `New` assembles, never
+  inferred from a path.** billing's first drift check compared paths and never
+  `route.verb`, so `PUT /v1/customers/{id}` was served in a money-handling
+  service and written down nowhere — one path on each side, and the comparison
+  reported agreement. **This repository has that bug already**, in the shape of
+  `POST /oidc/authorize` and `POST /oidc/userinfo`, and the check is what finds
+  it. If you find yourself deriving a method from a path, you are writing the
+  check that already failed once.
+- **The comparison is over sets, never over counts.** One operation added and one
+  removed leaves the count alone and is a completely ordinary way for a document
+  to drift.
+- **There is no prefix filter, and `knownDrift` is not an exclusion list.** Every
+  route is either in a document or in `knownDrift`, and
+  `TestEveryServedRouteIsDocumentedOrNamed` fails on anything that is neither —
+  without that check the list is where the next forgotten route goes, and the
+  tripwire becomes decoration. `knownDrift` is pinned at its exact contents: it
+  **cannot grow** (that is how a check gets made green by not checking) and
+  **cannot be emptied** (that is somebody deleting the list instead of fixing the
+  routes). Shrinking it is the only legal change, and it happens by documenting
+  an operation. It currently holds twelve routes and is open as D1 in
+  [DECISIONS.md](DECISIONS.md).
+
+The check reads **both** documents and treats the union as the contract. That is
+not tidiness: nine of the eleven `/oidc/*` and `/.well-known/*` routes are
+documented, in `openid/openid.yaml`, so a check reading only `openapi/v1.yaml`
+would have to declare all eleven "not client operations" — false about nine of
+them, and a list of omissions is where a false claim does the most damage.
+
+**A document is read by a reader that refuses rather than under-reads, and the
+reader has no YAML dependency behind it.** `go.mod` has none and this stays true:
+a library already in the module graph as a *transitive* dependency of
+`zitadel/schema` would become this service's direct requirement, with its
+versions and its CVEs, for the sake of forty lines of structure. So
+`openapi_reader_test.go` reads the `paths:` block by indentation, states the
+subset it understands, and turns every way it could come back with less than it
+should — no `paths:`, an empty block, a path item with no operation, two
+operations that normalise onto one, a missing file — into an error. **A reader
+that finds nothing agrees with another reader that finds nothing, and that is how
+a check over nothing goes green.** A new test in that file is a test of the
+rule the reader applies, not of a document.
+
 **Stubs stay honest.** A packet that is not written yet is absent, not a
 `not implemented` fake that looks finished. The README's "Not built yet" list is
 the source of truth for what v0 does not claim. A method the library's interface
@@ -224,6 +269,14 @@ the toolchain pin matches `go.mod`, and that no secret is written down.
 3. Add the row to the README endpoint table, and to `openapi/v1.yaml` or
    `openid/openid.yaml` depending on which surface it is on. Both validate
    against OpenAPI 3.1 and `caf contract lint` validates the manifest.
+   **The document entry is not optional and not a follow-up**:
+   `TestEveryServedRouteIsDocumentedOrNamed` reads the route out of the router
+   and fails when no document describes it, so a handler merged without its
+   document entry does not go green — and `TestEveryOperationHasAnOperationId`
+   fails if you forget the `operationId`, which is the name of the method on
+   every generated client in the fleet. If the operation is genuinely not
+   contract surface, that is a decision to record in the document and the
+   README, not a route to drop into a list.
 4. If it needs a dependency, add a `Check` to the slice `newApp` builds — never a
    bespoke health path.
 5. An account-scoped route goes in `registerTenancyRoutes` AND gets a row in
@@ -234,4 +287,4 @@ the toolchain pin matches `go.mod`, and that no secret is written down.
    matrix's fixture names its accounts with a counter and not with the test path,
    because `accounts.Slugify` truncates at 63 characters and two long names that
    share a prefix become one slug.
-6. `bin/prime`, `go vet ./...`, `gofmt -l .`.
+6. `bin/prime`, `go vet ./...`, `gofmt -l .`, `go test -race ./...`.

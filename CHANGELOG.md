@@ -8,6 +8,74 @@ All notable changes to identity are recorded here. The format follows
 
 ### Added
 
+- **The document-versus-router tripwire**, the last one owed in the fleet.
+  `internal/httpapi/openapi_drift_test.go` holds `openapi/v1.yaml` and
+  `openid/openid.yaml` to the router in **both directions**, comparing sets of
+  **(method, path)** and never counts.
+
+  - **It fires on its first run: twelve operations are served and written down in
+    no document.** The ten tenancy operations — the whole `/v1/accounts`
+    collection, `/v1/accounts/{account_id}/members`,
+    `/v1/accounts/{account_id}/invitations` and `/v1/invitations/accept` — are
+    served since the accounts packet and appear in neither document nor the
+    README's endpoint table. They are all in the authorization matrix and seven
+    declare a scope, so they are gated and unrecorded as contract surface at the
+    same time. And `POST /oidc/authorize` and `POST /oidc/userinfo` are served
+    deliberately — `registerOIDCRoutes` says why in a comment — while
+    `openid/openid.yaml` declares only the `GET`.
+
+    **The second pair is billing's bug, already here.** billing's first drift
+    check compared paths and never `route.verb`, so `PUT /v1/customers/{id}` was
+    served in a money-handling service and written down nowhere: one path on each
+    side, and the comparison reported agreement. The same shape is live on this
+    service's OIDC surface, and the (method, path) key is what sees it.
+
+    This packet adds a check and not operations, and calling twelve served
+    routes "not client operations" would be false about all twelve, so they sit
+    in `knownDrift` — named for what it is rather than for what it excuses, and
+    pinned so it can neither grow nor be emptied. **Open as D1 in
+    [DECISIONS.md](DECISIONS.md),** which is this repository's first; the
+    question is whether these are contract surface to document or routes to rule
+    out of the contract in writing, and this packet does not pick a side.
+  - **The method is read from chi's own walk**, of the tree `New` assembles, and
+    never inferred from a path. `New` now builds the mux through a `newMux`
+    helper so the walk reads the production assembly rather than a second one
+    written out in a test. Registering the same pattern under two methods is
+    invisible to a path comparison and to a count comparison, and is the bug that
+    has already cost billing one.
+  - **A route that is neither documented nor named is a failure**, so the list
+    cannot become the place a forgotten route goes. There is no prefix filter:
+    `strings.HasPrefix(path, "/v1")` is a guess about intent and cannot see a
+    method, which is exactly what let billing's `PUT` through.
+  - **No exclusion list is needed, and `TestTheProbesAreDocumentedRatherThan-
+    Excluded` holds that it is not needed.** `/healthz` and `/readyz` are
+    documented here, under `liveness` and `readiness` — which is identity's
+    answer to core's open D25, not a decision about it — and nine of the eleven
+    `/oidc/*` and `/.well-known/*` routes are documented in the sibling
+    document, so reading both is what keeps them out of a list of omissions that
+    would have been false about nine of them. chi registers no error-handler
+    route: `NotFound` and `MethodNotAllowed` are handlers, not routes.
+  - **The document is read without a YAML dependency.** `go.mod` has none and
+    this adds none; a library already in the module graph as a *transitive*
+    dependency of `zitadel/schema` would become this service's direct
+    requirement, with its versions and its CVEs, for the sake of forty lines of
+    structure. The reader takes the `paths:` block by indentation, states the
+    subset it understands, and turns every way it could under-read — no
+    `paths:`, an empty block, a path item with no operation, two operations
+    normalising onto one, a missing file — into an error, because two empty sets
+    agree and that is how a check over nothing goes green.
+  - **The tripwire is proved red four ways** in
+    `openapi_reader_faults_test.go`, and the load-bearing one registers a second
+    method on an already-documented path: the path set is then identical on both
+    sides and both counts unchanged, and only the (method, path) key catches it.
+- **[DECISIONS.md](DECISIONS.md)** — this repository's open-decision record,
+  numbered from D1. It did not exist: `moon/DECISIONS.md` numbers workspace
+  questions `MD…` and `cafaye.yml` carries the one callout this repository had.
+  A packet that had to escalate something had nowhere to put it. A `DECISION
+  NEEDED` callout for D1 is added to `cafaye.yml` as well, because
+  `exposes.api` promises a document describes this service's HTTP surface and for
+  twelve operations it does not.
+
 - `.github/workflows/ci.yml` — CI, in two halves. `ci (kit: go)` calls
   `cafaye/kit/.github/workflows/ci.reusable.yml@master` for the shared half.
   `gate` is the service-specific half: Postgres 17.11 as a job service, `goose up`
