@@ -231,6 +231,10 @@ func (m markerQuerier) Exec(context.Context, string, ...any) (pgconn.CommandTag,
 
 func (m markerQuerier) QueryRow(context.Context, string, ...any) pgx.Row { return nil }
 
+func (m markerQuerier) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, errors.New("markerQuerier returns no rows")
+}
+
 // fakeReader hands out a marker querier for statements that need no transaction,
 // so a test can tell a read from a write inside the registration transaction.
 type fakeReader struct{ q db.Querier }

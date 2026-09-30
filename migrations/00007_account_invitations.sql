@@ -89,22 +89,37 @@ CREATE TABLE account_invitations (
     -- An invitation that is already past its expiry at insert time is a bug in the
     -- caller rather than a state worth storing, and it would be indistinguishable
     -- from a legitimate expired one when redeemed.
+    --
+    -- There is deliberately NO equivalent constraint on accepted_at. expires_at is
+    -- the caller's clock plus seven days, so there is a week of margin against any
+    -- drift between this process and the server. accepted_at is the caller's clock
+    -- right now, compared against a created_at the server stamped: any host whose
+    -- clock runs even slightly behind Postgres fails every redemption with a 500 on
+    -- a constraint nobody asked for. The invariant actually worth having --
+    -- accepted_at is only ever set once -- is enforced by the conditional UPDATE in
+    -- Store.MarkInvitationAccepted, which is the one place it can be enforced
+    -- atomically.
     CONSTRAINT account_invitations_expires_after_creation
-        CHECK (expires_at > created_at),
-
-    -- accepted_at is either absent or at or after the row was created. A clock
-    -- that goes backwards mid-transaction should not produce a redemption that
-    -- predates the invitation.
-    CONSTRAINT account_invitations_accepted_after_creation
-        CHECK (accepted_at IS NULL OR accepted_at >= created_at)
+        CHECK (expires_at > created_at)
 );
 
 -- Redemption looks the invitation up by digest. This index is that lookup.
 CREATE UNIQUE INDEX account_invitations_token_digest_key ON account_invitations (token_digest);
 
--- "Who is still waiting for this account" and "has this address already been
--- invited to this account" both filter on (account_id, accepted_at IS NULL).
-CREATE INDEX account_invitations_pending_idx ON account_invitations (account_id) WHERE accepted_at IS NULL;
+-- "Which addresses has this account already invited, and is any of them still
+-- pending" is both a listing and a duplicate check, so the index is UNIQUE on
+-- (account_id, email) and partial on the pending rows.
+--
+-- Partial rather than a full unique constraint on (account_id, email), because a
+-- full one would make an account permanently un-invitable: accepting an
+-- invitation consumes it, and without the partial predicate the address could
+-- never be invited again. The predicate is what makes "one *pending* invitation
+-- per address" the rule rather than "one invitation ever".
+--
+-- The account_id leading column also covers "who is still waiting for this
+-- account" as a prefix, which is why there is no separate index for the listing.
+CREATE UNIQUE INDEX account_invitations_pending_idx
+	ON account_invitations (account_id, email) WHERE accepted_at IS NULL;
 
 -- +goose Down
 
