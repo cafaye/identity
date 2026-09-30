@@ -463,7 +463,7 @@ command above the suite, and a suite run against an unmigrated database fails
 loudly with `relation "public.users" does not exist` rather than skipping.
 
 With no `TEST_DATABASE_URL`: **759 PASS lines, 309 SKIP**. With it:
-**1237 PASS lines, 0 SKIP**. `internal/accounts` goes from 0.9s to ~36s and
+**1254 PASS lines, 0 SKIP**. `internal/accounts` goes from 0.9s to ~36s and
 `internal/httpapi` from 3.3s to ~69s, and that difference is the only thing that
 tells "ran" from "skipped" from the outside.
 

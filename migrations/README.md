@@ -4,8 +4,7 @@ Schema for `identity`, as goose SQL files. One migration per file, named
 `NNNNN_snake_case_description.sql`, applied in filename order.
 
 `goose` is **not** a module dependency of this repository — it is a command line
-tool, installed separately, so nothing in `go.sum` moves when it changes. No
-migration has been written yet: `00001_init.sql` is the convention marker.
+tool, installed separately, so nothing in `go.sum` moves when it changes.
 
 ## The convention
 
@@ -75,11 +74,18 @@ waits for it to report healthy, so the database is accepting connections before
 the service comes up:
 
 ```sh
-docker compose up -d postgres
+docker compose up -d --wait postgres
 docker compose exec postgres pg_isready -U identity
 goose -dir migrations postgres "$DATABASE_URL" up
 TEST_DATABASE_URL="$DATABASE_URL" go test ./...   # runs the integration tests
 ```
+
+`goose up` is a **deploy step and is above the suite**, never part of the same
+command. A suite run against an unmigrated database fails on
+`relation "public.users" does not exist` — loud, but it reads like a bug in the
+code rather than a pipeline that is wired wrong, and that is the whole reason the
+two are separate commands. [CI](../.github/workflows/ci.yml) runs them as two
+steps in that order and asserts the order.
 
 `docker-compose.yml` publishes Postgres on host port 5432. If something already
 listens there — a local Postgres install is the common case — the compose port
@@ -88,9 +94,11 @@ bind fails, or a host-side DSN silently reaches the *other* server and fails wit
 `DATABASE_URL` and `TEST_DATABASE_URL` at the port the compose stack actually
 got, not at the one you assumed.
 
-`TEST_DATABASE_URL` is what gates the two tests that need a real server
-(`TestOpenAndPingIntegration`, `TestOpenAppliesConfiguredPoolSize`). Without it
-those tests skip and the suite stays green on a bare runner.
+`TEST_DATABASE_URL` gates **most of the suite**, not two tests: eleven of the
+fifteen packages open a pool. Without it they skip, and
+`internal/mfa`'s `TestTheDatabaseTierActuallyRan` fails rather than skips, so
+`go test ./...` is red without it. That is deliberate — see the Testing section
+of the [README](../README.md).
 
 ## Prod
 

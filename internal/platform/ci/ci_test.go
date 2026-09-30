@@ -40,6 +40,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -355,6 +356,59 @@ func TestTheLockfileGuardExists(t *testing.T) {
 		"nothing here would say so")
 }
 
+// TestEveryRunBlockIsValidShell is the regression test for a defect that shipped
+// into this file once, and it is here because nothing else in this package could
+// have caught it.
+//
+// The awk program that counts PASS lines per package sat inside a shell
+// single-quoted string, and the comment above it inside that string contained an
+// apostrophe. That closed the quote early, the shell re-parsed the rest of the
+// program as commands, and the step died on a syntax error — in the one step of
+// the job that exists to prove the database tier ran. Every other test in this
+// file read the workflow as text and passed: the text is well formed, and it
+// means something other than what it appears to mean. The workflow had never been
+// executed, which is the same defect as an untested suite, one level further out.
+//
+// So the blocks are parsed. GitHub runs a `run:` step on a Linux runner under
+// `bash -e`, and this file uses a herestring, so bash is the shell these blocks
+// are written for and the shell they are checked with. A machine with no bash can
+// run neither this workflow nor `bin/prime`, so that is a failure here rather
+// than a skip — a skip is precisely how a check that never ran comes to be
+// counted as one that did.
+func TestEveryRunBlockIsValidShell(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Fatalf("bash is not on PATH, so no `run:` block in .github/workflows/ci.yml can be parsed.\n"+
+			"GitHub runs these under bash and bin/prime is a shell script, so a machine\n"+
+			"without bash can run neither this workflow nor this repository's gate: %v", err)
+	}
+
+	dir := t.TempDir()
+	checked := 0
+	for _, job := range jobNames(t) {
+		for i, script := range stepScripts(t, job) {
+			// `bash -n` parses without executing, so nothing in these blocks runs
+			// here: no database, no network, no /dev/urandom, no process bound.
+			path := filepath.Join(dir, "step.sh")
+			if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+				t.Fatalf("writing the run block of job %q, block %d: %v", job, i+1, err)
+			}
+			if out, err := exec.Command(bash, "-n", path).CombinedOutput(); err != nil {
+				t.Errorf("job %q, run block %d, is not valid bash: %v\n%s\n"+
+					"An apostrophe inside a single-quoted region — an awk program, a sed\n"+
+					"script, a grep pattern — ends the quoting, and the shell re-parses the\n"+
+					"rest as commands. Keep prose out of quoted programs and in shell\n"+
+					"comments above them, where an apostrophe costs nothing.",
+					job, i+1, err, out)
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Error("no `run:` block was found in either job, so this parsed nothing and passed for the wrong reason")
+	}
+}
+
 // TestNoSecretIsWrittenDown. MFA_ENCRYPTION_KEY and OIDC_SIGNING_KEY are read
 // from the environment and never generated (AGENTS.md: a key generated at boot
 // publishes a document no caching verifier has seen, and every restart would
@@ -438,9 +492,11 @@ func TestTheNamedSecurityTestsExist(t *testing.T) {
 
 // TestTheNamedSecurityTestsAreEnough is deliberately a floor, not a list. It
 // cannot know which of this repository's tests are the ones that matter, so it
-// asserts the four properties that would be catastrophic to lose quietly: a TOTP
+// asserts six properties that would be catastrophic to lose quietly: a TOTP
 // step cannot be spent twice, a recovery code is single-use, a session token is
-// never stored raw, and a deployment with no key fails closed.
+// never stored raw, a secret sealed under one key does not open under another, a
+// deployment with no key fails closed, and the tier that proves all of this
+// actually ran.
 func TestTheNamedSecurityTestsAreEnough(t *testing.T) {
 	named := strings.Join(namedInWorkflow(t), " ")
 	for _, property := range []struct{ subject, example string }{
@@ -592,6 +648,22 @@ func stepScripts(t *testing.T, job string) []string {
 	}
 	flush()
 	return scripts
+}
+
+// jobNames is every job in the workflow, read at two-space indent. stepScripts
+// needs a job name, and a check that only ever looked at the `gate` job would
+// miss a quoting bug in any other one.
+func jobNames(t *testing.T) []string {
+	t.Helper()
+
+	declared := regexp.MustCompile(`^  ([a-z][a-z0-9-]*):\s*$`)
+	var names []string
+	for _, line := range workflowLines(t) {
+		if m := declared.FindStringSubmatch(line); m != nil {
+			names = append(names, m[1])
+		}
+	}
+	return names
 }
 
 func serviceImages(t *testing.T) map[string]string {

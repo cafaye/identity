@@ -48,14 +48,16 @@ All notable changes to identity are recorded here. The format follows
     `services`/`env` seam, and not before on the strength of a green run.
 - `internal/platform/ci` — the test for the workflow file. `.github/workflows/ci.yml`
   is the artifact under test, and a workflow nobody has executed is a workflow
-  nobody has tested. Sixteen tests, and each names the step it is about: the
+  nobody has tested. Seventeen tests, and each names the step it is about: the
   `uses:` path resolving, the inputs being kit's, the `versions` literal matching
   `go.mod`'s `go` directive, the gate running `bin/prime`, the migrations running
   before it, the tier being derived and skip-checked, the Postgres image being
   pinned, the lockfile guard naming `go.sum` on the same line as the `git diff`,
   `coverage-fail-under` being above zero, `telemetry` being a quoted string, no
-  secret literal, and every named security test existing in the tree. It parses
-  no YAML: a YAML dependency would move `go.mod`, and AGENTS.md's rule is that
+  secret literal, every named security test existing in the tree, and every
+  `run:` block parsing under `bash -n` — an apostrophe inside an awk program or a
+  grep pattern ends the quoting and the shell re-parses the rest as commands. It
+  parses no YAML: a YAML dependency would move `go.mod`, and AGENTS.md's rule is that
   `go.mod` moves only for a stated cause.
 
 - `internal/mfa` — the second factor: TOTP enrollment, the challenge a login waits

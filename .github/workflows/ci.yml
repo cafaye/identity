@@ -20,7 +20,7 @@
 #   2. The migrations. A deploy step, against identity's own `migrations/`, with
 #      a DSN kit does not have and must not hard-code — the services that are not
 #      identity would inherit a database.
-#   3. The tier floors. 1237 tests, 1166 of them behind `TEST_DATABASE_URL`, are
+#   3. The tier floors. 1254 tests, 1166 of them behind `TEST_DATABASE_URL`, are
 #      identity's numbers in identity's tree.
 #   4. The lockfile guard, `go vet` and `gofmt`: gates this repository wrote down
 #      in AGENTS.md, none of which `bin/prime` runs.
@@ -191,12 +191,12 @@ jobs:
       # above; this is the copy that is checked.
       COVERAGE_FAIL_UNDER: '70'
       # Decrease detectors, not targets. Measured on the commit that added this
-      # file with the database tier applied: 1237 PASS lines across the whole
+      # file with the database tier applied: 1254 PASS lines across the whole
       # suite, 1166 of them in packages that open a pool, zero SKIP anywhere. A
       # lower number is a deleted test and this goes red; a higher one is a new
       # test, which is a one-line edit here. They are not read out of the run, so
       # a run cannot satisfy itself by having fewer tests.
-      SUITE_FLOOR: '1237'
+      SUITE_FLOOR: '1254'
       DATABASE_TIER_FLOOR: '1166'
       MODULE: github.com/cafaye/identity
 
@@ -369,14 +369,25 @@ jobs:
 
           # (b) per-package counts, one row per package, so the arithmetic below
           # is over the database tier and not over the whole suite.
+          #
+          # `go test -v` prints the tests of a package and THEN its `ok` line, so
+          # the counts accumulated so far belong to the package named on the line
+          # just read. Printing them against the previous package instead is off
+          # by one, and silently attributes every test to its neighbour. The
+          # patterns are not anchored to column zero because subtests are
+          # indented, and a run of PASS lines is every test that passed including
+          # the ones inside a table.
+          #
+          # The awk program below carries NO prose, and that is not a style
+          # choice. It sits inside a shell single-quoted string, so an
+          # apostrophe in an awk comment — "the tests of a package" — CLOSES the
+          # quote, and everything after it is re-parsed by the shell: the step
+          # dies on a syntax error, and the one check in this job that exists to
+          # prove the tier ran never runs. It happened here once. The prose lives
+          # in these shell comments, where an apostrophe is free, and
+          # internal/platform/ci runs `bash -n` over every `run:` block on every
+          # commit so the next one is caught before it ships.
           awk '
-            # `go test -v` prints a package's tests and THEN its `ok` line, so the
-            # counts accumulated so far belong to the package named on the line
-            # just read — printing them against the previous package is off by
-            # one, and silently attributes every test to its neighbour. Subtests
-            # are indented, so the pattern is not anchored to column zero: a
-            # run's PASS count is every test that passed, including the ones
-            # inside a table.
             /^(ok|FAIL|\?)[[:space:]]+github\.com\/cafaye\/identity/ {
               printf "%s\t%d\t%d\n", $2, p, s; p = 0; s = 0; next
             }
@@ -659,9 +670,9 @@ jobs:
             echo "| claim | floor | checked by |"
             echo "|---|---|---|"
             echo "| \`goose up\` before any test | 10 migrations applied | \`apply the migrations\` |"
-            echo "| whole suite (\`bin/prime\`, then \`go test -v -count=1 -race ./...\`) | ${SUITE_FLOOR} PASS lines, 0 SKIP | \`the database tier ran\` |"
-            echo "| database tier, derived from \`dbtest.\` in the tree | ${DATABASE_TIER_FLOOR} PASS lines, 0 SKIP | \`the database tier ran\` |"
-            echo "| MFA, session and matrix tests | 23 named, each PASS | \`the security tests ran, by name\` |"
+            echo "| whole suite (\`bin/prime\`, then \`-v -race\`) | ${SUITE_FLOOR} PASS lines, 0 SKIP | tier step |"
+            echo "| database tier, derived from \`dbtest.\` | ${DATABASE_TIER_FLOOR} PASS lines, 0 SKIP | tier step |"
+            echo "| MFA, session and matrix tests | 23 named, each PASS | security step |"
             echo "| \`go vet ./...\` | clean | vet |"
             echo "| \`gofmt -l .\` | empty | gofmt |"
             echo "| \`go.mod\`, \`go.sum\` | no diff after the gate | lockfile |"
