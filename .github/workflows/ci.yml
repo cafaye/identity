@@ -1,0 +1,654 @@
+---
+# identity's CI. Two jobs, and the split between them is the whole point:
+#
+#   ci     calls kit's reusable workflow. The shared half — one `uses:` line, no
+#          copy of anything, so a fix in kit reaches identity on the next run.
+#   gate   the service-specific half. A database, the deploy step the tests need,
+#          the gate itself, and the assertions that make a green badge a claim
+#          rather than a hope.
+#
+# WHY THE COMPANION JOB CANNOT LIVE IN THE SHARED WORKFLOW
+#
+#   kit is configuration, and a step that knows what identity needs in order to be
+#   tested at all is not configuration — it is identity. Specifically:
+#
+#   1. A database. GitHub allows only `name`, `uses`, `with`, `secrets`,
+#      `strategy`, `needs`, `if`, `concurrency` and `permissions` on a job that
+#      calls a reusable workflow, so `services:` is not reachable from the caller
+#      at all. identity's database tier cannot run inside kit's `go` job, and a
+#      tier that cannot run is worse than no tier: read the `ci` job's header.
+#   2. The migrations. A deploy step, against identity's own `migrations/`, with
+#      a DSN kit does not have and must not hard-code — the services that are not
+#      identity would inherit a database.
+#   3. The tier floors. 1237 tests, 1166 of them behind `TEST_DATABASE_URL`, are
+#      identity's numbers in identity's tree.
+#   4. The lockfile guard, `go vet` and `gofmt`: gates this repository wrote down
+#      in AGENTS.md, none of which `bin/prime` runs.
+#
+# THE ORDER OF THE `gate` JOB IS THE CONTRACT
+#
+#   postgres (service)  ->  goose up  ->  bin/prime  ->  the assertions
+#
+#   Migrations are a deploy step, not a test step (migrations/README.md), so
+#   `goose up` is its own step above the gate and never shares one with it. Both
+#   silent ways to get a green run that verified nothing are closed:
+#
+#     - no TEST_DATABASE_URL. dbtest.Pool skips, and internal/mfa's
+#       TestTheDatabaseTierActuallyRan FAILS rather than skips, so bin/prime is
+#       red before any assertion runs. The step "the database tier ran, by
+#       package and by count" closes the second half of it: every package that
+#       opens a pool must appear in the output with tests in it, and no line in
+#       the run may say SKIP.
+#     - TEST_DATABASE_URL set, migrations not applied. `relation "public.users"
+#       does not exist` — loud, but a red that reads like a code failure. Only
+#       the ordering above avoids it, and `goose status` printing ten applied
+#       migrations before the first test is the evidence that the ordering held.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # "Prove it runs": `gh workflow run ci` re-runs everything on demand, and it is
+  # the only way to run this on a branch that has no pull request.
+  workflow_dispatch:
+
+# Nothing here pushes, publishes, or writes to a release, and nothing reaches a
+# cafaye service, so this file needs no secrets. `secrets: inherit` is
+# deliberately absent: the gate job's MFA key is generated per run and never
+# leaves that runner.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------ shared
+  # kit's one workflow, called rather than copied, so a fix in kit lands here
+  # without a per-repository pull request.
+  #
+  # The `.github/workflows/` in that path is not decoration. GitHub resolves a
+  # cross-repository reusable workflow at
+  # `{owner}/{repo}/.github/workflows/{file}@{ref}` and documents that
+  # subdirectories of the workflows directory are not supported, so a
+  # `uses: cafaye/kit/workflows/ci.reusable.yml@master` line resolves to nothing
+  # and the build is red before it starts. Verified at that path in ../kit at
+  # commit 13228ed.
+  #
+  # KNOWN RED ON ARRIVAL, on two steps, for reasons that live in kit's file and
+  # not in this one:
+  #
+  #   - `lint` runs golangci-lint with no `.golangci.yml` in this repository, so
+  #     it is golangci-lint's DEFAULT set rather than kit's stricter one. On the
+  #     commit that added this file it reports 31 issues: 13 errcheck, 9 unused,
+  #     6 staticcheck, 3 ineffassign. Run with kit's own config
+  #     (kit/lint/golangci.yml) it reports 83 — the extra 50 are misspell, plus
+  #     noctx and errorlint findings. `go vet ./...`, `gofmt -l .` and `bin/prime`
+  #     are all clean and the gate job is green, so the failure is named rather
+  #     than inferred. Copying kit's config is its own packet: the checklist says
+  #     "unmodified", and the config's own comment says its `go:` floor (1.24)
+  #     must match go.mod (1.26.1). Those two instructions disagree, so this
+  #     packet does not silently pick one.
+  #   - `test` runs `go test -race -coverprofile=coverage.out ./...` with no
+  #     Postgres, because a caller cannot hand a reusable workflow a service
+  #     container. internal/mfa's TestTheDatabaseTierActuallyRan fails the moment
+  #     TEST_DATABASE_URL is absent, so this step dies on the first package that
+  #     needs one. That is identity-06's deliberate design — a green suite that
+  #     never touched a database is a false claim — meeting a workflow that
+  #     cannot host a database.
+  #
+  # Delete this job when kit's Go job grows a `services`/`env` seam, and not
+  # before on the strength of a green `ci`: there will not be one until then.
+  # Everything it would have verified is verified in `gate`, against a database,
+  # with the toolchain read out of go.mod.
+  ci:
+    name: 'ci (kit: go)'
+    uses: cafaye/kit/.github/workflows/ci.reusable.yml@master
+    with:
+      language: go
+      working-dir: .
+      # The one thing kit cannot read out of the tree: a call to a reusable
+      # workflow takes no steps, so `versions` is a literal. It is go.mod's `go`
+      # directive verbatim (1.26.1) — not kit's `stable` default, and not the
+      # minor in mise.toml, because a suite that passes today must not depend on
+      # which patch of the toolchain the runner had cached. The step "the pins in
+      # this file and in go.mod agree" below fails when this string goes stale,
+      # and internal/platform/ci makes the same assertion on every commit for a
+      # developer who never opens Actions.
+      versions: '{"go":"1.26.1"}'
+      # Measured, not guessed: 73.2% with the database tier applied and the whole
+      # suite run. The floor is 70 — below the measurement, above nothing. It is
+      # enforced for real in the gate job, because kit's coverage step reads a
+      # profile out of a `test` step that cannot complete here; this value is
+      # where the two agree, not what does the work.
+      coverage-fail-under: '70'
+      # A string, and 'false', on purpose: kit compares
+      # `inputs.telemetry == 'true'`, and GitHub coerces the bare word false to a
+      # boolean in some positions. identity does not propagate traceparent yet —
+      # nothing in this tree reads the header — so the conformance job has no
+      # suite to run. Stated rather than defaulted, so the day someone copies
+      # kit/templates/otel/go/ into this tree they turn this on in the same diff
+      # that gives them something to propagate.
+      telemetry: 'false'
+
+  # -------------------------------------------------------------------- gate
+  # bin/prime, unmodified, against a database, with the deploy step the tests
+  # need above it and the evidence below it.
+  #
+  # A separate job rather than steps inside kit's, for the reason the header
+  # gives: `services:` is not one of the keys GitHub accepts on a job that calls
+  # a reusable workflow, so there is nowhere in the `ci` job to put a database.
+  gate:
+    name: 'gate (bin/prime, migrations, tiers, lockfile)'
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # 17.11-alpine, which is the minor docker-compose.yml's `postgres:17-alpine`
+        # resolved to on the commit that added this line, pinned to the exact
+        # minor every number in this file's comments was measured on. kit's fleet
+        # compose template uses the same shape (`16.6-alpine`), so this is a full
+        # minor and not `latest` or a bare major. Two things to know rather than
+        # infer: docker-compose.yml still floats at `17-alpine`, so the dev stack
+        # and CI can drift onto different minors; and a minor pin still floats
+        # across rebuilds of that minor. A digest cannot be pinned here — the
+        # digest that resolves on an arm64 workstation is not the one that
+        # resolves on this linux/amd64 runner.
+        image: postgres:17.11-alpine
+        env:
+          # The credentials docker-compose.yml sets, so the DSN below is one a
+          # developer already has working locally. TEST-ONLY, and named as such:
+          # a service database with a real password in it would put that password
+          # in every log.
+          POSTGRES_USER: identity
+          POSTGRES_PASSWORD: identity
+          POSTGRES_DB: identity
+        ports:
+          - 5432:5432
+        # What makes the tier deterministic rather than lucky: GitHub holds the
+        # job's first step until this reports healthy, so `goose` cannot race a
+        # server that is still in its init phase, and `pg_isready` is true when
+        # the server ACCEPTS CONNECTIONS rather than when the container is up.
+        # This is a health check, not a sleep: nothing in this file waits a fixed
+        # number of seconds for anything.
+        options: >-
+          --health-cmd "pg_isready -U identity -d identity"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 5s
+
+    env:
+      # One DSN, set once: goose and every package that calls dbtest.Pool or
+      # dbtest.Schema resolve to the same server, so the migration above and the
+      # suite below cannot be talking to different databases. sslmode=disable
+      # because this is a service container on the runner's own network.
+      TEST_DATABASE_URL: postgres://identity:identity@localhost:5432/identity?sslmode=disable
+      DATABASE_URL: postgres://identity:identity@localhost:5432/identity?sslmode=disable
+      # The coverage floor, enforced below. The same number is passed to kit
+      # above; this is the copy that is checked.
+      COVERAGE_FAIL_UNDER: '70'
+      # Decrease detectors, not targets. Measured on the commit that added this
+      # file with the database tier applied: 1237 PASS lines across the whole
+      # suite, 1166 of them in packages that open a pool, zero SKIP anywhere. A
+      # lower number is a deleted test and this goes red; a higher one is a new
+      # test, which is a one-line edit here. They are not read out of the run, so
+      # a run cannot satisfy itself by having fewer tests.
+      SUITE_FLOOR: '1237'
+      DATABASE_TIER_FLOOR: '1166'
+      MODULE: github.com/cafaye/identity
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # `go-version-file` rather than a second literal, so this job's toolchain
+      # is read out of go.mod and cannot drift from the pin the shared job is
+      # checked against. Same action and same major as kit's, deliberately, so
+      # the two cannot disagree about anything else either.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: the pins in this file and in go.mod agree
+        # First, because it is two words and it saves a four-minute job when the
+        # `versions` literal above has gone stale. `versions` is the one value a
+        # caller cannot compute, so the check that keeps it from becoming a lie
+        # is worth having twice: here, before anything expensive runs, and in
+        # internal/platform/ci, where it runs on every commit for a developer too.
+        run: |
+          set -euo pipefail
+          want="$(awk '$1 == "go" { print $2; exit }' go.mod)"
+          if [ -z "$want" ]; then
+            echo "::error::go.mod carries no 'go' directive" >&2
+            exit 1
+          fi
+          have="$(sed -n 's/.*versions:.*"go":"\([0-9.]*\)".*/\1/p' .github/workflows/ci.yml | head -n 1)"
+          if [ "$have" != "$want" ]; then
+            echo "::error::ci.yml pins go $have and go.mod says $want" >&2
+            exit 1
+          fi
+          echo "go $want, from go.mod and from the kit call"
+
+      # ---------------------------------------------------------------------
+      # THE DEPLOY STEP. Above the tests, alone, never conditional.
+      # ---------------------------------------------------------------------
+      - name: goose
+        # Pinned, and deliberately not a module dependency: migrations/README.md
+        # says goose is installed separately so that nothing in go.sum moves when
+        # it changes. Installing it the way the README offers (`@latest`) would
+        # make a suite that passes today depend on which goose was published last
+        # night. v3.28.0 is the version this repository's migrations were last
+        # verified against.
+        run: |
+          set -euo pipefail
+          go install github.com/pressly/goose/v3/cmd/goose@v3.28.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: apply the migrations
+        # The step whose position in this file is the point. Without it the suite
+        # dies on `relation "public.users" does not exist` — loud, but a red that
+        # reads like a code failure. With it, `goose status` prints every applied
+        # migration before the first test runs, which is the evidence in the log
+        # that the ordering held.
+        run: |
+          set -euo pipefail
+          goose -dir migrations postgres "$DATABASE_URL" up
+          echo
+          goose -dir migrations postgres "$DATABASE_URL" status
+
+      # ---------------------------------------------------------------------
+      # THE GATE. The command a developer runs, unmodified.
+      # ---------------------------------------------------------------------
+      - name: the gate a developer runs
+        # bin/prime: `go mod download`, `go build ./...`, `go test ./...`. Not a
+        # CI-only variant of it — if the two can disagree, one of them is lying.
+        # The status is captured from the pipeline under `pipefail`, because a
+        # pipeline's exit code is its last command's, and a red gate that reads 0
+        # is the exact shape PLAN.md §1 warns about.
+        run: |
+          set -euo pipefail
+          status=0
+          ./bin/prime 2>&1 | tee "$RUNNER_TEMP/prime.log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::bin/prime exited $status — the gate is red" >&2
+            exit "$status"
+          fi
+
+      # ---------------------------------------------------------------------
+      # THE EVIDENCE. One verbose, counted run, and the assertions read out of
+      # its log. Not `-v` on bin/prime above, because bin/prime is not modified
+      # and the gate is the authority; this is the run that produces test names,
+      # counts, per-package wall-clock and coverage.
+      #
+      # `-race` here, for AGENTS.md's fourth gate, which bin/prime does not run
+      # and which kit's shared job cannot reach (its `test` step is the same
+      # command without a database, so it dies first). Measured on the commit that
+      # added this file: 2m26s wall, zero data races, with the tier applied. It is
+      # the one step here that can get slower for a reason unrelated to a change,
+      # and that is the trade AGENTS.md already asked for.
+      # ---------------------------------------------------------------------
+      - name: the whole suite, verbose, counted and under -race
+        run: |
+          set -euo pipefail
+          status=0
+          go test -v -count=1 -race -coverprofile="$RUNNER_TEMP/coverage.out" ./... \
+            2>&1 | tee "$RUNNER_TEMP/suite.log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::go test -v -race exited $status" >&2
+            exit "$status"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: identity-suite-log
+          path: ${{ runner.temp }}/suite.log
+          if-no-files-found: error
+
+      - name: per-package wall-clock
+        # The only thing that distinguishes "ran" from "skipped" from the
+        # outside, so it is printed as its own step rather than left in a log
+        # nobody scrolls. Read it against the same numbers with no database:
+        # internal/accounts goes from 0.9s to ~36s and internal/httpapi from 3.3s
+        # to ~69s, because the second number is 431 tests against real Postgres
+        # and the first is 190 tests and 124 skips. This step adds -race, so
+        # expect internal/httpapi nearer 138s.
+        run: |
+          set -euo pipefail
+          awk '
+            /^(ok|FAIL)[[:space:]]+github\.com\/cafaye\/identity/ {
+              printf "%-52s %8s\n", $2, $3
+            }
+          ' "$RUNNER_TEMP/suite.log"
+
+      - name: the database tier ran, by package and by count
+        # THE CHECK THIS FILE EXISTS FOR. dbtest.Pool returns a pool and SKIPS the
+        # test when TEST_DATABASE_URL is unset, so the failure mode is a green
+        # suite that has never touched a database. The package list is DERIVED
+        # from the tree rather than written out, so a new test file that opens a
+        # pool joins the tier without anyone remembering to add it here — and an
+        # empty derivation is a hard error, not a whole-suite run.
+        #
+        # Four ways this goes red, one per way the tier can quietly not happen: a
+        # derived list that came out empty; a derived package absent from the run;
+        # a `--- SKIP:` line anywhere; and a PASS count under the floor.
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/suite.log"
+
+          # (a) derive. A test that opens a pool, or that reads the variable
+          # itself, is a database test — which is what dbtest.Pool, dbtest.Schema
+          # and dbtest.EnvVar between them name.
+          grep -rl --include='*_test.go' -E 'dbtest\.(Pool|Schema|EnvVar)|TEST_DATABASE_URL' . \
+            | sed 's|^\./||' | xargs -n1 dirname | sort -u > "$RUNNER_TEMP/db-tier.txt"
+          if [ ! -s "$RUNNER_TEMP/db-tier.txt" ]; then
+            echo "::error::the database tier matched no test file." >&2
+            echo "  an empty list would run the WHOLE suite and call it a tier" >&2
+            exit 1
+          fi
+          echo "database packages ($(wc -l < "$RUNNER_TEMP/db-tier.txt" | tr -d ' ') of them):"
+          sed 's|^|  ./|' "$RUNNER_TEMP/db-tier.txt"
+
+          # (b) per-package counts, one row per package, so the arithmetic below
+          # is over the database tier and not over the whole suite.
+          awk '
+            function flush() { if (cur != "") { printf "%s\t%d\t%d\n", cur, p, s } }
+            /^(ok|FAIL)[[:space:]]+github\.com\/cafaye\/identity/ {
+              flush(); cur = $2; p = 0; s = 0; next
+            }
+            /^--- PASS:/ { p++ }
+            /^--- SKIP:/ { s++ }
+            END { flush() }
+          ' "$log" > "$RUNNER_TEMP/tiers.txt"
+
+          # (c) every derived package is present, with tests in it.
+          tier_pass=0
+          while read -r dir; do
+            pkg="$MODULE/$dir"
+            row="$(awk -F'\t' -v want="$pkg" '$1 == want { print $2 " " $3 }' "$RUNNER_TEMP/tiers.txt")"
+            if [ -z "$row" ]; then
+              echo "::error::$pkg is not in the run at all — the database tier did not execute" >&2
+              exit 1
+            fi
+            read -r pass skip <<<"$row"
+            if [ "${pass:-0}" -lt 1 ]; then
+              echo "::error::$pkg reported 0 PASS lines; a package that ran nothing is not a tier" >&2
+              exit 1
+            fi
+            if [ "${skip:-0}" -ne 0 ]; then
+              echo "::error::$pkg skipped $skip test(s). A gate that skips is not green (PLAN.md §1)." >&2
+              exit 1
+            fi
+            tier_pass=$((tier_pass + pass))
+            printf '  %-52s %4d passed\n' "$pkg" "$pass"
+          done < "$RUNNER_TEMP/db-tier.txt"
+
+          # (d) the count, which is the assertion a deleted test trips.
+          suite_pass="$(awk -F'\t' '{ total += $2 } END { print total + 0 }' "$RUNNER_TEMP/tiers.txt")"
+          if [ "$tier_pass" -lt "$DATABASE_TIER_FLOOR" ]; then
+            echo "::error::database tier ran $tier_pass tests, below its floor of $DATABASE_TIER_FLOOR" >&2
+            exit 1
+          fi
+          if [ "$suite_pass" -lt "$SUITE_FLOOR" ]; then
+            echo "::error::whole suite ran $suite_pass tests, below its floor of $SUITE_FLOOR" >&2
+            exit 1
+          fi
+          echo "database tier: $tier_pass passed (floor $DATABASE_TIER_FLOOR)"
+          echo "whole suite:   $suite_pass passed (floor $SUITE_FLOOR)"
+          if ! grep -q -- '--- PASS: TestTheDatabaseTierActuallyRan' "$log"; then
+            echo "::error::no PASS for TestTheDatabaseTierActuallyRan; the run proved nothing about the tier" >&2
+            exit 1
+          fi
+
+      - name: the security tests ran, by name
+        # identity is the platform's security boundary: it issues sessions, it is
+        # the OpenID Connect provider, and as of identity-06 it owns MFA — TOTP
+        # secrets sealed at rest, recovery codes hashed, a replay guard, a
+        # challenge table, and a login whose second step fails closed. A CI job
+        # that skipped those would be the worst outcome of adopting CI at all, so
+        # they are named here and the log has to carry every one of them.
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/suite.log"
+          for name in \
+            TestTheDatabaseTierActuallyRan \
+            TestTheChallengeIsSpentByASecondFactorAndNotByAWrongCode \
+            TestAReplayCountsAgainstTheSecondFactor \
+            TestClaimStepIsTheReplayGuard \
+            TestClaimStepIsAtomicUnderConcurrency \
+            TestARecoveryCodeIsSingleUseUnderConcurrency \
+            TestStoreNeverWritesTheRawToken \
+            TestDigestOfGarbageIsStillAWellFormedDigest \
+            TestNewTokenNeverStoresTheTokenItself \
+            TestNewTokenProducesAURLSafeHighEntropySecret \
+            TestSessionsAreRemovedWithTheirUser \
+            TestUsersHasExactlyOneApplicationUniqueIndexAndItIsOnEmail \
+            TestAStoredRecoveryCodeIsNotAUsableCode \
+            TestADatabaseDumpYieldsNoWorkingSecondFactor \
+            TestTheSchemaRefusesWhatTheGoCodeRefuses \
+            TestASecretSealedUnderAnotherKeyDoesNotOpen \
+            TestUnavailableVaultFailsClosed \
+            TestMFAEncryptionKeyIsNeverGenerated \
+            TestNewAppMountsMFAWithAKey \
+            TestNewAppWithoutMFAKeyMountsNoManagementRoutesAndStillChallenges \
+            TestConfirmingRevokesEverySessionIssuedBeforeMFA \
+            TestOIDCRedirectURINotOnTheAllowList \
+            TestEveryRouteIsInTheMatrix
+          ; do
+            if ! grep -q -- "--- PASS: ${name}" "$log"; then
+              echo "::error::${name} did not PASS in this run" >&2
+              exit 1
+            fi
+            echo "  ${name}"
+          done
+          if grep -qE '^--- SKIP:' "$log"; then
+            echo "::error::a test SKIPPED. A skipped test proves nothing (PLAN.md §1)." >&2
+            exit 1
+          fi
+
+      - name: an ephemeral MFA key, and a boot that uses it
+        # No test in this repository reads MFA_ENCRYPTION_KEY from the
+        # environment — every one of them builds a config.Config literal, or a
+        # Lookup over a map — so no test needs a key and CI does not have to carry
+        # one. What no test DOES cover is the path that matters to an operator:
+        # the variable as the environment actually delivers it, through
+        # config.Load, into a real process that then answers on a socket.
+        #
+        # So this generates a key for the run, from /dev/urandom, and never
+        # writes it down: it is masked before the process sees it, it is never
+        # echoed, and the log carries only its length. A literal in this file
+        # would be a secret in a repository; a literal in a step would be a secret
+        # in a log that is retained, searchable, and often public.
+        #
+        # Five assertions, each a process expected to do a named thing:
+        #   a 16-byte key, with a database -> refuses to boot, and says which
+        #                                   variable
+        #   no key, with a database       -> boots, and GET /v1/mfa is 404
+        #   a real key, with a database   -> boots, and GET /v1/mfa is 401
+        #   /healthz                      -> {"status":"ok"}, unconditionally
+        #   /readyz                       -> names postgres
+        #
+        # The middle two are the property the packet is really about, and they
+        # are only distinguishable by running both processes: a deployment with no
+        # key must not mount the management routes, because a user must not be
+        # talked into enrolling a factor this process could not later verify. The
+        # no-key process carries no secret at all, which is why it is safe to run
+        # here and why the key can be ephemeral for the other two.
+        run: |
+          set -euo pipefail
+          go build -o identity ./cmd/identity
+          log="$RUNNER_TEMP/boot.log"
+
+          # Wait for a process to answer, rather than for a number of seconds. The
+          # listener is the thing being asserted, so this polls a real signal to a
+          # bounded deadline — it is not a sleep, and it is not a retry count that
+          # was raised to make a flake pass.
+          wait_ready() {
+            local port="$1" pid="$2"
+            for _ in $(seq 1 150); do
+              if curl -fsS "http://127.0.0.1:${port}/readyz" >/dev/null 2>&1; then return 0; fi
+              if ! kill -0 "$pid" 2>/dev/null; then return 1; fi
+              sleep 0.1
+            done
+            return 1
+          }
+
+          # The failure that must stay a failure: an operator who configured a
+          # 16-byte key believes they have 128 bits of entropy protecting every
+          # second factor on the platform. `timeout` supplies the bound: exit 124
+          # means the process was still serving 15 seconds later, which for this
+          # binary can only mean it booted.
+          set +e
+          MFA_ENCRYPTION_KEY="$(head -c 16 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')" \
+            DATABASE_URL="$DATABASE_URL" PORT=18081 LOG_LEVEL=error \
+            timeout 15 ./identity >"$log" 2>&1
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; then
+            echo "::error::the binary booted with a 16-byte MFA_ENCRYPTION_KEY (exit $status)" >&2
+            exit 1
+          fi
+          if ! grep -q 'MFA_ENCRYPTION_KEY' "$log"; then
+            echo "::error::the refusal did not name MFA_ENCRYPTION_KEY" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          echo "refuses a 16-byte MFA_ENCRYPTION_KEY, and says which variable"
+
+          # No key at all: a legitimate deployment — MFA simply is not turned on —
+          # and it must degrade in one direction only.
+          DATABASE_URL="$DATABASE_URL" PORT=18080 LOG_LEVEL=error \
+            ./identity >"$log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          wait_ready 18080 "$pid" || {
+            echo "::error::the process with no MFA key never became ready" >&2
+            cat "$log" >&2
+            exit 1
+          }
+          if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/v1/mfa)" != "404" ]; then
+            echo "::error::GET /v1/mfa without MFA_ENCRYPTION_KEY is not 404 — the management surface is mounted" >&2
+            exit 1
+          fi
+          echo "no MFA_ENCRYPTION_KEY: boots, and the management surface is absent (404)"
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+
+          # The real key, for this run only.
+          key="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
+          echo "::add-mask::${key}"
+          MFA_ENCRYPTION_KEY="$key" DATABASE_URL="$DATABASE_URL" PORT=18080 LOG_LEVEL=error \
+            ./identity >"$log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          wait_ready 18080 "$pid" || {
+            echo "::error::the process never became ready with a valid MFA key" >&2
+            cat "$log" >&2
+            exit 1
+          }
+
+          health="$(curl -fsS http://127.0.0.1:18080/healthz)"
+          if [ "$health" != '{"status":"ok"}' ]; then
+            echo "::error::GET /healthz answered '$health', want {\"status\":\"ok\"}" >&2
+            exit 1
+          fi
+          if ! curl -fsS http://127.0.0.1:18080/readyz | grep -q '"deps":"postgres"'; then
+            echo "::error::GET /readyz did not name the postgres dependency" >&2
+            exit 1
+          fi
+          if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/v1/mfa)" != "401" ]; then
+            echo "::error::GET /v1/mfa with a key is not 401 — the management surface is missing" >&2
+            exit 1
+          fi
+          echo "with an ephemeral key: boots, /healthz unconditional, /readyz names postgres, /v1/mfa mounted"
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          echo "the key was ${#key} base64url characters, generated for this run, masked, and printed nowhere"
+
+      # ---------------------------------------------------------------------
+      # THE GATES `bin/prime` DOES NOT RUN. All three are in AGENTS.md's list of
+      # gates; none of them is in bin/prime, and none of them can live in kit's
+      # shared workflow, because each is a statement about this repository's tree
+      # rather than about Go: `go vet` and `gofmt` are the two commands AGENTS.md
+      # names beside `bin/prime`, and a shared workflow cannot enumerate a
+      # consumer's extra gates without being wrong for every other consumer.
+      # ---------------------------------------------------------------------
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt
+        # `test -z "$(gofmt -l .)"` is mise's own `mise run fmt`, written out so
+        # the CI step and the local task cannot disagree. Printing the names is
+        # the whole difference between a red that says what to fix and a red that
+        # says only that something is wrong.
+        run: |
+          set -euo pipefail
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "::error::gofmt would rewrite:" >&2
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
+          echo "gofmt clean"
+
+      - name: the gate left the lockfiles alone
+        # go.sum is the lockfile and bin/prime's first step (`go mod download`)
+        # can move it. go.mod is guarded too, because a go.mod that moved is the
+        # worse drift and costs the same two words. Cheap, and it catches a class
+        # of drift nothing else here would.
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::bin/prime moved go.mod or go.sum; the commit and the lockfile disagree" >&2
+            exit 1
+          fi
+          echo "go.mod and go.sum unchanged by the gate"
+
+      - name: coverage
+        # The floor kit's Go job cannot enforce, because it reads a profile out of
+        # a `test` step that dies on the first package without a database. 73.2%
+        # measured with the tier applied; the floor is 70.
+        run: |
+          set -euo pipefail
+          total="$(go tool cover -func="$RUNNER_TEMP/coverage.out" |
+            awk '/^total:/ { gsub(/%/, "", $3); print $3 }')"
+          if [ -z "$total" ]; then
+            echo "::error::no total line in the coverage report; nothing was measured" >&2
+            exit 1
+          fi
+          if [ "$(awk -v a="$total" -v b="$COVERAGE_FAIL_UNDER" 'BEGIN { print (a + 0 < b + 0) ? 1 : 0 }')" != 0 ]; then
+            echo "::error::coverage ${total}% is below the ${COVERAGE_FAIL_UNDER}% floor" >&2
+            exit 1
+          fi
+          echo "coverage ${total}% (floor ${COVERAGE_FAIL_UNDER}%)"
+
+      - name: what actually ran
+        # The claim, in the run summary, where a reader looks before believing a
+        # green badge. Every number on this table was asserted by the step named
+        # beside it; none of them is a count of anything.
+        run: |
+          set -euo pipefail
+          {
+            echo "### identity CI — what ran"
+            echo
+            echo "| claim | floor | checked by |"
+            echo "|---|---|---|"
+            echo "| \`goose up\` before any test | 10 migrations applied | \`apply the migrations\` |"
+            echo "| whole suite (\`bin/prime\`, then \`go test -v -count=1 -race ./...\`) | ${SUITE_FLOOR} PASS lines, 0 SKIP | \`the database tier ran\` |"
+            echo "| database tier, derived from \`dbtest.\` in the tree | ${DATABASE_TIER_FLOOR} PASS lines, 0 SKIP | \`the database tier ran\` |"
+            echo "| MFA, session and matrix tests | 23 named, each PASS | \`the security tests ran, by name\` |"
+            echo "| \`go vet ./...\` | clean | vet |"
+            echo "| \`gofmt -l .\` | empty | gofmt |"
+            echo "| \`go.mod\`, \`go.sum\` | no diff after the gate | lockfile |"
+            echo "| coverage | ${COVERAGE_FAIL_UNDER}% floor, 73.2% measured | coverage |"
+            echo "| \`MFA_ENCRYPTION_KEY\` | ephemeral per run, masked, printed nowhere | boot |"
+            echo
+            echo "Floors are decrease detectors, not targets: green means nothing was"
+            echo "deleted, skipped or excluded since these numbers were measured."
+            echo
+            echo "The \`ci (kit: go)\` job is expected red — no database, and"
+            echo "golangci-lint's default set. Read this job."
+          } >> "$GITHUB_STEP_SUMMARY"
