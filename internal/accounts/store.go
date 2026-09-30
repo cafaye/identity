@@ -486,6 +486,112 @@ func (s *Store) MarkInvitationAccepted(ctx context.Context, q db.Querier, invita
 	return nil
 }
 
+// RevokePendingInvitation stamps revoked_at on one pending invitation.
+//
+// IT IS CONDITIONAL, and every clause in the WHERE is load-bearing:
+//
+//	id              the invitation named
+//	account_id      THIS account — the tenancy check, and the reason a caller
+//	                cannot revoke an invitation belonging to somebody else even
+//	                having guessed its id
+//	accepted_at IS NULL   a redeemed invitation is not a pending one, and
+//	                revoking it would be a lie: the membership already exists and
+//	                the row says so
+//	revoked_at IS NULL    idempotence, and it is what makes a second call
+//	                report ErrInvitationRevoked rather than refreshing the
+//	                timestamp and pretending it happened again
+//
+// Zero rows is the ambiguous answer — gone, another account's, already accepted,
+// or already revoked — and it is disambiguated by one follow-up read rather than
+// by four queries, because two of the four must be reported identically and
+// telling them apart is the whole job of the read.
+//
+// The invitation is KEPT rather than deleted, and the reason is 00013's header:
+// a deleted invitation cannot answer "was this revoked, or was it always
+// broken?", and the same support question is why api_keys and oidc_clients both
+// keep their revoked rows.
+func (s *Store) RevokePendingInvitation(ctx context.Context, q db.Querier, accountID, invitationID id.UUID) (int, error) {
+	if invitationID.IsZero() || accountID.IsZero() {
+		return 0, ErrInvitationNotFound
+	}
+
+	const query = `
+		UPDATE account_invitations SET revoked_at = now(), updated_at = now()
+		WHERE id = $1 AND account_id = $2 AND accepted_at IS NULL AND revoked_at IS NULL`
+
+	tag, err := q.Exec(ctx, query, invitationID, accountID)
+	if err != nil {
+		return 0, fmt.Errorf("revoking an invitation: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return int(tag.RowsAffected()), nil
+	}
+	return 0, s.classifyUnrevocable(ctx, q, accountID, invitationID)
+}
+
+// RevokePendingInvitations stamps revoked_at on as many of ids as are pending
+// invitations of this account, and reports how many rows it changed.
+//
+// The count is the number that went into the audit record, and it is the number
+// the database says rather than the length of the request: a request naming six
+// ids where two were already revoked changes four rows, and recording six is a
+// trail that cannot be reconciled against the account.
+//
+// ids that are not revocable are silently not revoked here. The caller decides
+// whether that is acceptable, and the reason it is not an error at this level is
+// that "revoke these fifty, forty-eight of which are already gone" is a request a
+// caller should be able to make idempotently — returning an error would make a
+// retried batch fail forever on an id that was never going to work.
+func (s *Store) RevokePendingInvitations(ctx context.Context, q db.Querier, accountID id.UUID, ids []id.UUID) (int, error) {
+	if accountID.IsZero() || len(ids) == 0 {
+		return 0, ErrInvitationNotFound
+	}
+
+	const query = `
+		UPDATE account_invitations SET revoked_at = now(), updated_at = now()
+		WHERE account_id = $1 AND id = ANY($2)
+		  AND accepted_at IS NULL AND revoked_at IS NULL`
+
+	tag, err := q.Exec(ctx, query, accountID, ids)
+	if err != nil {
+		return 0, fmt.Errorf("revoking invitations: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// classifyUnrevocable turns "the UPDATE changed nothing" into the one of three
+// answers that are actually distinguishable, and it is a read rather than three
+// more UPDATEs because the point of the conditional statement above is that it
+// touches no row it should not.
+//
+// A row that exists and is NOT revocable is reported as revoked-or-used, and a
+// row that does not exist is ErrInvitationNotFound — which is also what another
+// account's invitation looks like, because the lookup is scoped to accountID and
+// a row in somebody else's account is a row this query cannot see. That is the
+// same conflation accountIDFrom makes in the path, and it is deliberate: a caller
+// who could distinguish "no such invitation" from "an invitation in an account you
+// are not in" would have a tenant-probe.
+func (s *Store) classifyUnrevocable(ctx context.Context, q db.Querier, accountID, invitationID id.UUID) error {
+	const query = `
+		SELECT accepted_at IS NOT NULL, revoked_at IS NOT NULL
+		FROM account_invitations WHERE id = $1 AND account_id = $2`
+
+	var accepted, revoked bool
+	err := q.QueryRow(ctx, query, invitationID, accountID).Scan(&accepted, &revoked)
+	if errors.Is(err, errNoRows) {
+		return ErrInvitationNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("classifying an unrevocable invitation: %w", err)
+	}
+	if accepted {
+		return ErrInvitationUsed
+	}
+	// revoked is true here, and an invitation with neither accepted nor revoked
+	// cannot reach this branch: the UPDATE would have matched it.
+	return ErrInvitationRevoked
+}
+
 // scanMembership reads one membership row.
 func scanMembership(row interface{ Scan(...any) error }) (Membership, error) {
 	var m Membership

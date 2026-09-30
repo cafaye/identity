@@ -197,6 +197,37 @@ const (
 	// oidc_clients:read would be a scope nobody in this service has a use for,
 	// and a scope nobody uses is one nobody tests.
 	ScopeOIDCClientsWrite = "oidc_clients:write"
+
+	// ScopeAuditLogRead is GET /v1/accounts/{accountID}/admin/audit-log and
+	// nothing else.
+	//
+	// A SEPARATE SCOPE AND NOT accounts:read, and the reason is that the two
+	// answer different questions. accounts:read is "what does this account look
+	// like"; the audit log is "who has acted on this account, when, and with
+	// which credential" — a record of authority being used, which is a different
+	// sensitivity from the account's own shape and the thing an operator reads
+	// during an incident. A token that can read the account should not thereby
+	// hold a standing record of every administrative action taken against it.
+	ScopeAuditLogRead = "audit_log:read"
+
+	// ScopeAccountInvitationsWrite is the admin surface's writes: revoking
+	// invitations, one at a time or in bulk.
+	//
+	// IT IS NOT accounts:write, and the difference is the whole boundary this
+	// surface draws. accounts:write is what an admin holds to MANAGE the account
+	// — rename it, invite, remove a member — and every one of those operations
+	// creates something the account wants. Revoking a pending invitation takes
+	// something away, and it is the operation an account's admin should be able
+	// to perform from a deployment pipeline without also holding the authority to
+	// remove the account's members. Narrowing it is what makes the scope a
+	// decision a person makes twice rather than one they make once.
+	//
+	// Note what is NOT here: the name is not `admin`, and there is no scope that
+	// means "the admin surface". The three admin routes declare two scopes, the
+	// same resource:action shape as every other name in this list, because the
+	// rule at the top of this block is that a token is granted exactly what it
+	// names and a category name is where a wildcard grows back.
+	ScopeAccountInvitationsWrite = "account_invitations:write"
 )
 
 // AllScopes is the vocabulary, in a fixed order.
@@ -205,7 +236,10 @@ const (
 // one: the order reaches an error message and a response, and a map's iteration
 // order would make two identical requests answer differently.
 func AllScopes() []string {
-	return []string{ScopeAccountsRead, ScopeAccountsWrite, ScopeAccountsDelete, ScopeOIDCClientsWrite}
+	return []string{
+		ScopeAccountsRead, ScopeAccountsWrite, ScopeAccountsDelete,
+		ScopeOIDCClientsWrite, ScopeAuditLogRead, ScopeAccountInvitationsWrite,
+	}
 }
 
 // IsSupportedScope reports whether this build implements a scope. Exact match,

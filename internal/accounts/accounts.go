@@ -70,6 +70,18 @@ var (
 	// expired and the same reasoning: it is not redeemable any more.
 	ErrInvitationUsed = errors.New("invitation has already been accepted")
 
+	// ErrInvitationRevoked means the invitation was withdrawn by an admin before
+	// it was redeemed.
+	//
+	// IT IS DISTINCT FROM ErrInvitationUsed even though both mean "not
+	// redeemable any more", and the difference is what an operator needs: a used
+	// invitation became a membership, and the question "where is the membership
+	// this link created?" is a support question. A revoked one never became
+	// anything, and the question is "who withdrew it and when" — which the
+	// account's audit trail answers, and which is the entire reason the admin
+	// surface that produces this error writes a row when it does.
+	ErrInvitationRevoked = errors.New("invitation has been revoked")
+
 	// ErrInvitationEmailTaken means this account already has a pending
 	// invitation for that address. Answering 409 rather than minting a second
 	// token stops an admin from filling the table with invitations that all say
