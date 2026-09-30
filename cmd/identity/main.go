@@ -14,12 +14,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/cafaye/identity/internal/accounts"
+	"github.com/cafaye/identity/internal/apikeys"
 	"github.com/cafaye/identity/internal/auth"
 	"github.com/cafaye/identity/internal/config"
 	"github.com/cafaye/identity/internal/httpapi"
@@ -109,6 +111,11 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 		return nil, err
 	}
 	if authSvc != nil {
+		machineCredentials, err := buildAPIKeys(cfg, pool, tenancy, logger)
+		if err != nil {
+			return nil, err
+		}
+
 		opts = append(opts,
 			httpapi.WithAuth(authSvc),
 			httpapi.WithTenancy(tenancy),
@@ -121,6 +128,20 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 		)
 		if mfaUsable {
 			opts = append(opts, httpapi.WithMFA(secondFactor))
+		}
+		if machineCredentials != nil {
+			// Four options from one service, and each is a different capability rather
+			// than a different spelling of the same one: the management surface
+			// (mint/list/revoke), resolving a presented token to its caller so the
+			// account routes accept one, and the introspection surface a resource
+			// server asks because the token is opaque and carries no claims of its
+			// own. WithAPIKeyCaller is what makes the scope gate reachable at all —
+			// without it every account route is session-only.
+			opts = append(opts,
+				httpapi.WithAPIKeys(machineCredentials),
+				httpapi.WithAPIKeyCaller(machineCredentials),
+				httpapi.WithIntrospection(machineCredentials),
+			)
 		}
 	} else {
 		// Said out loud, because a process serving probes and no auth surface is a
@@ -179,6 +200,19 @@ func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*aut
 	// them would be two objects that have to be configured identically.
 	events := outbox.NewStore(pool)
 
+	// The api key store, built BEFORE tenancy and handed to it. The dependency runs
+	// backwards from the rest of this file and the reason is a security rule rather
+	// than a convenience: removing a member from an account revokes the machine
+	// credentials they held in it, in the same transaction as the membership delete,
+	// and accounts.Service can only do that with a revoker to call. It is an
+	// interface declared in accounts and satisfied here, so neither package imports
+	// the other.
+	//
+	// One store, two services: apikeys.Service below takes the same *Store, so the
+	// table has a single owner in this process and there is no second object to
+	// configure identically.
+	apiKeyStore := apikeys.NewStore(pool)
+
 	// Tenancy is built first because registration needs it: a new user gets a
 	// personal account, and both writes are one transaction. The order of these
 	// two blocks is the dependency order, which is the reason they share a
@@ -187,6 +221,7 @@ func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*aut
 		db.TxRunner{Pool: pool},
 		accounts.NewStore(pool),
 		events,
+		apiKeyStore,
 		clock.System{},
 		db.Direct{Pool: pool},
 	)
@@ -258,6 +293,63 @@ func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*aut
 	)
 
 	return authSvc, tenancy, secondFactor, mfaUsable, nil
+}
+
+// buildAPIKeys assembles the scoped-token use cases, or returns nil when this
+// process cannot have them.
+//
+// THE ONE CONDITION is a pool, and it is the same one auth needs — a table with no
+// process writing to it is not a capability, it is a 500 waiting for the first
+// request. So this is called from inside the `authSvc != nil` branch and never
+// decides anything of its own.
+//
+// It takes NO CONFIGURATION, and that is worth a line because every other surface
+// in this file does. An api key is not a secret this deployment generates and has
+// to keep: it is a random value whose only stored form is a SHA-256 of it, and
+// there is no key to load, no key to rotate and no key to lose. The costs of
+// having a signing key configured for the OIDC provider — a startup failure on a
+// wrong one, a trust anchor that changes on a restart — do not exist here, which
+// is one of the reasons this credential is a row lookup rather than a JWT.
+//
+// The outbox store is a second one rather than the one buildAuth made, and that is
+// deliberate: the two have no state to share, and threading buildAuth's outbox
+// through a second return value would couple two builders that have nothing else to
+// do with each other. The same reasoning is in buildOIDC's last paragraph.
+func buildAPIKeys(
+	cfg config.Config,
+	pool *pgxpool.Pool,
+	tenancy *accounts.Service,
+	logger *slog.Logger,
+) (*apikeys.Service, error) {
+	if pool == nil || tenancy == nil {
+		return nil, nil
+	}
+
+	service := apikeys.NewService(
+		db.TxRunner{Pool: pool},
+		db.Direct{Pool: pool},
+		apikeys.NewStore(pool),
+		outbox.NewStore(pool),
+		tenancy,
+		users.NewStore(pool),
+		clock.System{},
+	)
+
+	// The startup line is the same one MFA gets, and for the same reason: an
+	// operator who does not know a capability is mounted will discover it from a
+	// 404, and one who believes it is mounted when it is not will discover it from
+	// a 404 too. The scopes are in the line because they are the vocabulary a
+	// consumer has to match against, and a list that changes with a release belongs
+	// in the log at boot rather than in a document somebody has to find.
+	logger.Info("scoped api tokens are mounted",
+		"prefix", apikeys.Prefix,
+		"secret_bytes", apikeys.SecretBytes,
+		"scopes", strings.Join(apikeys.AllScopes(), " "),
+		"default_ttl", apikeys.DefaultTTL,
+		"max_ttl", apikeys.MaxTTL,
+	)
+
+	return service, nil
 }
 
 // buildMFASecret returns the vault for the configured key, or mfa.Unavailable{}.

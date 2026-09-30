@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/cafaye/identity/internal/accounts"
+	"github.com/cafaye/identity/internal/apikeys"
 	"github.com/cafaye/identity/internal/auth"
 	"github.com/cafaye/identity/internal/platform/id"
 	"github.com/cafaye/identity/internal/users"
@@ -71,10 +73,27 @@ func WithTenancy(t Tenancy) Option {
 // middleware is genuinely middleware: the handler signature stays
 // http.HandlerFunc, and the session is resolved once per request rather than once
 // per handler that needs the caller.
+//
+// The three credential facts a handler might need, and they are deliberately
+// three fields rather than one union type. A session caller has ScopeKey zero and
+// KeyID zero; a token caller has all three set. A handler that needs to know which
+// it is can ask, and a handler that does not — nearly all of them — never has to.
 type accountScope struct {
 	Account accounts.Account
 	Role    accounts.Role
 	User    users.User
+	// Scopes is the caller's token's granted scopes, empty for a session caller.
+	//
+	// EMPTY FOR A SESSION IS NOT "NO AUTHORITY". A session is a human's credential
+	// and it carries the full authority of its role; a token is a narrowed one. That
+	// asymmetry is the reason the scope check below is skipped for sessions rather
+	// than failing them, and it is the reason a session can reach a route whose
+	// scope a token cannot.
+	Scopes []string
+	// KeyID is the api key's row id, zero for a session caller. It is what a
+	// handler puts in an audit line, and the rule from the packet is that a test
+	// identifying a token uses its id or its name — never the value.
+	KeyID id.UUID
 }
 
 type accountContextKey struct{}
@@ -93,16 +112,119 @@ func roleFrom(ctx context.Context) accounts.Role {
 	return scope.Role
 }
 
+// scopeFrom returns the caller's token scopes, empty for a session caller.
+func scopeFrom(ctx context.Context) []string {
+	scope, _ := ctx.Value(accountContextKey{}).(accountScope)
+	return scope.Scopes
+}
+
+// scopeRequiredBy is the account route → required scope table.
+//
+// IT IS A TABLE RATHER THAN A PARAMETER on requireAccountRole, and the reason is
+// that a parameter would have to be restated at fourteen call sites and the table
+// can be walked by a test. `TestEveryAccountRouteDeclaresItsScope` fails if a
+// route is mounted without a row, and `TestEveryScopeIsEnforcedOnItsRoutes` fails
+// if apikeys.AllScopes names something the router does not gate. Two lists that
+// have to agree, and a disagreement is a test failure rather than a comment.
+//
+// The key is the chi pattern with the method, spelled exactly as the router spells
+// it. chi's own RouteContext carries the matched pattern, so a request is looked up
+// by the route it actually reached rather than by a string this file re-derives —
+// which is what makes a route registered under a different spelling fail the test
+// rather than silently escape the gate.
+//
+// A ROUTE WITH NO ROW IS NOT UNGATED. scopeRequiredBy returns "" for one, and
+// `Allows("")` is false, so a token is refused on a route nobody declared a scope
+// for. That is the fail-closed direction and it is deliberate: a new account route
+// is unreachable by a token until somebody says what it may do with one.
+var accountRouteScopes = map[string]string{
+	// The tenancy reads. accounts:read is also the default a CI job needs and the
+	// one that leaks the least.
+	//
+	// NOT IN THIS TABLE: `GET /v1/accounts`, `POST /v1/accounts` and
+	// `POST /v1/invitations/accept`. Each is a question about the caller's WHOLE set
+	// of accounts rather than about one account, and a token is bound to one
+	// account — so they are refused outright by sessionCredentialOnly rather than
+	// gated. A row here would be a lie twice over: they do not go through
+	// requireAccountRole, and a scope that gates nothing is a comment with a type.
+	"GET /v1/accounts/{accountID}":         apikeys.ScopeAccountsRead,
+	"GET /v1/accounts/{accountID}/members": apikeys.ScopeAccountsRead,
+
+	// The account's own mutations, except deleting it.
+	"PATCH /v1/accounts/{accountID}":                   apikeys.ScopeAccountsWrite,
+	"POST /v1/accounts/{accountID}/invitations":        apikeys.ScopeAccountsWrite,
+	"PATCH /v1/accounts/{accountID}/members/{userID}":  apikeys.ScopeAccountsWrite,
+	"DELETE /v1/accounts/{accountID}/members/{userID}": apikeys.ScopeAccountsWrite,
+
+	// Deleting the account is its own scope: it is the only one of these that
+	// cannot be undone, and a token carrying accounts:write held by somebody who
+	// later becomes a member is already refused on the role check — so the extra
+	// scope is for the owner case, where the role gate alone would let it through.
+	"DELETE /v1/accounts/{accountID}": apikeys.ScopeAccountsDelete,
+
+	// The account's OpenID Connect registrations, read and write in one scope: both
+	// GETs are owner-only routes whose response IS the integration's configuration,
+	// so a separate read scope would be a name nobody has a use for.
+	"POST /v1/accounts/{accountID}/oidc-clients":              apikeys.ScopeOIDCClientsWrite,
+	"GET /v1/accounts/{accountID}/oidc-clients":               apikeys.ScopeOIDCClientsWrite,
+	"GET /v1/accounts/{accountID}/oidc-clients/{clientID}":    apikeys.ScopeOIDCClientsWrite,
+	"DELETE /v1/accounts/{accountID}/oidc-clients/{clientID}": apikeys.ScopeOIDCClientsWrite,
+}
+
+// scopeRequiredBy returns the scope a token needs for the route it reached, or ""
+// when no row declares one.
+//
+// "" MEANS NO TOKEN, not "any token". `Key.Allows("")` is false for every granted
+// set, so an undeclared route is closed to tokens until it is declared. That is
+// the direction that matters: a new account-scoped route added by a later packet
+// is unreachable by a machine credential on the day it lands, not on the day
+// somebody notices it was never gated.
+func scopeRequiredBy(r *http.Request) string {
+	route := chi.RouteContext(r.Context()).RoutePattern()
+	if route == "" {
+		return ""
+	}
+	return accountRouteScopes[strings.ToUpper(r.Method)+" "+route]
+}
+
+// APIKeyCaller resolves a scoped api key to its caller, or reports that the
+// request is not presenting one.
+//
+// It is on the HTTP layer's own options rather than on Auth because it is a
+// DIFFERENT CREDENTIAL with a different table, a different lifetime and a
+// different revocation story, and routing it through Auth would put a lookup for a
+// `cafaye_…` value in the sessions table on the path of every authenticated
+// request.
+type APIKeyCaller interface {
+	Authenticate(ctx context.Context, token string, now time.Time) (apikeys.Caller, error)
+}
+
+// WithAPIKeyCaller teaches the router how to resolve a scoped token.
+//
+// Without it the account-scoped routes are SESSION-ONLY: a token presented to one
+// is refused with the same 401 an unknown credential gets, because there is nothing
+// here that could authenticate it. That is the fail-closed direction and it is a
+// supported configuration — the routes still work for browsers.
+func WithAPIKeyCaller(c APIKeyCaller) Option {
+	return func(o *options) {
+		if c != nil {
+			o.apiKeyCaller = c
+		}
+	}
+}
+
 // requireAccountRole is the authorization gate on every account-scoped route.
 //
 // It resolves the caller from their credential, the account from the path, and
 // the caller's membership in that account, then compares the membership's role
-// against min. Three answers, and which one is correct is a security property
-// rather than a formatting choice:
+// against min AND — when the caller is a scoped token rather than a session —
+// the route's scope against the token's granted scopes. Three answers, and which
+// one is correct is a security property rather than a formatting choice:
 //
 //	no usable credential            401  — who are you
 //	no membership in this account    404  — this account is not visible to you
-//	membership below the minimum    403  — you can see it; you may not do this
+//	role below the minimum          403  — you can see it; you may not do this
+//	scope not granted               403  — this credential may not do this
 //
 // THE 404 IS THE INTERESTING ONE. A 403 for "you are not a member" would tell
 // any authenticated caller that the account id they guessed is a real account,
@@ -118,12 +240,28 @@ func roleFrom(ctx context.Context) accounts.Role {
 // A lookup that FAILS is a 500 and not a 403. A database blip is not evidence
 // that the caller is under-privileged, and answering 403 would turn a transient
 // outage into a wrong authorization answer that a client might cache.
+//
+// TWO CREDENTIALS, ONE GATE, AND THE ORDER MATTERS.
+//
+// The role is checked BEFORE the scope, and that is not arbitrary. A token
+// presented against an account it was not minted for is a 404 even if it holds
+// every scope in the vocabulary — the account in the path has to be one this
+// token is for before "may it act here" is even a question. And the role is read
+// from the membership table on this request rather than from anything the token
+// carries, which is what makes a demotion or a removal take effect on the next
+// request with nothing to invalidate.
+//
+// A SESSION CARRIES NO SCOPES AND IS NOT REFUSED FOR IT. A session is a human's
+// credential with the full authority of its role; a token is a narrowed one. The
+// scope check below runs only when ScopeKey is set, and the reason is written on
+// the accountScope fields.
 func (o options) requireAccountRole(min accounts.Role, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		user, ok := o.currentUser(w, r)
+		caller, ok := o.currentCaller(w, r)
 		if !ok {
 			return
 		}
+		user := caller.User
 
 		accountID, ok := accountIDFrom(r)
 		if !ok {
@@ -143,11 +281,72 @@ func (o options) requireAccountRole(min accounts.Role, next http.HandlerFunc) ht
 			return
 		}
 
+		// A token is minted FOR one account, and core's rule is that tenancy comes
+		// from the credential and never from the request body. A token reaching a
+		// path for a different account is 404, the same answer a stranger gets:
+		// the caller is not a non-member of that account, they are a caller whose
+		// credential is not for it, and neither fact may be distinguishable.
+		//
+		// `!caller.Key.ID.IsZero()` is "this is a token": a session caller's Key is
+		// the zero value, so the two checks below are skipped for a browser rather
+		// than being satisfied by a session that happened to hold no scopes.
+		if !caller.Key.ID.IsZero() && caller.Key.AccountID != accountID {
+			notFound(w, r)
+			return
+		}
+
+		// The scope gate. AFTER the membership and the role, so a caller who is not
+		// in the account at all learns nothing about which scopes a token would
+		// have needed.
+		if !caller.Key.ID.IsZero() && !caller.Key.Allows(scopeRequiredBy(r)) {
+			problemFor(w, r, http.StatusForbidden, CodeForbidden,
+				"this api key does not carry the "+scopeRequiredBy(r)+" scope")
+			return
+		}
+
 		ctx := context.WithValue(r.Context(), accountContextKey{}, accountScope{
 			Account: account, Role: role, User: user,
+			Scopes: caller.Key.Scopes,
+			KeyID:  caller.Key.ID,
 		})
 		next(w, r.WithContext(ctx))
 	}
+}
+
+// currentCaller resolves the request's credential to a caller: a session token or a
+// scoped api key.
+//
+// THE PREFIX DECIDES WHICH, before any query runs. That is the second thing the
+// `cafaye_` prefix buys — the first is recognition in a log — and it means a value
+// of the wrong kind never reaches the wrong table. A session token is looked up in
+// sessions and an api key in api_keys, and neither lookup is ever handed a value
+// belonging to the other, so "is this token live" cannot be answered by the
+// response time of the wrong index.
+//
+// A request with no usable credential is one 401, whatever was missing and
+// whatever was wrong with it.
+func (o options) currentCaller(w http.ResponseWriter, r *http.Request) (apikeys.Caller, bool) {
+	if token := o.presentedAPIKey(r); token != "" {
+		if o.apiKeyCaller == nil {
+			// A process with no api key support refuses one rather than 500ing. The
+			// value has the right shape and nothing here can check it, and answering
+			// 401 keeps the failure indistinguishable from an unknown credential.
+			unauthorized(w, r)
+			return apikeys.Caller{}, false
+		}
+		caller, err := o.apiKeyCaller.Authenticate(r.Context(), token, o.clk.Now())
+		if err != nil {
+			unauthorized(w, r)
+			return apikeys.Caller{}, false
+		}
+		return caller, true
+	}
+
+	user, ok := o.currentUser(w, r)
+	if !ok {
+		return apikeys.Caller{}, false
+	}
+	return apikeys.Caller{User: user}, true
 }
 
 // currentUser resolves the presented credential to a user, writing the problem
@@ -341,9 +540,14 @@ type changeRoleRequest struct {
 // never removed — are in the use case, not here. A route's minimum answers "may
 // this caller do this at all"; the rest answers "may they do it to this".
 func (o options) registerTenancyRoutes(r chiRouter) {
-	r.Post("/v1/accounts", o.handleCreateAccount)
-	r.Get("/v1/accounts", o.handleListAccounts)
-	r.Post("/v1/invitations/accept", o.handleAcceptInvitation)
+	// The three collection routes are SESSION-ONLY, and it is the token that makes
+	// that a decision rather than a default: each of them answers a question about
+	// the CALLER'S WHOLE SET of accounts rather than about one account, and a
+	// credential bound to one of them has no business enumerating the others. The
+	// reason in full is on sessionCredentialOnly.
+	r.Post("/v1/accounts", o.sessionCredentialOnly(o.handleCreateAccount))
+	r.Get("/v1/accounts", o.sessionCredentialOnly(o.handleListAccounts))
+	r.Post("/v1/invitations/accept", o.sessionCredentialOnly(o.handleAcceptInvitation))
 
 	r.Get("/v1/accounts/{accountID}", o.requireAccountRole(accounts.RoleMember, o.handleGetAccount))
 	r.Patch("/v1/accounts/{accountID}", o.requireAccountRole(accounts.RoleAdmin, o.handleRenameAccount))
@@ -362,6 +566,12 @@ func (o options) registerTenancyRoutes(r chiRouter) {
 	// other row of the matrix. Absent without WithOIDCClients, for the reason
 	// every other route is: a misconfiguration is a 404, not a 500.
 	o.registerOIDCClientRoutes(r)
+
+	// And so do the scoped api keys, for the same reason and on the same gate.
+	// They are deliberately NOT in accountRouteScopes, so a token presenting to one
+	// is refused: the credential surface is the one surface a credential may not
+	// manage. See the note in apikeys.go.
+	o.registerAPIKeyRoutes(r)
 }
 
 // handleCreateAccount provisions an account and makes the caller its owner.

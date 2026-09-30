@@ -11,18 +11,25 @@ openapi: 3.1.0
 
 info:
   title: cafaye identity
-  # Bumped for the OIDC registration routes and again for the multi-factor
-  # routes. No path prefix moved and no existing response shape changed, so
-  # core's sync rule asks for exactly this: a non-breaking change bumps only the
-  # document version.
+  # Bumped for the OIDC registration routes, again for the multi-factor routes, and
+  # again for the scoped API tokens. No path prefix moved and no existing response
+  # shape changed, so core's sync rule asks for exactly this: a non-breaking change
+  # bumps only the document version.
   #
   # The 202 on POST /v1/session is the exception worth reading twice. It is a new
   # response on an existing operation, and an existing 200 client is unaffected by
   # it because 200 is still what an account with no second factor gets. A client
   # that only accepts 200 is broken the moment a user enrolls, which is precisely
   # the moment the client has to change.
-  version: 1.2.0
-  summary: Authentication, sessions, multi-factor authentication, accounts, tenancy and OIDC registrations.
+  #
+  # The scoped API tokens are additive in the same sense: four new operations, a
+  # second credential accepted by `bearerToken`, and one behaviour change on an
+  # EXISTING operation — `DELETE /v1/session` now answers 403 to a scoped token
+  # where it used to answer 204. A client that only ever presents session tokens
+  # cannot tell, and a client that had started pasting a `cafaye_` token into its
+  # logout call was being told a revocation had happened when none had.
+  version: 1.3.0
+  summary: Authentication, sessions, multi-factor authentication, accounts, tenancy, scoped API tokens and OIDC registrations.
   description: |
     `identity` is the cafaye platform's security boundary: it is what every other
     service asks to identify a caller.
@@ -113,6 +120,28 @@ info:
     perimeter. `identity` has no platform-admin role yet — the admin API is a
     later packet — so the owner role is the one privilege this service already
     has that means "may change what can enter this account".
+
+    ## Scoped API tokens are a third credential, not a flag on either of the others
+
+    A **session** is browser-shaped and short-lived. An **OIDC access token** is a
+    JWT for a third party holding a browser, verified against a published JWKS
+    with no call back to here. A **scoped API token** is a first-party machine
+    credential: opaque, long-lived, revocable, and carrying a scope set.
+
+    Three of them because the three have genuinely different failure modes, and
+    running one through another's machinery would give each of them the wrong
+    one. A session that cannot be revoked instantly is a stolen browser; a JWT
+    that cannot be revoked before its `exp` is a fifteen-minute window and
+    nothing more; an opaque token that could not be revoked at all would be a
+    permanent credential, which is the one shape this service does not offer.
+
+    The property worth reading twice: **a token carries a scope set, not a role.**
+    Its authority is re-evaluated on every request against the owner's *current*
+    membership, so removing somebody from an account stops their tokens on the
+    next request — and a re-invitation does not bring them back, because the
+    removal also revoked what they held. That is the difference between a
+    credential and a permission, and it is why there is no `role` to edit on a
+    token.
   contact:
     name: identity
     url: https://github.com/cafaye/identity
@@ -147,6 +176,17 @@ tags:
     description: |
       OpenID Connect client registrations: the credentials products present at
       the token endpoint. The protocol surface itself is in `openid/openid.yaml`.
+  - name: api-keys
+    description: |
+      Scoped API tokens: the credential that is not a browser session, for a
+      script, a CI job or another service. Opaque, named, scoped, revocable, and
+      expiring — and **not** interchangeable with a session or with an OIDC access
+      token, which is why it is its own surface and not a flag on either of them.
+
+      A token carries a scope set, not a role. Its authority is re-evaluated on
+      every request from the owner's **current** membership, so removing somebody
+      from an account stops their tokens immediately, and a re-invitation does not
+      bring them back.
   - name: probes
     description: Liveness and readiness. Consumed by orchestrators, not by clients.
 
@@ -1154,6 +1194,337 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /v1/accounts/{account_id}/api-keys:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    post:
+      tags: [api-keys]
+      operationId: mintAPIKey
+      summary: Mint a scoped API token
+      description: |
+        The credential that is not a browser session: a long-lived, named, scoped,
+        revocable token for a script, a CI job or another service.
+
+        **Owner only**, and the reason is a security property rather than a
+        convention. A machine credential outlives every session that made it and is
+        exactly what a stolen password buys an attacker, so "can read the member
+        list" is not authority to mint one — the same argument that makes
+        registering an OIDC client owner-only.
+
+        **The account comes from the path and the user from the session.** There is
+        no `account_id` or `user_id` in the body, and a body carrying either is a
+        422. A credential is minted BY the caller FOR the caller's own account; there
+        is no subject field, and a machine credential that can be minted for somebody
+        else is a way for an owner to plant a credential somebody did not choose to
+        hold.
+
+        **`token` is returned here and nowhere else, ever.** It is shown once, at
+        creation, and there is no endpoint that re-reads it — not because one is
+        missing but because there is nothing left to print: the row holds a SHA-256
+        of a 256-bit value. A caller that loses it mints another. It is never in a
+        cookie, because a credential in a cookie is one a browser silently attaches
+        to a request its holder did not intend, which is what core means by "no
+        cookies for API traffic".
+
+        **`expires_in` is SECONDS from now** — the same name and the same shape
+        RFC 6749's token response uses, so every OAuth client in the world already
+        knows what it means. Omit it for the default (90 days). `0` or a negative
+        value is a **422, not "never expires"**: a permanent credential is not
+        something this build offers, and the ceiling is 365 days. The cost of that
+        decision is real and is stated in README.md: a CI credential has to be
+        replaced every quarter, and what it buys is a moment at which a credential
+        nobody is using gets noticed.
+
+        **One live token per name per account.** A second live token answering to
+        this name is a 409, because "revoke ci-deploy" is otherwise ambiguous and an
+        operator picking the wrong one leaves a credential live they believe they
+        have destroyed. The constraint is on LIVE tokens only, so rotation is two
+        requests — revoke, then mint the same name — and not a transaction that has
+        to find a name free first.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MintAPIKeyRequest'
+            examples:
+              aReadOnlyToken:
+                summary: A read-only token for a CI job
+                value:
+                  name: ci-deploy
+                  scopes: [accounts:read]
+              withALifetime:
+                summary: Naming how long it should live
+                value:
+                  name: nightly-import
+                  scopes: [accounts:read, accounts:write]
+                  expires_in: 2592000
+      responses:
+        '201':
+          description: |
+            The credential, and its secret. `token` is the only place it appears.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuedAPIKey'
+              example:
+                id: ab000000-0000-0000-0000-0000000000a1
+                name: ci-deploy
+                account_id: ab000000-0000-0000-0000-0000000000c1
+                user_id: ab000000-0000-0000-0000-0000000000u1
+                scopes: [accounts:read]
+                expires_at: '2026-12-29T12:00:00Z'
+                created_at: '2026-09-30T12:00:00Z'
+                token: cafaye_Zq3vK7mXpR2tY8wB4cN6dF0gH1jK5lM9oP3qS7uV2wX4yZ8
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: This account already has a live token with that name.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [api-keys]
+      operationId: listAPIKeys
+      summary: List an account's API tokens
+      description: |
+        Every credential this account holds, newest first, **revoked ones
+        included** — a token that has been withdrawn is how a person finds out that
+        the credential they are about to revoke was withdrawn last Tuesday. An
+        account with none answers `[]` and not `null`.
+
+        **No secret, and no digest.** There is no column holding the plaintext, so
+        there is nothing for a response to leak; and the digest is of no use to a
+        client, so echoing the row's most sensitive column into a browser's network
+        log would be a cost with no benefit. `prefix` is not in this document at
+        all: a list distinguishes tokens by `name` and `id`, and a credential is
+        identified by its name or its id — never by a piece of itself.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: The account's credentials.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/APIKey'
+              example:
+                - id: ab000000-0000-0000-0000-0000000000a1
+                  name: ci-deploy
+                  account_id: ab000000-0000-0000-0000-0000000000c1
+                  user_id: ab000000-0000-0000-0000-0000000000u1
+                  scopes: [accounts:read]
+                  expires_at: '2026-12-29T12:00:00Z'
+                  created_at: '2026-09-30T12:00:00Z'
+                  last_used_at: '2026-10-02T09:14:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/accounts/{account_id}/api-keys/{key_id}:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+      - name: key_id
+        in: path
+        required: true
+        description: |
+          The credential's row id. A malformed one, one in another account and one
+          that never existed are all `404` — the same answer, so an id is not a way
+          to learn which credentials exist.
+        schema:
+          type: string
+          format: uuid
+    delete:
+      tags: [api-keys]
+      operationId: revokeAPIKey
+      summary: Revoke an API token
+      description: |
+        Withdraws a credential. It stops working on the very next request: the
+        resolution query filters on `revoked_at`, so there is no window.
+
+        **The row is kept, not deleted.** "Was this token revoked, or was it always
+        broken?" is a support question and a deleted row answers it for nobody. A
+        revoked row holds a digest of a secret nobody has, so keeping it is not a
+        risk.
+
+        A second revoke is a **409, not a 204**: an operator who clicked twice is
+        owed the truth, because a 204 the second time would leave them believing a
+        second live credential had just been destroyed.
+
+        `reason` is optional and is stored on the row. It is **not** in the
+        `identity.api_key.revoked` event: nobody typed it consistently, it is not a
+        fact about the credential, and a field whose values vary per operator is one
+        every consumer learns to ignore.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevokeAPIKeyRequest'
+            example:
+              reason: rotated
+      responses:
+        '204':
+          description: The credential no longer works.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The credential was already revoked.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/introspections:
+    post:
+      tags: [api-keys]
+      operationId: introspectAPIKey
+      summary: Resolve a presented API token to its claims
+      description: |
+        Asks "what may this token do, and for which account". It exists because the
+        token is **opaque**: it is `cafaye_` plus 32 random bytes and the row holds
+        a SHA-256 of it, so there is no claim document inside it and no published
+        key set to verify it against. Asking identity is the only way a resource
+        server can learn a scope. The response is RFC 7662's shape.
+
+        The body takes the **credential, not an id** — an id would be an enumeration
+        oracle over somebody else's credentials, and a value is only useful to
+        somebody who already holds it.
+
+        ### An unusable token answers `{"active": false}` and nothing else
+
+        Unknown, revoked, expired, and one whose owner has been removed from the
+        account are all the same 200 with the same body, and the status is 200
+        rather than 404 because the endpoint succeeded — the answer is that the
+        token is not active. A caller who could tell those apart would learn whether
+        a leaked value was live, which is the second question an attacker asks after
+        "does this work".
+
+        ### The caller's own standing is a different question
+
+        It gets different statuses, because it is a different fact about the
+        request: **401** with no credential, and **403** for a token asking about
+        anybody else's. A token may introspect **itself**, which is the case a CI job
+        needs when it wants to know why it is being refused. A session may read a
+        token in an account it **owns**; a session that is not in the account is
+        404, for the reason every other route does that.
+
+        ### The two scope claim names
+
+        `scopes` and `scope` are **byte for byte identical**, and both are
+        space-separated strings.
+
+        This is a deliberate interim, not a contract. The fleet does not agree on the
+        name: core's `docs/openapi-conventions.md` requires `scopes`, and guard's
+        `src/middleware/jwt.ts` reads `scope` and splits it on whitespace. The
+        question is open (MD7 in the manager's `DECISIONS.md`) and answering it
+        unilaterally would mean rotating every credential already in a customer's
+        hand. Emitting both means whichever name wins, the other is a one-line
+        removal and no credential has to be reissued. A space-separated **string**
+        rather than an array because guard's verifier refuses a non-string claim.
+
+        ### `account_id` is required and there is no `sub` fallback
+
+        `sub` is the **user** the token names. `account_id` is the tenancy boundary
+        and it is always present; a token with no account cannot be used against any
+        account and is answered `{"active": false}`. Nothing here falls back to
+        `sub`, which would give a service-to-service token a user as its tenancy
+        key and turn a bug in one service into a cross-tenant read.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IntrospectRequest'
+            example:
+              token: cafaye_Zq3vK7mXpR2tY8wB4cN6dF0gH1jK5lM9oP3qS7uV2wX4yZ8
+      responses:
+        '200':
+          description: |
+            The claim document, or `{"active": false}` when the token cannot be
+            used.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntrospectionResponse'
+              examples:
+                active:
+                  summary: A live token
+                  value:
+                    active: true
+                    sub: ab000000-0000-0000-0000-0000000000u1
+                    account_id: ab000000-0000-0000-0000-0000000000c1
+                    scopes: accounts:read accounts:write
+                    scope: accounts:read accounts:write
+                    jti: ab000000-0000-0000-0000-0000000000a1
+                    name: ci-deploy
+                    role: owner
+                    iat: 1788168000
+                    exp: 1790760000
+                inactive:
+                  summary: A token that cannot be used, for any reason
+                  value:
+                    active: false
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /healthz:
     get:
       tags: [probes]
@@ -1245,15 +1616,60 @@ components:
       type: http
       scheme: bearer
       description: |
-        The API surface. A session token from `POST /v1/session`, presented as
-        `Authorization: Bearer <token>`.
+        The API surface. **Two** credentials are accepted here and they are
+        distinguished by their shape, not by a flag:
 
-        Not a JWT, and deliberately so: core's conventions describe JWTs for
-        *service-to-service* traffic verified against identity's JWKS. These are
-        opaque server-side session tokens, looked up by the SHA-256 of the
-        presented value. Revocation is a row delete and takes effect on the next
-        request, which a self-contained JWT cannot do. The OIDC provider, and the
-        JWTs core describes, arrive with the OIDC packet.
+        * a **session token** from `POST /v1/session` — a browser credential, with
+          the full authority of its role.
+        * a **scoped API token** from `POST /v1/accounts/{account_id}/api-keys` —
+          `cafaye_` followed by 43 base64url characters. Narrowed by a scope set,
+          bound to one account, revocable, expiring.
+
+        The `cafaye_` prefix is what tells them apart, before any query runs, so a
+        value of one kind is never looked up in the other's table. A scoped token
+        is accepted on the account-scoped routes only, and only where its scope
+        allows; it is **refused with 403** on the session surface, the second
+        factor, the credential surface and the account collection routes.
+
+        A scoped token presented anywhere it is not accepted is 401, the same
+        answer as a session token that never existed — revoked, expired, and one
+        whose owner has been removed from the account are all that too.
+
+        ## Required scopes, per operation
+
+        | Operation | Scope | Enforced on |
+        |---|---|---|
+        | `getAccount`, `listMembers` | `accounts:read` | the tenancy reads |
+        | `renameAccount`, `inviteMember`, `changeMemberRole`, `removeMember` | `accounts:write` | the account's mutations except deleting it |
+        | `deleteAccount` | `accounts:delete` | `DELETE /v1/accounts/{account_id}` and nothing else |
+        | the four `oidc-clients` operations | `oidc_clients:write` | an account's OpenID Connect registrations |
+        | `mintAPIKey`, `revokeAPIKey`, `listAPIKeys` | *(none)* | **refused to every token**, with 403 |
+
+        Four names, a closed set, and every one of them is a capability an existing
+        route already enforces a different way. A scope for something this service
+        cannot do is a promise rather than a control.
+
+        The three collection operations — `listAccounts`, `createAccount`,
+        `acceptInvitation` — have **no scope and refuse every token**, and the reason
+        is not an oversight: each answers a question about the caller's *whole set*
+        of accounts, and a token is bound to one account. A CI job holding a token
+        for one tenant is not entitled to an inventory of every other tenant its
+        owner belongs to.
+
+        There is no scope for the second factor, for sessions, or for a wildcard
+        meaning "everything". A machine credential that can turn a second factor off
+        is a credential whose theft is a *downgrade* rather than a break-in, and
+        "read this account" and "delete this account" are two decisions a person
+        makes twice.
+
+        A **session** carries no scopes and is not refused for that. A session is a
+        human's credential with the full authority of its role; a token is a
+        narrowed one. That asymmetry is the whole difference between the two.
+      x-scopes:
+        - accounts:read
+        - accounts:write
+        - accounts:delete
+        - oidc_clients:write
 
   parameters:
     AccountId:
@@ -1281,6 +1697,255 @@ components:
       example: 0af7651916cd43dd8448eb211c80319c
 
   schemas:
+    APIKey:
+      type: object
+      description: |
+        A scoped API token as the settings page sees it.
+
+        **There is no `token` field here, and that is not an omission.** The
+        plaintext exists exactly once, in the `201` from
+        `POST /v1/accounts/{account_id}/api-keys`; there is no column holding it and
+        no endpoint that re-reads one. `IssuedAPIKey` below is the only shape with
+        that field, and it embeds this one — so the list handler cannot reach it even
+        by accident.
+
+        Nor is there a `token_digest`. It is of no use to a client, and echoing the
+        row's most sensitive column into a browser's network log would be a cost
+        with no benefit. A token is identified by its `name` or its `id`, and never
+        by a piece of itself — that is a rule for the logs this service writes as
+        much as for this response.
+      required: [id, name, account_id, user_id, scopes, expires_at, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: |
+            The row's own id. This is what a revoke names and what a test uses to
+            identify a credential.
+        name:
+          type: string
+          maxLength: 80
+          description: |
+            What a human calls this in a list. Required, because an operator revokes
+            by what they can read; a token nobody can tell apart from another is one
+            nobody remembers to revoke.
+        account_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+          description: |
+            The user who minted it, and the only subject it ever has. A credential
+            is minted BY the caller FOR the caller's own account.
+        scopes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: |
+            The granted capabilities. An **array** here and not the
+            space-separated string of the claim document: this is a REST list, and
+            the claim form is the wire shape for something a resource server parses
+            out of a token. They are the same set.
+          items:
+            $ref: '#/components/schemas/APIKeyScope'
+        expires_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          description: |
+            Absent when the token has never been presented. `omitempty` is doing
+            real work: "never used" and "used at the epoch" are different answers
+            and only the first is true.
+
+            Accurate to within five minutes, deliberately. A CI token at a thousand
+            requests a second must not put a thousand UPDATEs a second on one row,
+            and a single row's lock is a queue.
+        revoked_at:
+          type: string
+          format: date-time
+        revoke_reason:
+          type: string
+          maxLength: 200
+          description: |
+            Why it was withdrawn, when an operator gave a reason. Either a sentence
+            somebody typed, or the closed value `membership removed` that
+            `accounts.Service.RemoveMember` writes.
+
+    APIKeyScope:
+      type: string
+      description: |
+        One of four names, in core's `resource:action` shape. The set is closed and
+        adding one is a code change rather than a migration, which is why a token
+        holding a name this build does not know is refused at the point of use
+        rather than being treated as "and so anything goes".
+      enum:
+        - accounts:read
+        - accounts:write
+        - accounts:delete
+        - oidc_clients:write
+
+    IssuedAPIKey:
+      allOf:
+        - $ref: '#/components/schemas/APIKey'
+        - type: object
+          description: |
+            The create response, and the ONLY place a credential's plaintext
+            appears.
+          required: [token]
+          properties:
+            token:
+              type: string
+              description: |
+                The credential: `cafaye_` plus 43 base64url characters. Shown once,
+                here, and unrecoverable afterwards — not because an endpoint is
+                missing but because the row holds a SHA-256 of a 256-bit value.
+                A caller that loses it mints another.
+
+                The prefix is a feature and the feature is recognition: a secret
+                that leaks into a CI log, a shell history or a support ticket is
+                recognised as a cafaye credential by its first seven characters,
+                which turns "somebody has to work out which of these strings is
+                working" into a grep.
+
+    MintAPIKeyRequest:
+      type: object
+      description: |
+        **The account and the user are not here.** They come from the path and the
+        session, and a body carrying `account_id` or `user_id` is a 422 — because a
+        body that could carry them is a body where they are ambiguous.
+      required: [name, scopes]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+          description: |
+            Trimmed, and refused if it holds a control character: a name lands in a
+            log line, a settings page and an incident report, and one carrying a
+            newline is three lines where somebody wrote one.
+        scopes:
+          type: array
+          minItems: 1
+          maxItems: 8
+          description: |
+            Required, and refused rather than defaulted. A token with no scopes is a
+            session that never expires, and it arrives as "the client did not send
+            the field" — which is exactly how the dangerous case looks.
+
+            An unsupported scope is a 422 naming the field, not a silent drop: a CI
+            job that asked for `accounts:admin` and silently received
+            `accounts:read` runs for a week and fails on the write it was written
+            to do.
+          items:
+            $ref: '#/components/schemas/APIKeyScope'
+        expires_in:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            **Seconds from now**, the same name and shape RFC 6749's token response
+            uses. Omit it for the 90-day default. `0` and negative values are 422:
+            a permanent credential is not something this build offers, and the
+            ceiling is 365 days.
+
+    RevokeAPIKeyRequest:
+      type: object
+      description: |
+        Optional in the strongest sense — a `DELETE` with no body at all is a
+        revoke, because "revoke this" with no explanation is the common request and
+        refusing it for want of a JSON document would be a 400 on a DELETE that needs
+        nothing else.
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          maxLength: 200
+
+    IntrospectRequest:
+      type: object
+      description: |
+        The **credential**, not an id. An id would be an enumeration oracle over
+        somebody else's credentials, and a value is only useful to somebody who
+        already holds it.
+      required: [token]
+      additionalProperties: false
+      properties:
+        token:
+          type: string
+          description: The presented value, prefix and all.
+
+    IntrospectionResponse:
+      type: object
+      description: |
+        RFC 7662's shape. When `active` is false this object is **exactly**
+        `{"active": false}` and carries nothing else — a `sub` on an inactive
+        document is a user id handed to whoever asked, and a refusal that differs
+        per reason is an oracle for whether a leaked value was live.
+      required: [active]
+      properties:
+        active:
+          type: boolean
+        sub:
+          type: string
+          format: uuid
+          description: |
+            The **user** the token names. It is not the tenancy key, and nothing in
+            this document falls back to it.
+        account_id:
+          type: string
+          format: uuid
+          description: |
+            The tenancy boundary, and **required** on an active document. core's
+            rule is that every query is scoped by `account_id` from the token and
+            never from the request body; a token with no account cannot be used
+            against any account and is answered `{"active": false}`.
+        scopes:
+          type: string
+          description: |
+            The capability set as a **space-separated string** — core's required
+            claim name.
+        scope:
+          type: string
+          description: |
+            An **exact mirror of `scopes`**, and the name `guard` reads. Both are
+            emitted because the fleet has not agreed on one (MD7, open) and
+            answering it here would mean rotating every credential already in a
+            customer's hand. Whichever name wins, the other is a one-line removal
+            and no credential has to be reissued. **Two names is not a contract.**
+        jti:
+          type: string
+          format: uuid
+          description: The credential's row id, which is what a consumer correlates on.
+        name:
+          type: string
+          description: What a human would call this credential.
+        role:
+          type: string
+          description: |
+            The owner's **live** membership role, read at the instant of the claim
+            rather than snapshotted at issue.
+
+            It is here for an operator reading the response, and it is **not** an
+            authorization input: core's rule is that services check scopes and ask
+            identity, and a role in a claim is a role a service might start
+            branching on.
+        iat:
+          type: integer
+          format: int64
+        exp:
+          type: integer
+          format: int64
+        last_used_at:
+          type: integer
+          format: int64
+
     User:
       type: object
       description: |
@@ -2112,7 +2777,7 @@ components:
 #    `validation_failed` at 400, since core's list is keyed by slug and one slug
 #    cannot carry two statuses.
 #
-# 3. `info.version` is set, and it is at 1.2.0.
+# 3. `info.version` is set, and it is at 1.3.0.
 #
 #    core's versioning section carries an open decision (D4) about whether a
 #    document version is required alongside the `/v1` path prefix, precisely
@@ -2144,10 +2809,27 @@ components:
 #
 #  * The `bearerToken` scheme is `http`/`bearer` with an opaque token, not a JWT.
 #    core's auth section describes JWTs for service-to-service traffic verified
-#    against identity's JWKS. These are server-side session tokens: revocation is a
-#    row delete that takes effect on the next request, which a self-contained JWT
-#    cannot do. The OIDC provider DOES issue JWTs, and those are verified against
-#    the JWKS in `openid/openid.yaml`.
+#    against identity's JWKS. BOTH credentials this scheme now accepts are
+#    server-side row lookups: a session token and a scoped API token. Revocation is
+#    a row write that takes effect on the next request, which a self-contained JWT
+#    cannot do — and for a credential that lives a quarter rather than fifteen
+#    minutes, that is the property worth having. The OIDC provider DOES issue JWTs,
+#    and those are verified against the JWKS in `openid/openid.yaml`.
+#  * A scoped API token is served by an **introspection endpoint on this
+#    `/v1` surface**, not through the OIDC one, and the path is RFC 7662's *response*
+#    shape rather than its `/introspect` path. The reason is that the credential is
+#    first-party and opaque: there is no access token to introspect in the OAuth
+#    sense, and `oidc.SetIntrospectionFromToken` still refuses. The OIDC
+#    provider's introspection is a separate, unmounted feature for JWT access
+#    tokens. If core decides an introspection path is fixed, this is the row that
+#    has to change.
+#  * Two decisions in this document are interim and marked as such: the **dual
+#    scope claim** on the introspection response (`scopes` and `scope`, byte for
+#    byte equal, pending MD7) and the **`account_id` floor with no `sub` fallback**.
+#    Both are recorded where a consumer will read them rather than only in a
+#    changelog, because a client integrating against the dual claim needs to know
+#    that one of the two names is going away and that nothing has to be reissued
+#    when it does.
 #  * `POST /v1/session/mfa` is on the `sessions` tag, not the `mfa` one, and it is
 #    mounted even in a deployment with no `MFA_ENCRYPTION_KEY`. It is the rest of
 #    the login, it lives with the login, and it answers `503` rather than being

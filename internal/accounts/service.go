@@ -61,18 +61,46 @@ type EventAppender interface {
 	Append(ctx context.Context, q db.Querier, e outbox.Envelope) error
 }
 
+// CredentialRevoker withdraws the machine credentials a user holds in an account.
+//
+// IT IS A DEPENDENCY RATHER THAN AN IMPORT because internal/apikeys imports this
+// package for accounts.Role, and a direct import back would be a cycle that exists
+// only because a role is a type on both sides. Declaring the one method here is the
+// same seam internal/mfa uses for its session sweep, and for the same reason: the
+// RULE lives in the use case that makes the change, and the table that holds the
+// rows is somebody else's.
+//
+// IT MAY BE NIL, and then a member removal changes only the membership. That is
+// supported rather than broken — a deployment with no api key table has no
+// credentials to revoke — and it is why the sweep is a separate statement rather
+// than part of the membership delete: a revocation that fails must not leave the
+// membership half-removed either.
+type CredentialRevoker interface {
+	RevokeAllForMember(ctx context.Context, q db.Querier, accountID, userID id.UUID, at time.Time) error
+}
+
 // Service is the tenancy use cases.
 type Service struct {
-	uow    UnitOfWork
-	store  AccountStore
-	events EventAppender
-	clock  clock.Clock
-	read   db.QuerierSource
+	uow     UnitOfWork
+	store   AccountStore
+	events  EventAppender
+	revokes CredentialRevoker
+	clock   clock.Clock
+	read    db.QuerierSource
 }
 
 // NewService wires the use cases.
-func NewService(uow UnitOfWork, store AccountStore, events EventAppender, clk clock.Clock, read db.QuerierSource) *Service {
-	return &Service{uow: uow, store: store, events: events, clock: clk, read: read}
+//
+// revokes may be nil — see CredentialRevoker.
+func NewService(
+	uow UnitOfWork,
+	store AccountStore,
+	events EventAppender,
+	revokes CredentialRevoker,
+	clk clock.Clock,
+	read db.QuerierSource,
+) *Service {
+	return &Service{uow: uow, store: store, events: events, revokes: revokes, clock: clk, read: read}
 }
 
 // CreateInput is a request to create an account.
@@ -640,6 +668,33 @@ func (s *Service) RemoveMember(ctx context.Context, in RemoveMemberInput) error 
 
 		if err := s.store.RemoveMember(ctx, q, in.AccountID, in.UserID); err != nil {
 			return err
+		}
+
+		// A CREDENTIAL THE MEMBER HELD IN THIS ACCOUNT IS REVOKED IN THE SAME
+		// TRANSACTION, and this is the rule that took two attempts to get right.
+		//
+		// The obvious design is that the token stores no role and the resolution
+		// query joins the membership — so a removal stops it on the next request
+		// with nothing to invalidate. That part works. What it does NOT do is stop
+		// the token coming BACK: the same user re-invited to the same account at
+		// the same role satisfies the join again, and a contractor's CI credential
+		// that was supposed to have died at offboarding quietly starts working the
+		// day somebody re-adds them. The test that caught it is
+		// TestARemovedMembershipStopsTheTokenOnTheNextRequest, in internal/httpapi.
+		//
+		// So the removal revokes explicitly. The row is kept, `revoked_at` is set,
+		// and the credential is dead for good: a re-invite is a NEW grant and starts
+		// from nothing, which is the only outcome an operator who offboarded
+		// somebody would recognise as correct.
+		//
+		// The alternative considered and rejected: keying the token on the
+		// membership's `created_at` so a re-invite's new row does not match. It
+		// fails on a clock — two removals and re-adds inside one second, or any test
+		// with a frozen clock, produce the same value and the token revives anyway.
+		if s.revokes != nil {
+			if err := s.revokes.RevokeAllForMember(ctx, q, in.AccountID, in.UserID, now); err != nil {
+				return err
+			}
 		}
 
 		event, err := outbox.NewMemberRemoved(now, in.AccountID, in.UserID, string(target.Role))

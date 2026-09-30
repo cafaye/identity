@@ -14,10 +14,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/cafaye/identity/internal/accounts"
+	"github.com/cafaye/identity/internal/apikeys"
 	"github.com/cafaye/identity/internal/oidc"
+	"github.com/cafaye/identity/internal/outbox"
 	"github.com/cafaye/identity/internal/platform/clock"
+	"github.com/cafaye/identity/internal/platform/db"
 	"github.com/cafaye/identity/internal/platform/dbtest"
 	"github.com/cafaye/identity/internal/platform/id"
+	"github.com/cafaye/identity/internal/users"
 )
 
 // THE AUTHORIZATION MATRIX.
@@ -103,11 +107,12 @@ type matrixEndpoint struct {
 }
 
 // path renders the concrete request path for a case.
-func (e matrixEndpoint) path(accountID, memberID, clientID id.UUID) string {
+func (e matrixEndpoint) path(accountID, memberID, clientID, keyID id.UUID) string {
 	out := e.pattern
 	out = strings.ReplaceAll(out, "{accountID}", accountID.String())
 	out = strings.ReplaceAll(out, "{userID}", memberID.String())
 	out = strings.ReplaceAll(out, "{clientID}", clientID.String())
+	out = strings.ReplaceAll(out, "{keyID}", keyID.String())
 	return out
 }
 
@@ -216,6 +221,36 @@ func matrixEndpoints() []matrixEndpoint {
 			name: "revoke an OIDC client", method: http.MethodDelete,
 			pattern: "/v1/accounts/{accountID}/oidc-clients/{clientID}", min: accounts.RoleOwner, success: http.StatusNoContent,
 		},
+
+		// The scoped api keys. All three are OWNER-ONLY, and the reason is a security
+		// property rather than a convention: minting a machine credential is adding a
+		// new way for code to act in this account with an authority outliving every
+		// session, and "can read the member list" is not authority to do that. It is
+		// the same argument as registering an OIDC client, and it is the same
+		// argument the use case makes when it asks for RoleOwner.
+		//
+		// There is NO scope for this surface, which is what keeps a token off these
+		// three routes: accountRouteScopes has no row for them, so the scope gate
+		// refuses. That is a separate test — a token is a different kind of caller
+		// than the six columns here, and the matrix is about roles.
+		{
+			name: "mint an api key", method: http.MethodPost,
+			pattern: "/v1/accounts/{accountID}/api-keys", min: accounts.RoleOwner, success: http.StatusCreated,
+			body: func(f *matrixFixture) string {
+				// The name is unique per case: the api_keys index is partial on
+				// revoked_at IS NULL, so a fixed name would make every later column a
+				// 409 for a reason that has nothing to do with authorization.
+				return `{"name":"` + f.caseName + `","scopes":["accounts:read"]}`
+			},
+		},
+		{
+			name: "list the api keys", method: http.MethodGet,
+			pattern: "/v1/accounts/{accountID}/api-keys", min: accounts.RoleOwner, success: http.StatusOK,
+		},
+		{
+			name: "revoke an api key", method: http.MethodDelete,
+			pattern: "/v1/accounts/{accountID}/api-keys/{keyID}", min: accounts.RoleOwner, success: http.StatusNoContent,
+		},
 	}
 }
 
@@ -226,6 +261,12 @@ type matrixFixture struct {
 	pool        *pgxpool.Pool
 	clock       *clock.Fake
 	oidcClients *oidc.Service
+	// apiKeys is the REAL scoped-token service, over the same private schema. The
+	// matrix's three api key rows are about who may mint, list and revoke — which
+	// the use case decides by asking tenancy for the caller's role — so a double
+	// here would answer every column with the 201 the test asked it to and the
+	// matrix would prove nothing.
+	apiKeys *apikeys.Service
 
 	// The account every row is about, and the plain member inside it, which is
 	// what the member-scoped routes act on.
@@ -252,6 +293,10 @@ type matrixFixture struct {
 	// index on pending invitations does not fire for a reason unrelated to
 	// authorization.
 	inviteeEmail string
+	// keyID is a fresh api key in the target account, minted per case for the same
+	// reason clientID is: the revoke row destroys what it is given, so one shared
+	// row would be gone by the second column.
+	keyID id.UUID
 
 	// One actor per column. A fresh target account is built per case, because
 	// one of the cases is "delete the account" and it would take the fixture with
@@ -275,12 +320,15 @@ func newMatrixFixture(t *testing.T) *matrixFixture {
 	tenancy := realTenancy(pool, clk)
 	authSvc := authServiceFor(pool, clk)
 	clients := matrixOIDCClients(t, pool, clk)
+	keys := matrixAPIKeys(pool, clk, tenancy)
 
 	handler := New(nil,
 		WithAuth(authSvc),
 		WithTenancy(tenancy),
 		WithOIDCClients(clients),
 		WithOIDC(newFakeOIDC()),
+		WithAPIKeys(keys),
+		WithAPIKeyCaller(keys),
 		WithLogger(slogLogger(&recordingHandler{})),
 	)
 
@@ -294,12 +342,30 @@ func newMatrixFixture(t *testing.T) *matrixFixture {
 		pool:        pool,
 		clock:       clk,
 		oidcClients: clients,
+		apiKeys:     keys,
 		owner:       actor{name: "owner", role: accounts.RoleOwner},
 		admin:       actor{name: "admin", role: accounts.RoleAdmin},
 		member:      actor{name: "member", role: accounts.RoleMember},
 		stranger:    actor{name: "non-member"},
 		elsewhere:   actor{name: "owner of another account"},
 	}
+}
+
+// matrixAPIKeys is the real scoped-token service over the matrix's pool.
+//
+// It is built here rather than reused from an MFA fixture because the matrix
+// fixture's pool is its own private schema: a service built on another fixture's
+// pool would write rows the matrix could not see and the revoke row would 404.
+func matrixAPIKeys(pool *pgxpool.Pool, clk clock.Clock, tenancy *accounts.Service) *apikeys.Service {
+	return apikeys.NewService(
+		db.TxRunner{Pool: pool},
+		db.Direct{Pool: pool},
+		apikeys.NewStore(pool),
+		outbox.NewStore(pool),
+		tenancy,
+		users.NewStore(pool),
+		clk,
+	)
 }
 
 // register creates a user and a live session for them, through the real use
@@ -408,6 +474,22 @@ func (f *matrixFixture) buildTarget(t *testing.T) {
 		t.Fatalf("creating the pending invitation: %v", err)
 	}
 	f.pendingToken = invited.Token
+
+	// A fresh api key for the revoke row, minted through the real use case so the
+	// row in the matrix is one the service would have written — and through the
+	// OWNER's session semantics (the use case asks for an owner, which the owner
+	// actor is), because a fixture that reached past the authorization decision
+	// would make the revoke row's 404 mean nothing.
+	key, err := f.apiKeys.Mint(t.Context(), apikeys.MintInput{
+		AccountID: f.accountID,
+		Name:      f.label("Matrix"),
+		Scopes:    []string{apikeys.ScopeAccountsRead},
+		MintedBy:  f.owner.user,
+	})
+	if err != nil {
+		t.Fatalf("minting the matrix's api key: %v", err)
+	}
+	f.keyID = key.Key.ID
 }
 
 // label is a short unique name for a fixture row.
@@ -463,7 +545,7 @@ func TestAuthorizationMatrix(t *testing.T) {
 					rec := f.send(t, endpoint, column)
 					if rec.Code != tt.wantStatus {
 						t.Fatalf("%s %s as %s = %d, want %d\nbody: %s",
-							endpoint.method, endpoint.path(f.accountID, f.memberID, f.clientID),
+							endpoint.method, endpoint.path(f.accountID, f.memberID, f.clientID, f.keyID),
 							column.name, rec.Code, tt.wantStatus, rec.Body)
 					}
 					if tt.wantProblemCode == "" {
@@ -542,7 +624,7 @@ func (f *matrixFixture) send(t *testing.T, endpoint matrixEndpoint, column actor
 		body = endpoint.body(f)
 	}
 
-	req := httptest.NewRequest(endpoint.method, endpoint.path(f.accountID, f.memberID, f.clientID), strings.NewReader(body))
+	req := httptest.NewRequest(endpoint.method, endpoint.path(f.accountID, f.memberID, f.clientID, f.keyID), strings.NewReader(body))
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -585,7 +667,16 @@ func mountedAccountRoutes() []string {
 	var found []string
 
 	r := chi.NewRouter()
-	opts := options{tenancy: newFakeTenancy(), auth: newFakeAuth(), oidcClients: newFakeOIDCClients()}
+	// apiKeys is set because registerAPIKeyRoutes returns early without it, and a
+	// walk of a router those three routes are missing from is a walk that would
+	// report the matrix as having rows for routes that do not exist. The doubles
+	// here are irrelevant: nothing is served, chi.Walk only reads the tree.
+	opts := options{
+		tenancy:     newFakeTenancy(),
+		auth:        newFakeAuth(),
+		oidcClients: newFakeOIDCClients(),
+		apiKeys:     newFakeAPIKeys(),
+	}
 	opts.registerTenancyRoutes(r)
 
 	// chi.Walk needs a real method handler; the routes are registered on a mux

@@ -29,7 +29,14 @@ know chi exists to be tested.
 
 ## Dependencies
 
-Four direct dependencies, each with a cause:
+The scoped API token packet added **none**, which is the point worth stating: a
+credential that is a random value in a column, hashed with `crypto/sha256` and
+looked up by an indexed equality, needs nothing from outside the standard library.
+There is no signing key to load, no key to rotate and no trust anchor to publish —
+which is one of the reasons this credential is a row lookup rather than a JWT, and
+one of the reasons it has no cost at boot.
+
+Direct dependencies, each with a cause:
 
 - `chi` — routing, above.
 - `pgx` — Postgres. The pool and the `SKIP LOCKED` claim in the outbox.
@@ -125,6 +132,10 @@ service quietly listening on the wrong port.
 | `POST /v1/mfa/enrollments/:id/confirm` | `200 {"enabled","recovery_codes",…}` | Prove you can produce a code, which makes MFA live and **revokes every session the user holds**. `recovery_codes` is returned here and never again. |
 | `POST /v1/mfa/recovery-codes` | `200 {"recovery_codes",…}` | Issue a new set and destroy the old one, in one transaction. Requires a factor. |
 | `DELETE /v1/mfa` | `204` | Turn MFA off. Requires a factor, and revokes every session. `409 conflict` if MFA is not on. |
+| `POST /v1/accounts/:id/api-keys` | `201 {id, name, scopes, …, token}` | Mint a scoped API token. **Owner only.** `token` is returned here and never again. `409 conflict` if this account already has a live key of that name. |
+| `GET /v1/accounts/:id/api-keys` | `200 [{id, name, scopes, …}]` | The account's credentials, newest first, **revoked ones included**. `[]` and not `null`. **Owner only.** |
+| `DELETE /v1/accounts/:id/api-keys/:keyId` | `204` | Revoke a credential. The row is kept. `409 conflict` if already revoked, `404` for an id that is not there or not in this account. **Owner only.** |
+| `POST /v1/introspections` | `200 {active, …}` or `200 {"active":false}` | What a presented token may do, and for which account. Needed because the token is opaque. |
 | anything else on `/v1` | `404 not_found` | A problem document, not chi's default plain text. |
 
 Every non-2xx is `application/problem+json` per core's error envelope, including
@@ -359,6 +370,227 @@ device is a real feature and a real attack surface — it is a bearer token with
 expiry and no second factor behind it — and it belongs in its own packet with the
 trade-off written down. Until then, every sign-in needs both factors.
 
+### Scoped API tokens
+
+The credential that is **not** a browser session. For a script, a CI job, or
+another service.
+
+There are three credentials here and they are not interchangeable, because their
+failure modes are genuinely different. A session is browser-shaped and dies in
+weeks. An OIDC access token is a JWT for a *third party holding a browser*,
+verifiable against the published JWKS with no call back here. A scoped API token is
+a first-party machine credential: opaque, long-lived, revocable, and carrying a
+scope set. Routing one through another's machinery would give each of them the
+wrong properties — a JWT cannot be revoked before its `exp` arrives, and a session
+cannot carry a scope set an operator curated.
+
+**The wire format** is `cafaye_` plus 43 base64url characters:
+
+```
+cafaye_Zq3vK7mXpR2tY8wB4cN6dF0gH1jK5lM9oP3qS7uV2wX4yZ8
+└──────┘└──────────────────────────────────────────────────┘
+  7              43 characters of 32 bytes of crypto/rand
+```
+
+The prefix is a feature and the feature is **recognition**. A secret that leaks
+into a CI log, a shell history, a support ticket or a paste buffer is recognised
+as a cafaye credential by its first seven characters, which turns "somebody has to
+work out which of these strings is working" into a `grep`. It is the prefix rather
+than a marker in the middle because a scanner — and a truncated log line — looks at
+the first bytes.
+
+The same prefix is the **discriminator** at the door: a session token is looked up
+in `sessions` and an api key in `api_keys`, and the shape decides which table is
+touched before any query runs. A value of the wrong kind is never looked up in the
+wrong place, so "is this token live" cannot be answered by the response time of the
+wrong index.
+
+**What is stored** is the SHA-256 of the presented value and nothing else. The
+plaintext exists once, in the `201`. Not argon2id, and the reasoning is
+`internal/sessions/token.go`'s with the difference this credential's lifetime makes:
+a slow hash would cost every authenticated machine request tens of milliseconds
+across the platform, and what it buys is nothing — 256 bits of `crypto/rand` has
+no structure to guess. The hash is a **deterministic** function because the lookup
+is "hash what was presented and find the row", and a salted password hash cannot be
+looked up at all.
+
+#### A token carries a scope set, not a role
+
+**This is the property worth reading twice.** A token names a user and an account.
+Its authority is re-evaluated on **every request** against that user's *current*
+membership, so:
+
+- **removing somebody from an account stops their tokens on the next request**,
+  with no cache to expire and nothing to sweep;
+- **a demotion takes effect immediately** — the route's 403 appears on the request
+  after it, and only on the routes the new role cannot reach;
+- **re-inviting them does not bring the tokens back.** The removal also revoked
+  what they held, in the same transaction, because re-evaluation alone was not
+  enough: the same person re-invited at the same role satisfies the membership join
+  again, and a contractor's CI credential that died at offboarding would quietly
+  start working the day somebody re-added them. That is a bug this service's own
+  test found and the assertion to read is the *last* one in
+  `TestARemovedMembershipStopsTheTokenOnTheNextRequest`.
+
+The difference between a credential and a permission is exactly this. A token
+stores no role, so there is no stored role to go stale.
+
+#### The scope vocabulary
+
+Four names, a closed set, and every one of them is a capability an existing route
+already enforces a different way. That is the test of a real scope: removing it
+removes access to something that exists. The shape is core's
+(`resource:action`, from `docs/openapi-conventions.md`'s `invoices:write`), and
+`darkroom` already publishes `assets:read` / `assets:write` in the same form.
+
+| Scope | Routes it is enforced on |
+|---|---|
+| `accounts:read` | `GET /v1/accounts/:id`, `GET /v1/accounts/:id/members` |
+| `accounts:write` | `PATCH /v1/accounts/:id`, `POST /v1/accounts/:id/invitations`, `PATCH` and `DELETE /v1/accounts/:id/members/:userId` |
+| `accounts:delete` | `DELETE /v1/accounts/:id`, and nothing else |
+| `oidc_clients:write` | all four `/v1/accounts/:id/oidc-clients` routes |
+
+**Where the vocabulary came from:** `openapi/v1.yaml` and the route table, read
+rather than invented. `accounts:delete` is separate from `accounts:write` because
+it is the only one of them that cannot be undone, and because its route's minimum
+is `owner` where everything else is `admin` — a token carrying `accounts:write`
+and held by somebody who later becomes a member is already refused on the role
+check, so the extra scope is for the owner case, where the role gate alone would
+let it through. `oidc_clients:read` does not exist: both `GET`s are owner-only
+routes whose response *is* the integration's configuration, so a separate read
+scope would be a name nobody in this service has a use for.
+
+**What is deliberately absent, and every absence is a refusal rather than an
+oversight:**
+
+- **no scope for the second factor.** A token cannot read whether an account has
+  MFA, enrol one, rotate one or turn one off. A machine credential that could
+  disable a second factor is a credential whose theft is a *downgrade* rather than
+  a break-in, so the routes refuse a token outright rather than consulting a list.
+- **no scope for sessions.** A token cannot mint, read or revoke a browser session.
+- **no scope for the api keys themselves.** A credential that can mint more
+  credentials is a privilege-escalation path with a nice UI.
+- **no scope that means "everything."** Not `*`, not `accounts:*`, not one named
+  `admin`. "Read this account" and "delete this account" are two decisions a person
+  makes twice.
+- **no scope for the account *collection* routes.** `GET /v1/accounts` answers
+  "which accounts does this **user** belong to", and a token is bound to one
+  account. A CI job holding a credential for one tenant is not entitled to an
+  inventory of every other tenant its owner is in.
+
+**A session carries no scopes and is not refused for that.** A session is a human's
+credential with the full authority of its role; a token is a narrowed one. That
+asymmetry is the whole difference between the two, and it is why the scope check is
+skipped for a session rather than failing it.
+
+A route with **no declared scope is closed to tokens** — `Allows("")` is false for
+every granted set — so a new account route added by a later packet is unreachable
+by a machine credential on the day it lands, not on the day somebody notices it was
+never gated. `TestEveryAccountRouteDeclaresItsScope` and
+`TestEveryScopeIsEnforcedOnItsRoutes` walk the router in both directions.
+
+#### Expiry
+
+**Optional, with a default, and a ceiling.** Omit `expires_in` and the credential
+lives **90 days**. Ask for more and the ceiling is **365**. Ask for `0` or a
+negative number and you get a `422`, because that is where "never expires" would
+have gone and it is not something this build offers.
+
+The 90 is a judgement about two failure modes rather than a round number: long
+enough that a CI job somebody set up in a hurry does not fail on a Tuesday three
+months later, and short enough that "we rotated our tokens" happens without anybody
+having to decide to make it happen. A permanent credential has no such moment, and
+that is the whole of the decision.
+
+**What it costs, stated because it is real:** a CI credential has to be replaced
+every quarter, and that is friction on precisely the use case that motivates the
+feature. What it buys is a moment at which a credential nobody is using gets
+noticed — and `last_used_at` is how that moment is acted on rather than guessed at.
+Rotation is two requests, not a maintenance window: revoke, then mint. Mint the new
+one first if you cannot afford the gap, and revoke the old one when it works.
+
+`last_used_at` is accurate to within **five minutes**, deliberately. A CI token at a
+thousand requests a second must not put a thousand `UPDATE`s a second on one row,
+and a single row's lock is a queue. The write is conditional on the stored value
+being stale, so there is no read-modify-write and zero rows updated is a success.
+
+#### One-time display
+
+`token` is in the `201` body and **nowhere else, ever**. Not in the list, not in a
+single-token read, not in the introspection response, not in the log, not in the
+event payload. A caller that loses it mints another.
+
+`TestTheSecretIsOnTheWireOnceAndNowhereElse` asserts it on the wire, and then
+searches at rest: the whole row as JSON, the whole table, and every event payload
+in the outbox, for the plaintext, for the plaintext without its prefix, and for its
+digest. The digest has to be *found* in that search, or the test would pass on a
+table that stored nothing at all.
+
+There is no "reveal" endpoint, and there is no "rotate" endpoint either — changing
+a token's authority means minting a new one, which means a new secret and a revoked
+old one, so "change the scopes" is exactly "rotate" spelled two ways and a second
+spelling is a second way to get the security property wrong.
+
+#### Refusals are all the same refusal
+
+Unknown, revoked, expired, and one whose owner has been removed from the account
+are all **401** with the same body. `TestEveryRefusalIsTheSameResponse` also
+covers the things a machine will present at this endpoint by accident — a session
+token, a JWT, a truncated paste, the digest itself, binary noise — and asserts the
+`type`, `title`, `status`, `code` and `detail` are identical across all of them.
+
+**The timing story is structural rather than a promise about
+`subtle.ConstantTimeCompare`.** The store never sees the presented value: `Digest`
+turns *anything* into a well-formed 64-character hex string, and the query is an
+ordinary indexed equality on that. So there is no length comparison anywhere on the
+path for an early return to skip, and no function whose runtime reveals how much of a
+guess was right. A constant-time compare is what you reach for when a stored secret
+is compared byte by byte, and nothing here does that.
+
+#### Introspection, and the two claim names
+
+A token is opaque: it has no claims inside it and there is no published key set to
+verify it against. So `POST /v1/introspections` is how a resource server learns
+what a token may do. The response is RFC 7662's shape, and the path is under `/v1`
+because core's rule says every path in this document is — if core fixes an
+introspection path, that is the row to change.
+
+An unusable token answers **`200 {"active": false}`** and nothing else. The status
+is 200 rather than 404 because the endpoint succeeded; the answer is that the token
+is not active. Unknown, revoked, expired and orphaned are indistinguishable, which
+is the whole point: a caller who can tell them apart learns whether a leaked value
+was live.
+
+The caller's *own* standing is a different question with different statuses, because
+it is a different fact about the request: `401` with no credential, `403` for a
+token asking about somebody else's. A token may introspect **itself** — the case a
+CI job needs when it wants to know why it is being refused — and a session may read
+a token in an account it owns.
+
+> **The capability set is emitted TWICE, as `scopes` and as `scope`, byte for byte
+> identical.** That is a deliberate interim and it is not this service's contract.
+> core's `docs/openapi-conventions.md:134` requires a claim named `scopes`;
+> `guard/src/middleware/jwt.ts:32` reads `scope`, splits it on whitespace, and
+> treats an absent claim as an empty set. The fleet has not agreed, the question is
+> open as **MD7**, and picking a side here would mean rotating every credential
+> already in a customer's hand. Emitting both means whichever name wins, the other
+> is a one-line removal from `internal/apikeys/claims.go` and **nothing has to be
+> reissued**. Two names is not a contract.
+>
+> The shape is a space-separated **string**, not an array: that is the one shape
+> both sides can read. guard's verifier does `raw.split(/\s+/)` and refuses a
+> non-string claim, so an array is a token the gateway will not parse at all.
+
+**`account_id` is required and there is no `sub` fallback.** `sub` is the **user**
+the token names; `account_id` is the tenancy boundary and it is always present. A
+token with no account cannot be used against any account, so it is answered
+`{"active": false}` rather than issued a subject to guess a tenancy key from. The
+alternative — falling back to `sub`, as guard's `limitKey` does today — would give a
+service-to-service token a *user* as its tenancy key, and a bug in one service that
+keys on `sub` becomes a cross-tenant read rather than a `403`. Whether guard's
+fallback is safe is **MD8** and is not decided here; what is decided here is that
+identity never produces a token that needs it.
+
 ### The OpenID Connect provider
 
 `identity` is a first-class OIDC **provider**, so any product signs users in
@@ -430,6 +662,7 @@ internal/users/        accounts and the email-uniqueness rules
 internal/sessions/     session tokens, hashing and revocation
 internal/oidc/         the OIDC provider: storage adapter, registrations, the key
 internal/accounts/     the tenancy use cases: accounts, memberships, invitations
+internal/apikeys/      scoped API tokens: the wire format, the scopes, the claims
 internal/oauth/        the social-login client side: state, token cipher, registry
 internal/outbox/       transactional event envelope, SKIP LOCKED claim, publisher
 internal/platform/db/  the pgx pool, and the readiness ping
@@ -536,8 +769,9 @@ named security test being renamed.
 goose SQL files in `migrations/`, numbered and annotated. `goose` is a CLI
 tool, not a module dependency. `00001_init.sql` establishes the convention and
 `00002`–`00004` create `users`, `sessions` and `outbox_events`, `00005`–`00008`
-the tenancy and social-login tables, `00009` the OIDC ones, and `00010` the four
-MFA tables. Migrations are a deploy step, not a boot step — see [migrations/README.md](migrations/README.md).
+the tenancy and social-login tables, `00009` the OIDC ones, `00010` the four MFA
+tables, and `00011` the `api_keys` table. Migrations are a deploy step, not a boot
+step — see [migrations/README.md](migrations/README.md).
 
 ## Image
 
@@ -552,9 +786,33 @@ docker run --rm -p 8080:8080 identity
 ## Not built yet
 
 Everything below is a later packet, and none of it is stubbed to look finished:
-email verification, password reset, scoped API tokens, the admin API, and key
-rotation. No self-service password recovery — a user who forgets a password today
-has no path back in.
+email verification, password reset, the admin API, and key rotation. No
+self-service password recovery — a user who forgets a password today has no path
+back in.
+
+Three things in the scoped-api-token area are specifically **not** here, and each
+is a decision rather than an oversight:
+
+- **No sweep revokes a user's api keys when MFA is enabled.** `sessions` is swept
+  when a second factor goes on and off, and the argument for sweeping a token is
+  stronger — a token is long-lived, named, visible in a settings page, and is
+  exactly what an attacker with a stolen password would mint before the user
+  notices. It is not wired because doing it **silently breaks a CI job**: the user
+  turns on MFA and an unrelated service starts answering 401, with nothing in the
+  MFA response saying why. Doing it honestly needs the count of what was revoked in
+  that response, which changes a landed contract and belongs to whichever packet
+  owns the MFA surface. The index is already there
+  (`api_keys_user_idx`) and the one-statement sweep is written; the *decision* to
+  call it is not made here.
+- **No sweeper emits `identity.api_key.revoked` for an expiry.** core's catalog
+  row says "A scoped API token is revoked or expired" and the expiry half of that
+  has no producer: there is no job. `api_keys_expires_at_idx` is in the migration
+  so the job is one statement when it lands, and an expired token is already
+  refused on resolution.
+- **No rotation endpoint and no reveal endpoint.** "Rotate" is revoke-then-mint,
+  two requests, deliberately: a rotation endpoint that has to preserve the name
+  would be a second spelling of the same security property. And there is nothing to
+  reveal.
 
 Inside the OIDC provider, specifically not built: refresh tokens (access tokens
 live fifteen minutes and cannot be renewed), the implicit flow, client
@@ -567,8 +825,7 @@ document, rather than a stub that looks finished.
 **A product cannot register itself.** Client management is owner-gated on an
 account, reusing `RequireAccountRole`, because `identity` has no platform-admin
 role yet — the admin API is a later packet, and a rule this service cannot
-express would be a rule with a bypass in it. A service-to-service credential for
-a product arrives with the scoped API tokens packet.
+express would be a rule with a bypass in it.
 
 ## Roadmap
 
@@ -582,7 +839,7 @@ a product arrives with the scoped API tokens packet.
 - [x] Accounts, memberships, roles, invitations
 - [x] OIDC provider (zitadel/oidc)
 - [x] MFA: TOTP + recovery codes
-- [ ] Scoped API tokens
+- [x] Scoped API tokens (`cafaye_`-prefixed, four scopes, revocable, expiring)
 - [ ] Admin API
 - [x] Authorization matrix suite (route table × role × anonymous)
 

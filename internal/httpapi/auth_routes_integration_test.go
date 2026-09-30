@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/cafaye/identity/internal/accounts"
+	"github.com/cafaye/identity/internal/apikeys"
 	"github.com/cafaye/identity/internal/auth"
 	"github.com/cafaye/identity/internal/outbox"
 	"github.com/cafaye/identity/internal/platform/clock"
@@ -664,6 +665,7 @@ func realTenancy(pool *pgxpool.Pool, clk clock.Clock) *accounts.Service {
 		db.TxRunner{Pool: pool},
 		accounts.NewStore(pool),
 		outbox.NewStore(pool),
+		apikeys.NewStore(pool),
 		clk,
 		db.Direct{Pool: pool},
 	)

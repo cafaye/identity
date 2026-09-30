@@ -121,11 +121,17 @@ func (o options) registerMFARoutes(r chiRouter) {
 	if o.mfa == nil {
 		return
 	}
-	r.Get("/v1/mfa", o.handleMFAStatus)
-	r.Post("/v1/mfa/enrollments", o.handleStartEnrollment)
-	r.Post("/v1/mfa/enrollments/{enrollmentID}/confirm", o.handleConfirmEnrollment)
-	r.Post("/v1/mfa/recovery-codes", o.handleRegenerateRecoveryCodes)
-	r.Delete("/v1/mfa", o.handleDisableMFA)
+	// EVERY ONE OF THESE IS SESSION-ONLY, and there is no scope for the second
+	// factor in the machine vocabulary. A token that could read whether an account
+	// has a second factor, enrol one, rotate one or turn one off is a credential
+	// whose theft is a DOWNGRADE rather than a break-in: the attacker does not have
+	// to get in, they turn the lock off. The refusal is one middleware rather than
+	// five checks — see sessionCredentialOnly.
+	r.Get("/v1/mfa", o.sessionCredentialOnly(o.handleMFAStatus))
+	r.Post("/v1/mfa/enrollments", o.sessionCredentialOnly(o.handleStartEnrollment))
+	r.Post("/v1/mfa/enrollments/{enrollmentID}/confirm", o.sessionCredentialOnly(o.handleConfirmEnrollment))
+	r.Post("/v1/mfa/recovery-codes", o.sessionCredentialOnly(o.handleRegenerateRecoveryCodes))
+	r.Delete("/v1/mfa", o.sessionCredentialOnly(o.handleDisableMFA))
 }
 
 // ---------------------------------------------------------------------------

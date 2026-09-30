@@ -64,6 +64,109 @@ All notable changes to identity are recorded here. The format follows
   parses no YAML: a YAML dependency would move `go.mod`, and AGENTS.md's rule is that
   `go.mod` moves only for a stated cause.
 
+- `internal/apikeys` — the scoped API token: the credential that is **not** a
+  browser session, for a script, a CI job or another service. `cafaye_` plus 32
+  bytes of `crypto/rand`; the row holds the SHA-256 of the presented value and
+  nothing else.
+  - **A token carries a scope set, not a role.** Its authority is re-read on every
+    request against the owner's *current* membership, so a demotion or a removal
+    takes effect on the very next request with no cache to expire and nothing to
+    sweep. The store's resolution query inner-joins `account_users` and reads the
+    role in the same statement — that join is the whole packet.
+  - **A removed member's credentials are revoked, in the same transaction as the
+    membership delete** — and this is the part that took two attempts. Re-evaluating
+    the role is not enough on its own: the same user re-invited to the same
+    account at the same role satisfies the join again, so a contractor's CI
+    credential that died at offboarding quietly starts working the day somebody
+    re-adds them. `TestARemovedMembershipStopsTheTokenOnTheNextRequest` in
+    `internal/httpapi` is the test, and its *last* assertion is the one that failed
+    first. `accounts.Service.RemoveMember` now calls
+    `apikeys.Store.RevokeAllForMember`, through an interface declared in
+    `accounts` — `apikeys` imports `accounts` for `accounts.Role`, so a direct
+    import back would be a cycle. The sweep may be `nil`, and then a removal still
+    removes: refusing to offboard anybody because a table that does not exist is
+    unavailable is an availability bug dressed as a safety one.
+  - **The capability set is published under BOTH claim names, and that is a
+    deliberate interim, not the contract.** `POST /v1/introspections` emits
+    `scopes` (core's name, `docs/openapi-conventions.md:134`) and `scope` (guard's
+    name, `src/middleware/jwt.ts:32`), **byte for byte identical**, both
+    space-separated strings. The fleet has not agreed and the question is open as
+    **MD7** in the manager's `DECISIONS.md`; it has been recorded twice before and
+    answered neither time. Emitting both is a deliberate interim **to avoid
+    rotating credentials already in a customer's hand** — it is **not the
+    contract**, and the flip is **a one-line removal** from
+    `internal/apikeys/claims.go` once MD7 is ruled, with no credential reissued.
+    Two names is not a contract; it is the cost of not rotating credentials over an
+    unanswered question. `TestTheTwoScopeClaimNamesAreEqual` holds them together in
+    a struct and `TestIntrospectionPublishesBothScopeClaimNames` holds them
+    together on the wire, which is the only place a consumer sees them. The shape
+    is a **string**, not an array: guard splits on whitespace and refuses a
+    non-string claim, so an array is a token the gateway will not parse.
+  - **`account_id` is required and nothing falls back to `sub`.** `sub` is the
+    *user* a token names; `account_id` is the tenancy boundary and is always
+    present, and a token with no account is answered `{"active": false}` rather
+    than issued a subject to guess a tenancy key from. Falling back to `sub` — as
+    guard's `limitKey` does today — would give a service-to-service token a user
+    as its tenancy key, so a bug in one service that keys on `sub` becomes a
+    cross-tenant read rather than a `403`. Whether guard's fallback is safe is
+    **MD8** and is not decided here; what is decided is that identity never
+    produces a token that needs it.
+  - **The vocabulary is four names and every one is a capability an existing route
+    already enforces**: `accounts:read`, `accounts:write`, `accounts:delete`,
+    `oidc_clients:write`, in core's `resource:action` shape and read off this
+    service's own route table rather than invented. There is deliberately **no**
+    scope for the second factor, for sessions, for the api keys themselves, for
+    the account *collection* routes, and none that means "everything" — and a
+    route with no declared scope is **closed to tokens**, so a new account route
+    added by a later packet is unreachable by a machine credential on the day it
+    lands. `TestEveryAccountRouteDeclaresItsScope` and
+    `TestEveryScopeIsEnforcedOnItsRoutes` walk the router in both directions, and
+    `TestScopeEnforcementIsWiredToTheRoutes` makes real requests with a real token
+    holding exactly one scope.
+  - **Expiry is optional with a default and a ceiling: 90 days, 365 maximum, and
+    `0` is a 422.** That is where "never expires" would have gone and it is not
+    something this build offers. The cost is real and is stated: a CI credential
+    has to be replaced every quarter, which is friction on precisely the use case
+    that motivates the feature. What it buys is a moment at which a credential
+    nobody is using gets noticed, and `last_used_at` — accurate to within five
+    minutes, because a busy token must not be a write per request — is how that
+    moment is acted on.
+  - **The secret is shown once, and the test that proves it searches the database.**
+    `TestTheSecretIsOnTheWireOnceAndNowhereElse` checks the wire, then renders the
+    whole row, the whole table and every outbox envelope and searches them for the
+    plaintext, for the plaintext without its prefix, and for its digest. The digest
+    has to be *found*, or the test would pass on a table storing nothing.
+  - **Every refusal is the same refusal**, and the timing answer is structural: the
+    store never sees the presented value, `Digest` turns anything into a well-formed
+    64-character hex string, and the lookup is an indexed equality on that. There is
+    no length comparison on the path to branch on.
+  - One live credential per name per account, enforced by a partial unique index —
+    so "revoke ci-deploy" is never ambiguous and rotation is two requests rather
+    than a transaction that has to find a name free first.
+  - `identity.api_key.created` and `identity.api_key.revoked`, both core's catalog
+    names, each written inside the transaction that changed the row. The subject is
+    the credential's own id, and no payload carries a credential or a digest.
+
+- `POST /v1/introspections` — what a presented token may do, and for which account.
+  It exists because the token is **opaque**: no claims inside it, no published key
+  set, so asking identity is the only way a resource server can learn a scope.
+  RFC 7662's response shape, on a `/v1` path because core's rule puts every path
+  in this document there. An unusable token answers `200 {"active": false}` and
+  nothing else — unknown, revoked, expired and orphaned are indistinguishable, which
+  is the point. The caller's own standing is a separate question with separate
+  statuses: a token may introspect itself, a session may read a token in an account
+  it owns.
+
+- **A scoped token is refused with 403 on the surfaces it has no scope for** — the
+  second factor, the session surface, the api-key surface, and the three account
+  *collection* routes. 403 and not 401, because the token is authenticated and a 401
+  would send a developer looking for a login problem. Three of these are changes to
+  existing routes: `DELETE /v1/session` used to answer **204** to a token, because
+  `Logout` treats an unknown token as a success so that logging out twice is not an
+  error — nothing was revoked and the caller was told it had been. The MFA routes
+  used to answer **401 "authentication is required"** to a live token, which is a
+  lie.
+
 - `internal/mfa` — the second factor: TOTP enrollment, the challenge a login waits
   on, recovery codes, and the lockout that stops somebody who has stolen a password
   from finishing the job with six digits of guessing. `github.com/pquerna/otp`
@@ -141,6 +244,13 @@ All notable changes to identity are recorded here. The format follows
     generated**: a key generated at boot would mean every restart invalidates every
     enrolled user's secret, and a restart is not something anybody decides to do.
 
+### Fixed
+
+- The HTTP layer called `time.Now()` when resolving a credential, so the test suite
+  could not age one out without sleeping and the expiry cases were silently testing
+  nothing. It takes a clock from `options` now — the same seam every use case reads
+  time through.
+
 ### Changed
 
 - Two defects in `.github/workflows/ci.yml`, both found by executing the steps
@@ -161,6 +271,9 @@ All notable changes to identity are recorded here. The format follows
     possible, but the log carried no reason at all. `|| true` on the pipeline
     lets the empty list through to the check, which now prints
     `the database tier matched no test file.`
+- **`accounts.NewService` takes a `CredentialRevoker`.** It may be `nil`, and then a
+  member removal changes only the membership — the supported configuration for a
+  deployment with no api key table.
 - `auth.NewService` takes a **required** `SecondFactor`. A login that cannot ask
   whether an account has a second factor now returns `ErrNoSecondFactor` instead
   of minting a session — that failure is silent by construction otherwise, since

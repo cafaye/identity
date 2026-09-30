@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,11 +25,12 @@ import (
 // which writes land in the same transaction as which.
 
 type harness struct {
-	svc    *Service
-	store  *Store
-	events *recordedEvents
-	clock  *clock.Fake
-	q      db.Querier
+	svc     *Service
+	store   *Store
+	events  *recordedEvents
+	revokes *recordedRevocations
+	clock   *clock.Fake
+	q       db.Querier
 }
 
 func newHarness(t *testing.T) *harness {
@@ -37,21 +39,60 @@ func newHarness(t *testing.T) *harness {
 	pool := dbtest.Schema(t)
 	clk := clock.NewFake(time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC))
 	events := &recordedEvents{}
+	revokes := &recordedRevocations{}
 	store := NewStore(pool)
 
 	return &harness{
-		store:  store,
-		events: events,
-		clock:  clk,
-		q:      pool,
+		store:   store,
+		events:  events,
+		revokes: revokes,
+		clock:   clk,
+		q:       pool,
 		svc: NewService(
 			db.TxRunner{Pool: pool},
 			store,
 			events,
+			revokes,
 			clk,
 			db.Direct{Pool: pool},
 		),
 	}
+}
+
+// recordedRevocations is the CredentialRevoker double.
+//
+// It exists rather than the real api key store because this package CANNOT import
+// that one: internal/apikeys imports this package for accounts.Role, so a real one
+// here would be an import cycle that exists only because a role is a type on both
+// sides. The double records what the use case asked for, which is the whole of
+// this package's half of the contract — the table it reaches is apikeys' problem
+// and is tested there.
+type recordedRevocations struct {
+	mu       sync.Mutex
+	calls    []revocation
+	failWith error
+}
+
+type revocation struct {
+	accountID id.UUID
+	userID    id.UUID
+	at        time.Time
+}
+
+func (r *recordedRevocations) RevokeAllForMember(_ context.Context, _ db.Querier, accountID, userID id.UUID, at time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failWith != nil {
+		return r.failWith
+	}
+	r.calls = append(r.calls, revocation{accountID: accountID, userID: userID, at: at})
+	return nil
+}
+
+func (r *recordedRevocations) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
 }
 
 // recordedEvents keeps the envelopes, so a test can assert that an event was
@@ -712,6 +753,123 @@ func TestRemoveMemberThroughTheService(t *testing.T) {
 		AccountID: account.ID, UserID: admin, Actor: owner,
 	}); err != nil {
 		t.Errorf("an owner removing an admin = %v, want success", err)
+	}
+}
+
+// TestRemoveMemberRevokesTheCredentialsTheyHeld is the rule this package exists to
+// enforce on behalf of another one, and it is worth its own test here rather than
+// only in internal/apikeys because THE USE CASE IS WHERE THE DECISION LIVES.
+//
+// THE STORY IT TELLS IS AN OFFBOARDING. A user is removed from an account, which
+// stops every machine credential they hold in it — and the second half is the one
+// that is easy to miss: the credential must not come BACK when the same person is
+// re-invited. A token whose authority is only re-evaluated would satisfy the
+// membership join again the moment a new row existed, and a contractor's CI
+// credential that was supposed to have died at offboarding would quietly start
+// working the day somebody re-adds them. So the removal revokes, explicitly, in the
+// same transaction.
+//
+// It is the same transaction on purpose. A membership deleted and a credential
+// left live is a state neither is defensible on its own: the operator believes both
+// happened or neither did.
+func TestRemoveMemberRevokesTheCredentialsTheyHeld(t *testing.T) {
+	h := newHarness(t)
+	owner := addUser(t, h.q)
+	account := h.owned(t, "Departures", owner)
+	target := h.member(t, account.ID, RoleMember)
+
+	if err := h.svc.RemoveMember(t.Context(), RemoveMemberInput{
+		AccountID: account.ID, UserID: target, Actor: owner,
+	}); err != nil {
+		t.Fatalf("removing: %v", err)
+	}
+
+	if h.revokes.count() != 1 {
+		t.Fatalf("the removal swept credentials %d times, want 1", h.revokes.count())
+	}
+	got := h.revokes.calls[0]
+	if got.accountID != account.ID {
+		t.Errorf("the sweep was scoped to account %s, want %s", got.accountID, account.ID)
+	}
+	if got.userID != target {
+		t.Errorf("the sweep was scoped to user %s, want the member who was removed %s", got.userID, target)
+	}
+	// The same instant the removal and the event carry, so "when was this
+	// credential withdrawn" and "when was this person removed" have one answer.
+	if !got.at.Equal(h.clock.Now()) {
+		t.Errorf("the sweep ran at %s, want the service clock's %s", got.at, h.clock.Now())
+	}
+
+	// A REFUSED removal sweeps nothing. An admin who cannot remove the owner must
+	// not leave that owner's credentials revoked on the way to being told no — a
+	// sweep outside the transaction's success path is a partial write.
+	before := h.revokes.count()
+	if err := h.svc.RemoveMember(t.Context(), RemoveMemberInput{
+		AccountID: account.ID, UserID: owner, Actor: h.member(t, account.ID, RoleAdmin),
+	}); !errors.Is(err, ErrOwnerProtected) {
+		t.Fatalf("an admin removing the owner = %v, want ErrOwnerProtected", err)
+	}
+	if h.revokes.count() != before {
+		t.Error("a refused removal swept credentials anyway")
+	}
+}
+
+// TestARemovalThatCannotSweepRollsBack is the other direction of the same
+// transaction, and it is the one that would be a real incident: the membership is
+// gone and the credentials are live, or the reverse. A revoker that fails must take
+// the whole removal with it.
+func TestARemovalThatCannotSweepRollsBack(t *testing.T) {
+	h := newHarness(t)
+	owner := addUser(t, h.q)
+	account := h.owned(t, "Departures", owner)
+	target := h.member(t, account.ID, RoleMember)
+
+	h.revokes.failWith = errors.New("the api_keys table is not reachable")
+	if err := h.svc.RemoveMember(t.Context(), RemoveMemberInput{
+		AccountID: account.ID, UserID: target, Actor: owner,
+	}); err == nil {
+		t.Fatal("a removal succeeded with a revoker that failed")
+	}
+
+	// The membership is back, and the event was not written: both writes were inside
+	// the transaction the sweep's failure rolled back.
+	if _, err := h.svc.Member(t.Context(), account.ID, target); err != nil {
+		t.Errorf("the membership was removed even though the sweep failed: %v", err)
+	}
+	for _, e := range h.events.appended {
+		if e.Type == outbox.EventMemberRemoved {
+			t.Error("identity.member.removed was announced for a removal that rolled back")
+		}
+	}
+}
+
+// TestARemovalWithNoRevokerStillRemovesTheMembership: the sweep may be nil — a
+// deployment with no api key table has no credentials to revoke — and the
+// membership change must still happen. Refusing to offboard anybody because a
+// table that does not exist is not available would be a availability bug dressed up
+// as a safety one.
+func TestARemovalWithNoRevokerStillRemovesTheMembership(t *testing.T) {
+	h := newHarness(t)
+	owner := addUser(t, h.q)
+	account := h.owned(t, "Departures", owner)
+	target := h.member(t, account.ID, RoleMember)
+
+	// A service with no revoker, built the production way with a nil.
+	withoutSweep := NewService(
+		db.TxRunner{Pool: h.q.(db.Pool)},
+		h.store,
+		h.events,
+		nil,
+		h.clock,
+		db.Direct{Pool: h.q.(db.Pool)},
+	)
+	if err := withoutSweep.RemoveMember(t.Context(), RemoveMemberInput{
+		AccountID: account.ID, UserID: target, Actor: owner,
+	}); err != nil {
+		t.Fatalf("removing with no revoker wired: %v", err)
+	}
+	if _, err := withoutSweep.Member(t.Context(), account.ID, target); !errors.Is(err, ErrNotAMember) {
+		t.Errorf("the membership survived a removal with no revoker: %v", err)
 	}
 }
 

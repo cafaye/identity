@@ -125,7 +125,15 @@ func (o options) registerRoutes(r chiRouter) {
 
 	r.Post("/v1/users", o.handleRegister)
 	r.Post("/v1/session", o.handleLogin)
-	r.Delete("/v1/session", o.handleLogout)
+	// SESSION-ONLY, and it has to be said out loud rather than left to fall out of
+	// the lookup: a token presented here resolves to no session, Logout treats an
+	// unknown token as a success because logging out twice is not an error, and the
+	// caller is answered 204 — "your session was revoked" — when nothing was. The
+	// token still works afterwards, so nothing is compromised; but a client that
+	// believed the 204 would think its credential was gone. There is no scope for
+	// the session surface at all: a token cannot mint, read or revoke a browser
+	// session.
+	r.Delete("/v1/session", o.sessionCredentialOnly(o.handleLogout))
 	r.Get("/v1/me", o.handleMe)
 
 	// THE SECOND STEP OF A LOGIN, mounted beside the first and deliberately NOT
@@ -136,7 +144,12 @@ func (o options) registerRoutes(r chiRouter) {
 	// here would say this service has never heard of MFA, and a client that believed
 	// it would be free to treat the absence of a challenge as the absence of a
 	// requirement — which is the bypass, expressed as a routing decision.
-	r.Post("/v1/session/mfa", o.handleCompleteSecondFactor)
+	// The login's second step is NOT a session surface in the sense above: it takes
+	// a challenge token rather than a credential, and a challenge is not a session
+	// and cannot be replayed. A scoped token presenting one gets the same 403 as
+	// every other non-session credential, because the answer to a challenge is a
+	// browser session and a machine holding one has no use for it.
+	r.Post("/v1/session/mfa", o.sessionCredentialOnly(o.handleCompleteSecondFactor))
 
 	// The account routes need both services: a session to resolve the caller from
 	// and a tenancy service to resolve their role in it. With only one of the two
@@ -157,6 +170,14 @@ func (o options) registerRoutes(r chiRouter) {
 	if o.oidc != nil {
 		o.registerOIDCRoutes(r)
 	}
+
+	// The introspection surface. Not account-scoped and not conditional on the OIDC
+	// provider, because it introspects an OPAQUE first-party credential and has
+	// nothing to do with the JWT one: the provider's own introspection is still a
+	// refusal, and a deployment with a database and no signing key still answers
+	// this one. Absent without WithIntrospection, for the reason every other route
+	// is: a misconfiguration is a 404, not a 500.
+	o.registerIntrospectionRoute(r)
 }
 
 // chiRouter is the slice of *chi.Mux these routes need. Naming it keeps the

@@ -128,12 +128,48 @@ from it with a domain-separated SHA-256 rather than configured separately — it
 one secret to rotate, and it is genuinely used, because the userinfo handler
 decrypts an access token before it verifies one.
 
+**There are three credentials, and the prefix is how two of them are told apart.**
+A session token and a scoped api key are both opaque bearer values, and
+`apikeys.Prefix` decides which table a presented value is looked up in before any
+query runs. Nothing else may: not a length, not a character class, not a "does it
+look like a JWT" check. A credential's shape is a public fact, and the whole
+security property is that a value of the wrong kind never reaches the wrong index.
+
+**A token carries a scope set, never a role.** There is no `role` column on
+`api_keys` and there must not be one. A role on a token is a permission that goes
+stale, and a stale permission is the thing this table exists to avoid — so the
+resolution query inner-joins `account_users` and re-reads the role on every
+request. A second place that could *store* authority is a second thing to get
+stale, and the sweep in `accounts.Service.RemoveMember` exists precisely because
+re-evaluation alone lets a re-invitation resurrect a credential: the join is
+satisfied again. If you add a column that would let a token answer "what may I do"
+without a membership read, the packet's reason has been undone.
+
+**A route with no declared scope is closed to tokens.** The scope table in
+`internal/httpapi/accounts.go` is keyed by the chi pattern, `scopeRequiredBy`
+returns `""` for a route that is not in it, and `Allows("")` is false for every
+granted set. So a new account route is unreachable by a machine credential on the
+day it lands rather than the day somebody notices it was never gated. The failure
+direction is the whole point: a route that needs a scope and does not have one is
+closed, never open.
+
+**`accountRouteScopes` is the only scope table, and the OpenAPI document is its
+mirror.** Two lists that have to agree, because a scope that gates a route nobody
+documented is invisible to a generated client and a scope documented on a route
+that does not gate it is a promise this service does not keep. Both directions are
+walked by a test in `internal/httpapi`.
+
 **Stubs stay honest.** A packet that is not written yet is absent, not a
 `not implemented` fake that looks finished. The README's "Not built yet" list is
 the source of truth for what v0 does not claim. A method the library's interface
 requires but this packet does not mount is still implemented correctly rather than
 returning a plausible-looking success, because a fake is a lie waiting for the day
-somebody mounts the endpoint.
+somebody mounts the endpoint. **A tested but unwired method is the same lie from
+the other side** — and this repository had one: an `apikeys.Store` sweep for
+"revoke everything this user holds", with a test, for an MFA sweep this service
+does not perform. It was deleted rather than left, because an unwired method is an
+invitation to wire it without reading why it was not wired, and the honest state
+for "we decided not to do this" is a paragraph in the README and no code.
 
 **Comments say why.** Explain the decision and the constraint, not the
 mechanism. A comment restating the line below it is noise.
@@ -191,7 +227,10 @@ the toolchain pin matches `go.mod`, and that no secret is written down.
 4. If it needs a dependency, add a `Check` to the slice `newApp` builds — never a
    bespoke health path.
 5. An account-scoped route goes in `registerTenancyRoutes` AND gets a row in
-   `matrixEndpoints()`; `TestEveryRouteIsInTheMatrix` fails otherwise. The
+   `matrixEndpoints()` AND a row in `accountRouteScopes` **if a token may reach
+   it**. `TestEveryRouteIsInTheMatrix` and `TestEveryAccountRouteDeclaresItsScope`
+   fail otherwise. A route with no scope row is closed to tokens, which is the safe
+   direction, so "I did not add a row" is a decision and not an oversight. The
    matrix's fixture names its accounts with a counter and not with the test path,
    because `accounts.Slugify` truncates at 63 characters and two long names that
    share a prefix become one slug.
