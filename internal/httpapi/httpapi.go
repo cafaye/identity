@@ -62,6 +62,10 @@ type options struct {
 	// The login's second step is NOT here: it goes through Auth, because
 	// auth.Service is where a session is minted. See the note in mfa.go.
 	mfa MFAManage
+	// admin is the ADMIN surface: revoking invitations and reading the immutable
+	// audit trail. It is token-only (see requireAdminToken) and absent without it,
+	// like every other optional surface here.
+	admin Admin
 }
 
 // Option customises the handler built by New.
