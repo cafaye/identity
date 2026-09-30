@@ -1,0 +1,42 @@
+# cafaye.yml — the cafaye project manifest for identity.
+#
+# DRAFT. The schema is owned by cafaye/core, not by this repository. This file
+# records the shape identity is being built against; when core freezes the
+# manifest spec, this file is replaced by `caf init`, which generates it from
+# the schema and validates it. Do not add fields here that core does not define.
+#
+# GUESSED FIELDS — these are marked `# GUESS` below and are the reconciliation
+# list for whoever freezes the core schema:
+#   - top level `version` and `name`            (guessed: the shape caf drafted)
+#   - `languages[].name/version`                 (guessed: core may want a
+#                                                 `toolchain` field, or a
+#                                                 per-language build config)
+#   - `contracts[]` and how a contract is named   (guessed: empty is certain,
+#                                                 the entry shape is not)
+#   - `description`                             (guessed: may be `summary`, or
+#                                                 absent entirely)
+#   - `dev.services[]` and its fields            (guessed: whether the value is
+#                                                 an image reference or a name
+#                                                 resolved against a catalog)
+
+version: 1
+
+name: identity
+description: cafaye identity — auth, sessions, MFA, OAuth, accounts and tenancy, OIDC.
+
+# The languages in this project, and the toolchain each one is built with. The Go
+# version here must match the go directive in go.mod and the lint config's
+# floor; three places, one number.
+languages:
+  - name: go
+    version: "1.26"
+
+# The contract packages this project owns. Empty for now: identity's API is not
+# spec'd yet, and contracts land with cafaye/core.
+contracts: []
+
+# Local development stack. `caf dev` reads this to decide what to run; the
+# values are defaults only, and every one is overridable by a flag. The stack
+# itself is declared in docker-compose.yml, which `caf dev` brings up.
+dev:
+  services: []

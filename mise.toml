@@ -1,0 +1,35 @@
+# Toolchain pins for this repository. identity is a single static Go binary with
+# no other runtime dependency, so the go pin is the whole file.
+#
+#   mise install     # install the pinned toolchain
+#   mise run prime   # the gate
+[tools]
+go = "1.26"
+
+[tasks.prime]
+description = "The gate: download, build, test"
+run = "./bin/prime"
+
+[tasks.build]
+description = "Build the identity binary into ./identity"
+run = "go build -o identity ./cmd/identity"
+
+[tasks.run]
+description = "Run identity locally, no database"
+run = "go run ./cmd/identity"
+
+[tasks.fmt]
+description = "Fail if anything needs gofmt"
+run = "test -z \"$(gofmt -l .)\""
+
+[tasks.vet]
+description = "go vet"
+run = "go vet ./..."
+
+[tasks.compose-up]
+description = "Start the local stack: postgres and identity"
+run = "docker compose up -d"
+
+[tasks.compose-down]
+description = "Stop the local stack"
+run = "docker compose down"

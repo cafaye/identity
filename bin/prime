@@ -1,0 +1,10 @@
+# The gate for a Go repository in the cafaye org. Download, build, test.
+#
+#   bin/prime
+#
+# This is the kit Go template; if kit changes it, follow kit.
+set -eu
+
+go mod download
+go build ./...
+go test ./...
