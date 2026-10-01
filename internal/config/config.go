@@ -62,6 +62,22 @@ var (
 	// sentinel from ErrInvalidMFA because the two lead to completely different
 	// places — one starts up, the other mounts a reduced surface and logs why.
 	ErrNoMFAEncryptionKey = errors.New("MFA_ENCRYPTION_KEY is not configured")
+
+	// ErrInvalidCourier means the courier block is present and unreadable: a base
+	// URL that is not one, or a recovery link template that cannot produce a
+	// working link. A startup failure rather than a degraded mode, for the reason
+	// the OIDC and MFA blocks are — a deployment whose mail configuration is wrong
+	// cannot send a password reset, and it would find out from a user who never got
+	// one, in front of somebody waiting on a link.
+	ErrInvalidCourier = errors.New("invalid courier configuration")
+
+	// ErrNoCourierToken means COURIER_TOKEN is not set at all, which is a
+	// SUPPORTED state: a deployment with no mail path. It is a distinct sentinel
+	// from ErrInvalidCourier for the same reason ErrNoMFAEncryptionKey is distinct
+	// from ErrInvalidMFA — one starts up and mounts a reduced surface, the other
+	// refuses to start, and conflating them would either refuse to boot a
+	// legitimate deployment or silently boot a broken one.
+	ErrNoCourierToken = errors.New("COURIER_TOKEN is not configured")
 )
 
 // DefaultMFAIssuer is what an authenticator app displays next to the entry when
@@ -108,6 +124,23 @@ type Config struct {
 	// MFAIssuerLabel is what an authenticator app displays. It is NOT a secret, and
 	// changing it is harmless to every credential already confirmed.
 	MFAIssuerLabel string
+
+	// The courier block: the platform's mail service, and the only thing that can
+	// deliver a recovery message.
+	//
+	// ALL THREE ARE REQUIRED TOGETHER OR NOT AT ALL, for the same all-or-nothing
+	// reason the OIDC block is. A base URL with no credential would send every
+	// request as an anonymous caller, and courier's answer to that is a 401 on a
+	// mail egress; a credential with no base URL is a secret with nowhere to go; and
+	// a link template is what turns a reset token into a link a person can follow,
+	// so without it a "sent" reset mail would arrive with nothing to click.
+	//
+	// The token is never logged and never rendered, and it is read from the
+	// environment rather than a file so the secret is whatever the deployment's
+	// secret store already is.
+	CourierBaseURL       string
+	CourierTokenValue    string
+	RecoveryLinkTemplate string
 }
 
 // MFAEncryptionKey returns the configured key, or ErrNoMFAEncryptionKey.
@@ -158,6 +191,28 @@ func (c Config) OIDCEnabled() bool {
 	return c.OIDCIssuer != "" && c.OIDCSigningKey != "" && c.OIDCKeyID != ""
 }
 
+// CourierToken returns the service credential, or ErrNoCourierToken.
+//
+// The split sentinel matters at the one place it is used: `main` treats "absent"
+// as a deployment with no mail path and mounts `recovery.Unavailable{}`, and treats
+// "present and unreadable" as a startup failure. Those are opposite behaviours and
+// an operator who cannot tell them apart from the log has been told nothing.
+func (c Config) CourierToken() (string, error) {
+	if c.CourierTokenValue == "" {
+		return "", ErrNoCourierToken
+	}
+	return c.CourierTokenValue, nil
+}
+
+// CourierEnabled reports whether this deployment can send a message.
+//
+// One boolean rather than three checks at the use site, because the decision is one
+// thing — either this process has a mail path or it does not — and a caller that
+// checked three fields could get a combination this service does not allow.
+func (c Config) CourierEnabled() bool {
+	return c.CourierBaseURL != "" && c.CourierTokenValue != "" && c.RecoveryLinkTemplate != ""
+}
+
 // Load reads the environment through lookup and returns a validated Config.
 //
 // A nil lookup means "no environment": the defaults apply. Values that are
@@ -200,6 +255,10 @@ func Load(lookup Lookup) (Config, error) {
 		return Config{}, err
 	}
 
+	if err := cfg.loadCourier(lookup); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
 }
 
@@ -239,6 +298,127 @@ func (c *Config) loadMFA(lookup Lookup) error {
 	c.MFAEncryptionKeyValue = decoded
 	return nil
 }
+
+// loadCourier reads and validates the courier block.
+//
+// IT MIRRORS `loadOIDC`'s all-or-nothing rule and for the same reason: three
+// variables that only make sense together, and a partial block is a deployment that
+// believes it can send mail.
+//
+// Absent is supported. All three unset is a process with no mail path, which is a
+// legitimate deployment — a local stack, or one where courier is not deployed yet —
+// and it mounts `recovery.Unavailable{}` so every route that needs a message answers
+// 503 with a sentence saying why.
+//
+// The base URL is checked HERE rather than by the courier client. That is the whole
+// point of loading it at boot: a URL that does not parse is a typo, and a typo found
+// by the first user's password reset is a typo found in front of somebody who cannot
+// sign in.
+func (c *Config) loadCourier(lookup Lookup) error {
+	baseURL := lookupValue(lookup, "COURIER_BASE_URL")
+	token := lookupValue(lookup, "COURIER_TOKEN")
+	linkTemplate := lookupValue(lookup, "RECOVERY_LINK_TEMPLATE")
+
+	present := 0
+	for _, value := range []string{baseURL, token, linkTemplate} {
+		if value != "" {
+			present++
+		}
+	}
+	if present == 0 {
+		return nil
+	}
+	if present != 3 {
+		return fmt.Errorf("%w: COURIER_BASE_URL, COURIER_TOKEN and RECOVERY_LINK_TEMPLATE "+
+			"must all be set, or none of them", ErrInvalidCourier)
+	}
+
+	if err := validateMailBaseURL(baseURL); err != nil {
+		return err
+	}
+	if err := validateRecoveryLinkTemplate(linkTemplate); err != nil {
+		return err
+	}
+
+	c.CourierBaseURL = baseURL
+	c.CourierTokenValue = token
+	c.RecoveryLinkTemplate = linkTemplate
+	return nil
+}
+
+// validateMailBaseURL refuses a courier address that is not one.
+//
+// IT IS DUPLICATED RATHER THAN CALLED because the rule is identity's at boot and
+// `internal/courier`'s at construction, and the two must be true independently: this
+// service should refuse to start on a bad URL whether or not a courier client is
+// built, and the client should refuse to exist on one whether or not something else
+// validated it. `TestTheBootRulesAndTheClientRulesAgree` holds them in step.
+func validateMailBaseURL(raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("%w: COURIER_BASE_URL is not a URL: %v", ErrInvalidCourier, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("%w: COURIER_BASE_URL scheme is %q, want https",
+			ErrInvalidCourier, parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("%w: COURIER_BASE_URL has no host", ErrInvalidCourier)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		// A base URL with a query is a base URL somebody is about to concatenate a
+		// path onto, and the result is a request whose query this service did not
+		// write.
+		return fmt.Errorf("%w: COURIER_BASE_URL has a query or a fragment", ErrInvalidCourier)
+	}
+	return nil
+}
+
+// validateRecoveryLinkTemplate refuses a template that cannot produce a link a
+// person can follow.
+//
+// THE PLACEHOLDER IS REQUIRED and the check runs against a SUBSTITUTED copy rather
+// than the raw string, because `{token}` is not a legal URI character: validating
+// the template as written would let through a shape courier's `format: uri` rejects
+// once the real token is in it.
+func validateRecoveryLinkTemplate(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if !strings.Contains(trimmed, recoveryTokenPlaceholder) {
+		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE has no %s in it, so a reset link "+
+			"would carry no token", ErrInvalidCourier, recoveryTokenPlaceholder)
+	}
+	probe := strings.ReplaceAll(trimmed, recoveryTokenPlaceholder, "6f5d4c3b-2a19-4e8f-9c07-1b2d3e4f5061")
+	parsed, err := url.Parse(probe)
+	if err != nil {
+		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE is not a URL: %v", ErrInvalidCourier, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE scheme is %q, want https",
+			ErrInvalidCourier, parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE has no host", ErrInvalidCourier)
+	}
+	if parsed.Fragment != "" {
+		// A fragment is not sent to a server, so a token in one reaches a browser
+		// and never the screen that redeems it.
+		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE has a fragment; a mail client "+
+			"does not send one to a server", ErrInvalidCourier)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE has a userinfo section", ErrInvalidCourier)
+	}
+	return nil
+}
+
+// recoveryTokenPlaceholder is the marker a link template must contain.
+//
+// IT IS DECLARED HERE AND NOT IMPORTED FROM `internal/courier` because the
+// dependency runs the other way: `internal/courier` implements
+// `recovery.Mailer` and this package is the service's configuration. Duplicating one
+// constant is cheaper than an import that inverts the layering, and
+// `TestTheBootPlaceholderIsCouriersPlaceholder` holds the two in step.
+const recoveryTokenPlaceholder = "{token}"
 
 // loadOIDC reads and validates the OIDC block.
 //

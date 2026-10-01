@@ -25,6 +25,7 @@ import (
 	"github.com/cafaye/identity/internal/apikeys"
 	"github.com/cafaye/identity/internal/auth"
 	"github.com/cafaye/identity/internal/config"
+	"github.com/cafaye/identity/internal/courier"
 	"github.com/cafaye/identity/internal/httpapi"
 	"github.com/cafaye/identity/internal/mfa"
 	"github.com/cafaye/identity/internal/oidc"
@@ -278,7 +279,13 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 		// product this service has never heard of password recovery, which is both
 		// false and useless. A deployment that cannot send a message answers 503 on
 		// the routes that need one, with a sentence saying so.
-		opts = append(opts, httpapi.WithRecovery(buildRecovery(cfg, pool, hasher, logger)))
+		recoverySvc, err := buildRecovery(cfg, pool, hasher, logger)
+		if err != nil {
+			return nil, err
+		}
+		if recoverySvc != nil {
+			opts = append(opts, httpapi.WithRecovery(recoverySvc))
+		}
 		if machineCredentials != nil {
 			// Four options from one service, and each is a different capability rather
 			// than a different spelling of the same one: the management surface
@@ -451,31 +458,58 @@ func buildAuth(
 // buildRecovery assembles the account-recovery use cases: password reset, address
 // verification and email change.
 //
-// # THE MAILER IS `Unavailable{}` AND THAT IS THE HONEST STATE, NOT A GAP IN THIS
-// FUNCTION
+// # THE MAILER IS courier's, AND `Unavailable{}` IS ONLY FOR A DEPLOYMENT THAT HAS
+// NOT CONFIGURED IT
 //
-// courier is the platform's mail service and its own delivery path is unfinished,
-// so there is no endpoint to call and no provider adapter to write — and writing
-// one is another packet's job, not this one's. What this function therefore wires
-// is a seam with one implementation that REFUSES: every route that needs to send
-// a message answers 503 with a sentence naming the problem, which is the shape
-// `buildMFASecret`'s absent key already produces through `mfa.Unavailable{}`.
+// `buildMailer` returns one of two things, and the difference is the whole of this
+// function's mailer wiring:
 //
-// The alternative was rejected rather than weighed. A logger would be a mailer
-// this service can be configured into, and a reset token in an operator's log
-// aggregator is a reset token anybody who can read the logs can redeem — so the
-// flows would work perfectly in every test and in a staging stack, and the first
-// production deployment would be the first time a real user found out that their
-// password reset had been written to a log file.
+//	configured    a courier.RecoveryMailer, which speaks POST /v1/messages
+//	absent        recovery.Unavailable{}, which fails every send with ErrNoMailer
 //
-// WHEN THE SEAM LANDS the change is this function's last three lines: construct a
-// courier-backed Mailer and pass it in. Nothing in internal/recovery changes, and
-// nothing in internal/httpapi changes, because neither knows what a courier is.
+// The absent case is a SUPPORTED DEPLOYMENT rather than a gap: a local stack with
+// no courier, or one where mail has not been turned on. It is loud in the log
+// because a 404 on `/v1/password-resets` would tell a product this service has
+// never heard of password recovery, which is both false and useless — so the routes
+// stay mounted and answer 503 with a sentence naming the problem. The shape is the
+// one `buildMFASecret`'s absent key already produces, and for the same reason: a
+// user told "try later" retries forever and an operator told `internal` goes
+// looking for a database problem that is not there.
+//
+// # NEITHER ALTERNATIVE WAS AVAILABLE
+//
+// A LOGGER was the alternative that was weighed and refused, and the reason is
+// unchanged from when the seam was declared: every message this service sends
+// contains a live credential until it is spent, and a reset token in an operator's
+// log aggregator is a reset token anybody who can read the logs can redeem. The
+// flows would work in every test and in a staging stack, and the first production
+// deployment would be the first time a real user found their password reset had
+// been written to a log file.
+//
+// # AND `Unavailable{}` IS STILL HERE FOR A REASON
+//
+// It is not reachable by accident and it is not dead: it is what a deployment with
+// no `COURIER_TOKEN` mounts, and `TestAMailerIsCouriersOrUnavailableAndNothing
+// Else` holds that the two are the only possibilities. It is the fail-loud design
+// the seam was written for — every path that needs a message answers 503 rather
+// than dropping one — and that is worth keeping for a deployment that has not
+// finished the configuration rather than deleting.
 func buildRecovery(
 	cfg config.Config, pool *pgxpool.Pool, hasher *users.Hasher, logger *slog.Logger,
-) *recovery.Service {
+) (*recovery.Service, error) {
 	if pool == nil {
-		return nil
+		return nil, nil
+	}
+
+	mailer, err := buildMailer(cfg, logger)
+	if err != nil {
+		// A courier block that is PRESENT and unreadable is a startup failure, and
+		// `config.Load` has already refused the obviously broken ones. This is the
+		// remaining case, and it fails startup rather than warning because a
+		// deployment that believes it can send mail and cannot is worse than one
+		// that refuses to start: the first person to find out is a user waiting on
+		// a password reset that was never sent.
+		return nil, fmt.Errorf("building the mailer: %w", err)
 	}
 
 	service := recovery.NewService(
@@ -495,15 +529,95 @@ func buildRecovery(
 		// provider is not mounted at all.
 		oidc.NewStore(pool),
 		outbox.NewStore(pool),
-		recovery.Unavailable{},
+		mailer,
 		hasher,
 		clock.System{},
 	)
 
-	logger.Warn("account recovery is mounted, but this deployment cannot send email. " +
-		"POST /v1/password-resets answers 503 until a mailer is wired; see internal/recovery.")
+	return service, nil
+}
 
-	return service
+// buildMailer returns the Mailer this deployment has: courier's, or a refusing one.
+//
+// # THE SERVICE CREDENTIAL, AND WHY IT IS A BEARER TOKEN
+//
+// courier's document declares `security: [bearerAuth: [messages:write]]` and says
+// identity is the only issuer, so this service presents
+// `Authorization: Bearer <COURIER_TOKEN>` and nothing else. The alternatives were
+// weighed:
+//
+//   - A SHARED SECRET on a header of our own. courier's
+//     `CourierWeb.Plugs.IngestToken` does this, and its moduledoc gives the reason
+//     it is right THERE: the callers are three services holding a Sentry DSN and
+//     there is no identity service in that path to mint one. There IS one in this
+//     path, and that plug is wired to a different route — a header courier's
+//     `:authenticated` pipeline does not read produces a request that is still a
+//     401.
+//   - A USER'S SESSION OR API KEY. Both are a person's credential, and the
+//     `account_id` courier takes from the principal is the tenancy of the mail.
+//     Attributing the platform's password resets to whichever user happened to
+//     trigger one would put a stranger's recovery in somebody else's tenant.
+//
+// # AND THE TOKEN IS NEVER LOGGED, WHICH IS WHY THE STARTUP LINE NAMES NOTHING
+//
+// The credential lives inside a closure in `internal/courier` and the line below
+// reports the base URL, which is not a secret and is the thing an operator has to be
+// able to confirm. `%#v` prints an exported struct field by value and does not
+// consult `String()`, so a `token` field on the client would be a leak no method
+// could intercept; `TestTheClientNeverPrintsACredential` drives a real request
+// against a server that echoes the credential back and sweeps every formatting verb
+// for it.
+func buildMailer(cfg config.Config, logger *slog.Logger) (recovery.Mailer, error) {
+	if !cfg.CourierEnabled() {
+		logger.Warn("account recovery is mounted, but this deployment cannot send email. " +
+			"Set COURIER_BASE_URL, COURIER_TOKEN and RECOVERY_LINK_TEMPLATE to enable it; " +
+			"until then POST /v1/password-resets answers 503.")
+		return recovery.Unavailable{}, nil
+	}
+
+	client, err := courier.New(courier.Config{
+		BaseURL: cfg.CourierBaseURL,
+		Token:   cfg.CourierTokenValue,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("building the courier client: %w", err)
+	}
+	mailer, err := courier.NewRecoveryMailer(courier.RecoveryMailerConfig{
+		Client:       client,
+		LinkTemplate: cfg.RecoveryLinkTemplate,
+		Logger:       logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("building the courier mailer: %w", err)
+	}
+
+	// THE LINE, AND WHAT IT DOES NOT SAY. It does not say mail will be sent.
+	// courier's `/readyz` is outside every pipeline and answers for courier's
+	// DATABASE; it does not say courier can deliver, because courier's adapter check
+	// is scoped to production. A green readiness probe and this line together are
+	// "courier is reachable", and a send is where a misconfigured provider is
+	// found. An operator who reads "mail is wired" as "mail is being sent" has been
+	// told something this process cannot support.
+	logger.Info("account recovery can send email through courier",
+		"courier", cfg.CourierBaseURL,
+		"send_timeout", courier.DefaultTimeout,
+		"probe_timeout", courier.DefaultProbeTimeout,
+		"link_template", cfg.RecoveryLinkTemplate,
+	)
+	// WHAT IS AND IS NOT DELIVERABLE, said out loud. courier's NotificationType is
+	// [welcome, password_reset, team_invitation], which covers this service's
+	// password reset and its address verification — the latter through courier's
+	// `welcome` template, whose words are true for an account that has never proved
+	// an address. The two halves of an EMAIL CHANGE are not covered by any of them,
+	// and the current-address half is the only warning an account owner gets that
+	// somebody is moving their address, so it is refused rather than translated onto
+	// a template that would say something false. See internal/courier's
+	// RecoveryMailer for that argument in full.
+	logger.Warn("courier cannot render this service's email change messages, so " +
+		"POST /v1/email-changes answers 503 until courier's vocabulary includes them; " +
+		"password reset and address verification are delivered")
+
+	return mailer, nil
 }
 
 // buildAPIKeys assembles the scoped-token use cases, or returns nil when this

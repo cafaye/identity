@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/cafaye/identity/internal/platform/id"
 )
 
 // THE MESSAGES.
@@ -148,6 +150,10 @@ type messageData struct {
 	Target string
 	Token  string
 	Expiry time.Time
+	// UserID is the account the message concerns. It is carried here and not
+	// resolved at the seam, because every flow that renders a message already holds
+	// the id and a delivery adapter cannot recover it from prose.
+	UserID id.UUID
 }
 
 // messageFor renders the message for a kind.
@@ -176,5 +182,8 @@ func messageFor(kind messageKind, data messageData) (Message, error) {
 		"{{expiry}}", data.Expiry.UTC().Format(time.RFC1123),
 	).Replace(parts.Body)
 
-	return Message{Subject: parts.Subject, Body: body}, nil
+	// The account comes along because a delivery adapter has no other way to learn
+	// it: it is a field on the value rather than an argument to `Send`, so the
+	// seam's signature is unchanged and no implementation learns what it is for.
+	return Message{Subject: parts.Subject, Body: body, UserID: data.UserID}, nil
 }

@@ -38,19 +38,29 @@
 // exercised against a recording double, and the delivery path is somebody else's
 // problem to finish.
 //
-// There is no production implementation yet, and that is a fact rather than a
-// gap in this file. courier is the platform's mail service and its own delivery
-// path is unfinished, so `Unavailable` is what main wires, and it FAILS: every
-// path that needs to send mail returns ErrNoMailer and the HTTP layer answers 503
-// with a sentence naming the problem. That is deliberately not a mailer that logs
-// its messages — a reset token in an operator's log aggregator is a reset token
+// The production implementation is `internal/courier`, which speaks courier's
+// `POST /v1/messages`, and the seam is declared HERE so that this package gains no
+// import of it, no knowledge of courier's type vocabulary, and no field on `Message`
+// naming anything courier needs. `Message` grew exactly one field for that adapter
+// and its type comment says why it is a fact about the recipient rather than a
+// rendering decision.
+//
+// `Unavailable` is what main wires for a deployment that has not configured
+// courier, and it is still here rather than deleted: absent `COURIER_TOKEN` is a
+// SUPPORTED state, and the honest shape of it is a seam that FAILS. Every path
+// that needs to send mail returns ErrNoMailer and the HTTP layer answers 503 with a
+// sentence naming the problem. That is deliberately not a mailer that logs its
+// messages — a reset token in an operator's log aggregator is a reset token
 // anybody who can read the logs can redeem.
 //
 // The failure is checked BEFORE the token is minted, which is also what keeps the
-// request endpoint from becoming an account-existence oracle: with no delivery
-// path, a request for a registered address and a request for an unregistered one
-// both stop at the same place, before either has learned whether the account
-// exists.
+// request endpoint from becoming an account-existence oracle: a deployment that
+// cannot send mail stops a request for a registered address and a request for an
+// unregistered one at the same place, before either has learned whether the account
+// exists. `internal/courier`'s flow tests hold that property with a real Mailer and
+// a real database, because a courier that is reachable but down must fail in the
+// same place — an unconfigured deployment is not the only way to have no delivery
+// path.
 //
 // # WHAT IS DELIBERATELY NOT HERE
 //
@@ -69,6 +79,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/cafaye/identity/internal/platform/id"
 	"github.com/cafaye/identity/internal/users"
 )
 
@@ -232,6 +243,36 @@ var (
 // A message carries no template identifier and no layout, deliberately. The moment
 // this type grows a `Template` field, identity has taken courier's rendering
 // decisions, and the two will disagree.
+//
+// # WHY THERE IS ONE FIELD THAT IS NOT PROSE, AND WHY IT IS NOT A `Template`
+//
+// `UserID`, and a reader will reasonably assume the rule above forbids it. The
+// distinction is the difference between a RENDERING decision and a FACT about the
+// recipient, and it is worth being exact about because both are fields on this
+// struct.
+//
+// A `Template` field would be a rendering decision — "use layout 3", "use the HTML
+// variant" — and identity would then be a second opinion about how a mail looks,
+// disagreeing with the service that renders it. `UserID` is not that. It says WHICH
+// ACCOUNT the message is about, and a platform mailer needs that for reasons with
+// nothing to do with prose:
+//
+//   - courier reads that recipient's notification preferences by it, so a send
+//     without one cannot be checked against a decline;
+//   - it is what the `courier.email.delivered` event is attributed to, so a bounce
+//     can be traced back to the account it concerned.
+//
+// Naming the account by ADDRESS would be worse than useless for both. An address
+// changes — that is the entire point of the email-change flow two files over — and
+// a preference table and a suppression list are keyed by an opaque id. Every body
+// here names the address in prose because a PERSON reads it; none carries a uuid
+// because a person has no use for one.
+//
+// So this is a fact every flow in this package already held. It was not on the
+// struct because no implementation needed it, and adding it is the composition the
+// delivery seam needed rather than a widening of the `Mailer` interface: `Send`
+// still takes one argument and returns one error, and no implementation learns
+// about courier.
 type Message struct {
 	// To is the normalised address the message goes to.
 	To string
@@ -240,6 +281,15 @@ type Message struct {
 	// rendering decision courier's packet owns.
 	Subject string
 	Body    string
+
+	// UserID is the account this message concerns, and it is never rendered.
+	//
+	// IT MAY BE THE ZERO VALUE, and that is not an error here: this package has no
+	// provider to be unfriendly to, and a test double has no use for an id. An
+	// implementation that requires one MUST refuse rather than guess — attributing a
+	// message that contains a live credential to an account nobody chose is worse
+	// than not sending it.
+	UserID id.UUID
 }
 
 // Mailer hands one rendered message to the platform's mail service.
@@ -287,6 +337,19 @@ type Mailer interface {
 // It is a struct rather than a nil Mailer so that no caller has to decide whether
 // a nil is a supported configuration, and `main` cannot wire a process in which
 // the flows are mounted and silent.
+//
+// # IT IS STILL REACHABLE, AND THAT IS THE REASON TO KEEP IT
+//
+// A courier-backed implementation exists, so the obvious question is why this one
+// is not deleted. Because a deployment with no `COURIER_TOKEN` is a SUPPORTED
+// state — a local stack, or one where mail has not been turned on — and the honest
+// shape of "this deployment cannot send email" is a seam that refuses rather than a
+// `nil` that panics, a logger that leaks the token, or a `courier.Client` built
+// from an empty credential that would present nothing and get a 401 per send.
+//
+// `TestAMailerIsCouriersOrUnavailableAndNothingElse` in `cmd/identity` holds that
+// these are the only two things `buildMailer` can return, so an "unavailable" a
+// reader cannot reach is not hiding here.
 type Unavailable struct{}
 
 // Send returns ErrNoMailer.
