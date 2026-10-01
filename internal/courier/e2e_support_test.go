@@ -448,6 +448,42 @@ func renderTestLink(t *testing.T, token string) string {
 // repository is not modified, and `Courier.MailerAdapter`'s refusing default is not
 // bypassed, only satisfied.
 //
+// # PICK BOTH PORTS, AND THE HTTP ONE IS NOT OPTIONAL
+//
+// The two numbers below (55433 and 4014) were free when the fixtures were
+// recorded. They are not free now, and an occupied one fails in a way that
+// invalidates the proof rather than refusing to run it:
+//
+//   - **The postgres port collides loudly.** `docker run` refuses to publish an
+//     already-bound port, so you find out immediately. Pick another.
+//   - **The HTTP port does NOT collide loudly, and this is the dangerous one.**
+//     Two processes can hold `4014` at once when one binds `127.0.0.1` and the
+//     other `0.0.0.0`, because the more specific bind wins the loopback traffic
+//     and the wildcard keeps the rest. Nothing errors. Instead your sends land in
+//     the OTHER courier's database, so a green live tier is a tier somebody
+//     else's process answered — which is precisely the false claim this file
+//     exists to rule out.
+//     Before you start, check the port is free (`lsof -nP -iTCP:4014 -sTCP:LISTEN`)
+//     and pick one nothing is on. The one hardcoded in this recipe and in
+//     `skipWithoutCourier` is a default to edit, not a default to trust.
+//   - The defence that does not depend on the port: after the run, confirm the
+//     rows are in the database you started. `select subject, data->>'email' from
+//     outbox_events` is the whole check, and it is the only one that distinguishes
+//     "a real courier accepted these bytes" from "a real courier accepted these
+//     bytes, the one you happened to be talking to".
+//
+// # AND DO NOT SET `OTEL_SDK_DISABLED` TO QUIETEN THE LOG
+//
+// It is a reasonable thing to try, and on courier master `a8f15cc` it stops the
+// boot. `Courier.Telemetry.sdk_config/0`'s disabled branch returns the bare atom
+// `span_processor: :otel_simple_processor`, and opentelemetry 1.7.0 needs a named
+// tuple whose options are a map — the same shape courier's ENABLED branch already
+// uses. A bare atom is a `FunctionClauseError` in `otel_configuration:processors/2`
+// and the application refuses to start. `OTEL_TRACES_EXPORTER=none` (and the
+// metrics and logs equivalents) reach the same branch and fail the same way. That
+// is courier's defect and not this repository's; the exporter failing to reach a
+// collector is harmless noise in a run, so leave it on.
+//
 //	# 1. a database
 //	docker run -d --name courier-e2e-pg -e POSTGRES_DB=courier_test \
 //	  -e POSTGRES_USER=courier -e POSTGRES_PASSWORD=courier \
