@@ -20,7 +20,7 @@
 #   2. The migrations. A deploy step, against identity's own `migrations/`, with
 #      a DSN kit does not have and must not hard-code — the services that are not
 #      identity would inherit a database.
-#   3. The tier floors. 1254 tests, 1166 of them behind `TEST_DATABASE_URL`, are
+#   3. The tier floors. 1989 tests, 1732 of them behind `TEST_DATABASE_URL`, are
 #      identity's numbers in identity's tree.
 #   4. The lockfile guard, `go vet` and `gofmt`: gates this repository wrote down
 #      in AGENTS.md, none of which `bin/prime` runs.
@@ -218,12 +218,19 @@ jobs:
       # argument and refuses to run if it disagrees with the declaration.
       COVERAGE_FAIL_UNDER: '70'
       # Decrease detectors, not targets. Measured on 2026-10-01 against
-      # `go test -v -count=1 -race ./...` with the database tier applied, from a
-      # complete log: 1939 PASS lines across the whole suite, 1715 of them in the
+      # `go test -v -count=1 ./...` with the database tier applied, from a
+      # complete log: 1989 PASS lines across the whole suite, 1732 of them in the
       # 14 packages that open a pool, zero SKIP anywhere. A lower number is a
       # deleted test and this goes red; a higher one is a new test, which is a
       # one-line edit here. They are not read out of the run, so a run cannot
       # satisfy itself by having fewer tests.
+      #
+      # `-race` is NOT in the command this was measured with, and deliberately so:
+      # the race detector changes neither how many tests run nor how many PASS
+      # lines they print, and leaving it out makes the measurement reproducible on
+      # a laptop in a couple of minutes. CI still runs the suite WITH `-race`; a
+      # count is the same either way, and a floor measured from a run nobody can
+      # reproduce is a floor nobody can check.
       #
       # The coverage percentage is deliberately NOT quoted here. It used to say
       # "73.2% coverage" on this line, and that number has been wrong twice: it
@@ -235,20 +242,31 @@ jobs:
       # floor by `bin/coverage-floor`, which is the only place a reader has to
       # look and the only place that cannot go stale.
       #
-      # Both floors were remeasured by the recovery packet, which is the rule rather than
-      # a courtesy: the previous pair (1254 / 1166) had been measured from a log
-      # taken before this package's own tests were in the tree, so it carried a
-      # 17-test blind spot in the one package that guards this file. 1254 was 1237
-      # plus those 17, and the recovery packet moved the suite by +685 PASS
-      # (+549 of them in the database tier) — 55 in internal/recovery, the matrix
-      # and wire tests in internal/httpapi, and 14 new database packages touched
-      # by the two migrations.
+      # Both floors below were measured on the MERGED tree, which is the only
+      # measurement that means anything here.
       #
-      # A floor is only a decrease detector if it was measured from a complete run,
-      # and a raise has to land in the same commit as the tests that earned it or it
-      # is not a raise at all.
-      SUITE_FLOOR: '1939'
-      DATABASE_TIER_FLOOR: '1715'
+      # Two packets moved this tree at once and each carried its own pair, taken
+      # from its own branch: the recovery packet measured 1939 / 1715, and the
+      # observability packet measured 1864 / 1609. Neither number was ever true
+      # of this tree, because each was measured without the other's tests. The
+      # real counts are 1989 and 1732 — higher than BOTH, since the two packets
+      # added tests in overlapping files rather than replacing them.
+      #
+      # This is the floor rule stated as an event rather than as a principle: a
+      # floor is a claim about the present tree, so the merge that makes two
+      # claims each incomplete has to produce one claim about the result. Taking
+      # either side's number would have installed a floor the tree does not meet,
+      # and the gate would have gone red on a green tree for a reason that has
+      # nothing to do with the code.
+      #
+      # A floor is only a decrease detector if it was measured from a complete
+      # run, and a raise has to land in the same commit as the tests that earned
+      # it or it is not a raise at all. Both numbers come from a
+      # `go test -json -count=1 ./...` against a real postgres:17-alpine with
+      # migrations applied, counting per-package PASS events rather than reading
+      # a summary line — the same partition the check below computes.
+      SUITE_FLOOR: '1989'
+      DATABASE_TIER_FLOOR: '1732'
       MODULE: github.com/cafaye/identity
 
     steps:

@@ -23,9 +23,14 @@ internal/config/       environment in, validated Config out
 internal/httpapi/      the router, the probes, the /v1 surface and the OIDC routes
 internal/oidc/         the OpenID Connect provider: storage, registrations, the key
 internal/platform/db/  the pgx pool, and the readiness ping
+internal/telemetry/    OpenTelemetry: the allowlist, the exporter, and the install
+internal/httpapi/telemetry.go  the request span, and the route TEMPLATE it records
 migrations/            goose SQL files
 client/                THE GO CLIENT: a generated transport and the hand-written wrapper
+kit.ref                the pinned kit commit the local stack comes from
 bin/prime              the gate: go mod download && go build ./... && go test ./...
+bin/migrate            migrations as a deploy step, for `bin/dev`
+bin/dev                kit's, verbatim: fetch kit.ref, merge with our override, up
 bin/coverage-floor     the coverage floor, over the profile minus coverage-exclusions
 coverage-exclusions    DECLARED paths left out of that measurement: reason, owner, dates
 gate.yml               WHAT THIS GATE IS WORTH, declared: the entrypoint, the proofs the
@@ -34,6 +39,9 @@ gate.yml               WHAT THIS GATE IS WORTH, declared: the entrypoint, the pr
                        go test. Go prints no test count, so this file carries no
                        `minimum` floor and the decrease-detector is SUITE_FLOOR in
                        .github/workflows/ci.yml — read the report before changing it.
+docker-compose.yml     an OVERRIDE on kit's stack: our service, our database, our
+                       crash layer. No collector config, no postgres container of
+                       our own, and no `depends_on: otel-collector`.
 ```
 
 `client/` is deliberately NOT under `internal/`, and that is the only reason it is
@@ -109,6 +117,55 @@ holds a `jose` key, so the library's storage interface cannot be implemented
 without it. Logging is `log/slog`. No zap, no logrus, no ORM, no CLI framework, no
 dependency without a cause stated in review. `go mod tidy` must leave `go.mod` and
 `go.sum` unchanged.
+
+Two more have been approved since, with their cause stated here rather than
+assumed: `go.opentelemetry.io/otel/sdk` and
+`go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp` (v1.46.0).
+Without them identity cannot emit a span, and kit's collector — which ships with
+the stack and is what makes "where did that 500 come from" a question with an
+answer — has nothing to receive. Note that grpc, the protobuf runtime and
+grpc-gateway arrive **transitively**, through `otlpconfig`; that is a cost of the
+HTTP exporter rather than a second transport we asked for, and the first draft of
+this rule claimed otherwise and was wrong. What is deliberately **not** added:
+`otelhttp`'s handler (it records `url.path`, `url.query` and headers as its own
+attributes, so depending on the collector to strip them would make this boundary
+one control where this repository insists on two — hence the hand-rolled
+middleware), `otel/sdk/metric` (metrics come from kit's collector's `spanmetrics`
+connector, which runs after redaction), and `otel/log` (logs come from the
+container's stdout via compose `logging:`).
+
+**One span-attribute allowlist, in `internal/telemetry`, and it is a choke point
+rather than a convention.** Every attribute goes through `telemetry.Record/2`,
+which drops anything not on the list, and the list is projected from
+`core/schemas/telemetry/*.schema.json`. The realistic failure is not an attacker:
+it is a well-meaning engineer in six months adding
+`span.SetAttributes(attribute.String("email", user.Email))` because it would help
+debug a login, in the service that holds every user's email and password digest.
+`internal/telemetry/canary_test.go` is the proof — a canary in every field a
+caller controls, asserted absent from everything exported — and every absence
+assertion in it is paired with a presence one, because a boundary that deletes
+everything passes "no canary" and is useless.
+
+Three properties of the middleware are structural rather than lexical, and each
+has a test that fails when it stops holding:
+
+  * **`http.route` is chi's `RoutePattern()`, never `r.URL.Path`.** A template has
+    one value per endpoint; a concrete path has one per request, and kit's
+    collector derives metrics with a `spanmetrics` connector that mints a series
+    per distinct value. The value is read from the `chi.RouteContext` **inside**
+    the handler chain, because a middleware wrapped outside the router sees no
+    route at all and a test that puts the assertion in the wrong place would pass
+    against an empty string.
+  * **A 404 carries NO route.** The path is caller-controlled text, so recording
+    it is the cardinality bomb and the content leak in one move. The 404 status is
+    the answer.
+  * **Only 5xx is an error span.** A 401 or a 404 is identity refusing a caller,
+    which is identity working; an error rate that counts it is a function of how
+    much guessing the internet absorbs, and an alert on it pages somebody to turn
+    off the protection doing its job.
+
+No `tenant_id` on a span: it is a resource attribute, and
+`internal/telemetry`'s tests hold the resource's own shape.
 
 **The OIDC surface has two error shapes, and the split is not a detail.**
 `/v1/*` and the `/oidc/authorize` pre-checks answer

@@ -12,7 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/cafaye/identity/internal/auth"
+	"github.com/cafaye/identity/internal/telemetry"
 	"github.com/cafaye/identity/internal/users"
 )
 
@@ -187,11 +190,92 @@ func (o options) registerRoutes(r chiRouter) {
 
 // chiRouter is the slice of *chi.Mux these routes need. Naming it keeps the
 // option struct from importing chi for one method.
+//
+// It is an INTERFACE rather than a concrete *chi.Mux for one reason beyond
+// tidiness, and the reason is observability: every route registered through it is
+// wrapped by `traced`, so a route registered by any of the seven register*
+// functions gets its `http.route` recorded without that function having to know
+// telemetry exists. A handler list that somebody has to remember to extend is a
+// list that will be missed exactly once, and the miss is a span with no route on
+// it — invisible in a trace view, wrong in a metric, and green in every test that
+// does not walk the routes.
+//
+// A decorator rather than a chi `Use` middleware, and the reason is measured in
+// telemetry.go: chi fills RoutePattern in on the request it routes to, and
+// neither an outer middleware nor a `Use` middleware ever sees it. Only the
+// matched handler does.
 type chiRouter interface {
 	Post(pattern string, h http.HandlerFunc)
 	Delete(pattern string, h http.HandlerFunc)
 	Get(pattern string, h http.HandlerFunc)
 	Patch(pattern string, h http.HandlerFunc)
+}
+
+// traced wraps a route handler so the span carries the route TEMPLATE.
+//
+// This is the one place in the service that knows the difference between a route
+// and a path, and it is a decorator rather than a middleware for the reason given
+// on chiRouter: a pattern has one value per endpoint and a path has one per
+// request, and only chi — at the moment it matches — can tell them apart.
+func traced(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// ONLY the route. The method is recorded by telemetryMiddleware, outside
+		// the router, so that a 404 and a 405 carry it too — those never reach a
+		// route handler, and a 404 whose span says nothing about what was asked
+		// for is a request an operator cannot search for.
+		span := trace.SpanFromContext(r.Context())
+		telemetry.Record(span, map[string]any{"http.route": routeTemplate(r)})
+		h(w, r)
+	}
+}
+
+// tracedRouter decorates a chiRouter so every route registered through it is
+// wrapped by `traced`.
+//
+// The decorator is here rather than at each of the seven register* call sites for
+// the reason given on chiRouter, and it is a POINTER receiver because of one
+// specific thing: a fault injection went the wrong way and the fix belongs here.
+//
+// Changing `traced` to record `r.URL.Path` instead of the template made every
+// observability test in this package PASS, and that is the finding. A test that
+// drives a handful of fixed requests cannot tell a template from a path when the
+// requests it drives have no path parameters in them: for `GET /healthz` the
+// template and the path are the same string. The tests assert the positive case
+// (`http.route` == "/healthz") and the negative case (a 404 carries no route),
+// and neither can distinguish the two implementations for a request whose path IS
+// its template.
+//
+// So `patterns` records the templates as they are registered, and
+// TestTheRouteTableIsWhatTheRouterServes drives a PARAMETERISED template. That
+// is the only request shape on which the property is testable at all, and it is
+// the shape that actually occurs in production: every one of the routes with a
+// `{parameter}` in it is a route whose path and template differ on every request
+// but the first.
+type tracedRouter struct {
+	chiRouter
+
+	// patterns is the route table, in registration order.
+	patterns []string
+}
+
+func (t *tracedRouter) Get(pattern string, h http.HandlerFunc) {
+	t.patterns = append(t.patterns, pattern)
+	t.chiRouter.Get(pattern, traced(h))
+}
+
+func (t *tracedRouter) Post(pattern string, h http.HandlerFunc) {
+	t.patterns = append(t.patterns, pattern)
+	t.chiRouter.Post(pattern, traced(h))
+}
+
+func (t *tracedRouter) Patch(pattern string, h http.HandlerFunc) {
+	t.patterns = append(t.patterns, pattern)
+	t.chiRouter.Patch(pattern, traced(h))
+}
+
+func (t *tracedRouter) Delete(pattern string, h http.HandlerFunc) {
+	t.patterns = append(t.patterns, pattern)
+	t.chiRouter.Delete(pattern, traced(h))
 }
 
 // handleRegister creates an account.

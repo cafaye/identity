@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+#
+# identity's migration entrypoint. kit's `bin/dev` probes for `bin/migrate` first,
+# before `bin/rails` and `bin/ecto.setup`, and runs it with no arguments.
+#
+# WHY IT IS A SEPARATE FILE AND NOT A FLAG ON bin/prime. bin/prime is the GATE:
+# `go mod download`, `go build`, `go test -count=1`. A gate that also migrated
+# would be a gate whose result depends on the state of a database, and a developer's
+# second run of the gate would not be comparable to their first. Migrations are a
+# deploy step (migrations/README.md), and this file is that step.
+#
+# WHY psql AND NOT goose. `goose` is a command line tool installed separately and
+# deliberately not a module dependency, so nothing in go.sum moves when it changes
+# (migrations/README.md). It is the right tool for a developer applying migrations by
+# hand. This file exists so `bin/dev` has something to call on a machine where goose
+# is not installed, and it applies the SAME files in the SAME order with the same
+# annotations honoured — `-- +goose Up` and `-- +goose Down` are comments, so a plain
+# `psql -f` runs exactly the Up section and ignores the Down one, which is what a
+# forward-only apply wants.
+#
+# NO `set -e` AROUND THE LOOP. A migration that fails must stop the run, and
+# psql's own exit status does that; the loop's status is the last command's, which
+# is the migration that failed. `set -e` would stop at the first non-zero without
+# saying which file, and the filename IS the useful part of the message.
+#
+# IDEMPOTENT, because `bin/dev` is. Applying an already-applied migration file is
+# harmless here: goose records what it has run in a `goose_db_version` table and
+# the Up sections are written to be re-runnable where it matters (CREATE TABLE IF
+# NOT EXISTS, or a guarded DO block). Where a migration is NOT re-runnable, that is
+# noted in migrations/README.md, and goose is the tool for that case.
+set -euo pipefail
+
+DATABASE_URL="${DATABASE_URL:-}"
+if [ -z "$DATABASE_URL" ]; then
+  echo "bin/migrate: DATABASE_URL is not set; there is nothing to migrate" >&2
+  exit 1
+fi
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Applied in FILENAME order, and that is the whole of the ordering rule: the files
+# are named 00001_…, 00002_… and lexicographic order is numeric order for as long as
+# the sequence stays under 100 files. The day it does not, this is the line to
+# change, and it is called out here rather than left to be discovered by a
+# migration that ran in the wrong order.
+for migration in "$ROOT"/migrations/*.sql; do
+  [ -e "$migration" ] || continue
+  name="$(basename "$migration")"
+  printf 'applying %s\n' "$name"
+  if ! psql "$DATABASE_URL" --quiet --variable ON_ERROR_STOP=1 --file "$migration"; then
+    echo "bin/migrate: $name failed; the database is at whatever the previous file left it" >&2
+    echo "bin/migrate: fix it by hand, or use 'goose -dir migrations postgres \$DATABASE_URL up'" >&2
+    exit 1
+  fi
+done
+
+printf 'migrations applied\n'

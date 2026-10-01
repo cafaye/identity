@@ -74,6 +74,32 @@ type options struct {
 	// A 404 here would tell a product this service has never heard of password
 	// recovery, and that is the one answer that is both false and useless.
 	recovery Recovery
+
+	// panicOnRoute is a TEST seam: a route pattern that is registered with a
+	// handler which panics, so a test can reach the recovery path and the 500 it
+	// writes without a database.
+	//
+	// It replaces a ROUTE and not the router, and that distinction is the whole
+	// reason this exists in this shape. The first version of it swapped out the
+	// entire mux, which meant the request never passed through chi, never got a
+	// route template, and produced a 500 on a span with no route on it — a test
+	// asserting a service that is not the one that ships. Replacing one route
+	// keeps the span, the template, the recovery and the status exactly as they
+	// are in production, and changes only which handler the route points at.
+	//
+	// Empty in every real process, and it is an empty string rather than a nil
+	// handler so the production path has no branch to get wrong.
+	panicOnRoute string
+
+	// parameterizedRoute is a second TEST seam, and its reason is the fault
+	// injection described on tracedRouter: a suite of fixed requests cannot tell
+	// a route template from a concrete path, because for a request with no path
+	// parameters the two are the same string. A parameterised pattern is the only
+	// request shape on which the distinction is observable at all, and the
+	// distinction is the whole of the cardinality guarantee.
+	//
+	// Empty in every real process.
+	parameterizedRoute string
 }
 
 // Option customises the handler built by New.
@@ -127,9 +153,22 @@ func New(checks []Check, opts ...Option) http.Handler {
 		opt(&o)
 	}
 
-	// Outermost first: the trace id must exist before anything can log or report
-	// one, and recovery must sit inside it so the panic handler can quote the id.
-	return traceMiddleware(recoverPanics(o.logger, newMux(checks, o)))
+	// Outermost first, and the order is a dependency chain rather than a
+	// preference:
+	//
+	//	telemetry  the span must exist before anything can record a status on it
+	//	trace id   the id must exist before the panic handler can quote it
+	//	recovery   inside the trace, so the 500 it writes is on a span
+	//
+	// Recovery is inside telemetry rather than outside it because a panic
+	// recovered above the span would write its 500 with no span carrying the
+	// status — a request that failed with nothing in the trace view saying so,
+	// which is the one request an operator most wants to find.
+	//
+	// The test seam sits INSIDE all of them, not outside: a handler that panics
+	// must still get a span, a trace id and a recovery, or the observability
+	// tests would be asserting about a request that never went through the chain.
+	return telemetryMiddleware(traceMiddleware(recoverPanics(o.logger, newMux(checks, o))))
 }
 
 // newMux is the router, without the two middlewares, so that a test which has to
@@ -140,19 +179,66 @@ func New(checks []Check, opts ...Option) http.Handler {
 // second list of what a deployed process mounts — the exact thing the tripwire in
 // openapi_drift_test.go exists to refuse. This is the whole of the change: the
 // wiring below is the wiring that was inline, and New is the only caller.
+// routeTable is the pattern list the last-built router recorded, and it is what
+// the route-template canary reads.
+//
+// A package variable rather than a return value because newMux is called by
+// New, whose signature is a published contract of this package — the option
+// struct, not a route table. It is written by every build and read only by tests,
+// and the test that reads it builds its own router, so nothing outside the test
+// binary ever observes it.
+//
+// It exists because of the fault injection described on tracedRouter: with only
+// per-request assertions, a service recording the concrete path instead of the
+// template passed every observability test. The route table is what makes the
+// distinction observable.
+var routeTable []string
+
 func newMux(checks []Check, o options) *chi.Mux {
-	r := chi.NewRouter()
-	r.NotFound(notFound)
-	r.MethodNotAllowed(methodNotAllowed)
+	mux := chi.NewRouter()
+	mux.NotFound(notFound)
+	mux.MethodNotAllowed(methodNotAllowed)
+
+	// EVERY route goes through tracedRouter, including the two probes. That is the
+	// point of the decorator: a route registered directly on the mux would get a
+	// span with no route on it, and the probes are exactly the routes an operator
+	// filters by when a service looks idle.
+	//
+	// `r` is the traced view; `mux` is the real router underneath. The two names
+	// are here because the authorization-matrix walk in router_walk_test.go needs
+	// the undecorated tree to enumerate the routes, and a walk that saw a
+	// decorator's wrapper would count a route twice.
+	r := &tracedRouter{chiRouter: mux}
 	r.Get("/healthz", handleHealthz)
 	r.Get("/readyz", o.handleReadyz(checks))
+	if o.panicOnRoute != "" {
+		// Through `r`, not `mux`, so the test's route is traced like every other.
+		// A test-only route that skipped the decorator would make the 500's span
+		// look like a production one while missing the route, which is the exact
+		// false negative the seam is supposed to avoid.
+		r.Get(o.panicOnRoute, func(http.ResponseWriter, *http.Request) {
+			panic("the handler panicked")
+		})
+	}
+	if o.parameterizedRoute != "" {
+		r.Get(o.parameterizedRoute, func(w http.ResponseWriter, r *http.Request) {
+			// A 404 is the honest answer for a route with no service behind it,
+			// and it is what the test needs: the span still records the route
+			// template, because the template is recorded by the decorator BEFORE
+			// the handler runs. That ordering is the point — a service that
+			// recorded the route only on a 2xx would lose it on every error, and
+			// the errors are the requests an operator is looking at.
+			notFound(w, r)
+		})
+	}
 	// The well-known documents are registered before the /v1 and /oidc routes
 	// because they are reachable without a session, a database or a signing key
 	// being configured, and a process with no DATABASE_URL should still be able
 	// to answer a probe for its own metadata.
 	o.registerOIDCWellKnownRoutes(r)
 	o.registerRoutes(r)
-	return r
+	routeTable = r.patterns
+	return mux
 }
 
 // HealthResponse is the /healthz body. Liveness answers whether this process

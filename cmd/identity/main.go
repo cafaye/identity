@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -32,6 +33,7 @@ import (
 	"github.com/cafaye/identity/internal/platform/db"
 	"github.com/cafaye/identity/internal/recovery"
 	"github.com/cafaye/identity/internal/sessions"
+	"github.com/cafaye/identity/internal/telemetry"
 	"github.com/cafaye/identity/internal/users"
 )
 
@@ -40,10 +42,69 @@ import (
 const shutdownTimeout = 15 * time.Second
 
 func main() {
+	// `-healthcheck` is the container health probe, and it is a flag on this binary
+	// rather than a `curl` in the compose file for one reason: the runtime image is
+	// `gcr.io/distroless/static-debian12:nonroot`, which has no shell and no HTTP
+	// client. The alternatives were a `build:` stanza that adds curl (a supply
+	// chain in a security service's image) or no healthcheck at all.
+	//
+	// It matters more than a dev-loop convenience, because `docker compose up
+	// --wait` is only as good as the health signals it waits on, and without this
+	// it considers the service up the instant the process starts — which is before
+	// the pools are built and long before /readyz would answer 200.
+	//
+	// It probes /readyz and not /healthz, because readiness is the one that
+	// consults the database. A probe that reports healthy against a database that
+	// is gone is a probe that reports a working service that answers 503 to
+	// everybody.
+	if len(os.Args) == 2 && os.Args[1] == "-healthcheck" {
+		os.Exit(healthcheck())
+	}
+
 	if err := run(); err != nil {
 		slog.Error("identity exited with an error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// healthcheckTimeout bounds the probe. Short, because a compose healthcheck that
+// takes thirty seconds to fail is a healthcheck whose interval is a lie, and this
+// one runs every few seconds for the life of the container.
+const healthcheckTimeout = 2 * time.Second
+
+// healthcheck probes this process's own readiness endpoint and reports the result
+// as an exit status. 0 healthy, 1 not.
+//
+// The address comes from PORT rather than being hardcoded, because a container
+// started with a different PORT has to be probeable and a probe aimed at 8080
+// would report a perfectly healthy service as dead.
+func healthcheck() int {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = config.DefaultPort
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), healthcheckTimeout)
+	defer cancel()
+
+	// The response body is read and discarded rather than the connection simply
+	// being closed: closing without draining means the server sees a broken pipe
+	// on a request it already answered, which shows up in its own logs as an error
+	// every few seconds forever.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:"+port+"/readyz", nil)
+	if err != nil {
+		return 1
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 1
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return 1
+	}
+	return 0
 }
 
 func run() error {
@@ -57,6 +118,26 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Telemetry is installed BEFORE the app, so a span can exist for anything
+	// that happens while the pools and the providers are being built — a boot
+	// that takes ninety seconds because the database is slow is exactly the boot
+	// an operator is watching for, and it is invisible without this.
+	shutdownTelemetry, err := installTelemetry(ctx, logger)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// A separate context: `ctx` is already cancelled by the time this runs,
+		// because a SIGTERM is what usually got us here, and a cancelled context
+		// cannot be used to wait for a flush. Bounded by the SDK's own timeout,
+		// because a telemetry flush must not be able to hold up a shutdown.
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTelemetry(flushCtx); err != nil {
+			logger.Warn("flushing telemetry on the way out failed", "error", err)
+		}
+	}()
 
 	a, err := newApp(ctx, cfg, logger)
 	if err != nil {
@@ -76,6 +157,59 @@ func run() error {
 
 	logger.Info("identity stopped")
 	return nil
+}
+
+// installTelemetry starts OpenTelemetry, or stands the no-op up in its place.
+//
+// ONE LINE, AND ONLY ON THE DISABLED PATH. Silence is the contract there: a
+// warning per export attempt fills the service's own log store with the fact that
+// telemetry is off, which is how a self-hoster discovers that turning it off is
+// not supported — the opposite of the intent. One line at startup is not spam,
+// and it is the difference between "telemetry is off" and "telemetry is broken",
+// which look identical from outside.
+//
+// The endpoint is logged WITH ITS QUERY AND FRAGMENT REMOVED. A bring-your-own
+// backend puts its API key in the path or the query string, and a startup line
+// that quoted the whole thing would write that key into the same log store the
+// redaction boundary is trying to keep it out of.
+//
+// A configured endpoint that cannot be built is a BOOT FAILURE, not a silent
+// no-op. "Telemetry is silently absent" and "telemetry is off" look identical
+// from outside and only one of them is what anybody meant, so a service that
+// starts happily and exports nowhere is the one that gets discovered a quarter
+// later.
+func installTelemetry(ctx context.Context, logger *slog.Logger) (telemetry.Shutdown, error) {
+	lookup := os.Getenv
+	shutdown, err := telemetry.Install(ctx, telemetry.Options{
+		ServiceName: telemetry.ServiceName,
+		Endpoint:    telemetry.Endpoint(lookup),
+		Disabled:    !telemetry.Enabled(lookup),
+		LookupEnv:   lookup,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if reason := telemetry.NoOpReason(lookup); reason != "" {
+		logger.Info("telemetry is off", "reason", reason)
+		return shutdown, nil
+	}
+	logger.Info("telemetry is on",
+		"service", telemetry.ServiceName,
+		"endpoint", redactEndpoint(telemetry.Endpoint(lookup)),
+	)
+	return shutdown, nil
+}
+
+// redactEndpoint is a hostname and a port, or nothing else. A bring-your-own
+// backend's key lives in the path or the query string, and a self-hoster has to
+// be able to confirm which backend their service is pointed at without that key
+// landing in a log store.
+func redactEndpoint(endpoint string) string {
+	if index := strings.IndexAny(endpoint, "?#"); index >= 0 {
+		return endpoint[:index]
+	}
+	return endpoint
 }
 
 // app owns the process's HTTP server and, when a database is configured, the

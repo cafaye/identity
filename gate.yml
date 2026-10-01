@@ -108,14 +108,17 @@ gate:
     # read out of a `-v` run. See the note on those numbers below — they are
     # the finding, not the fix.
     #
-    #     whole suite      1939 PASS, 0 SKIP, 0 FAIL
-    #     database tier    1715 PASS, 0 SKIP, across 14 packages
+    #     whole suite      1989 PASS, 0 SKIP, 0 FAIL
+    #     database tier    1732 PASS, 0 SKIP, across 14 packages
     #
     # measured with `go test -v -count=1 ./...` against the pinned
     # postgres:17.11-alpine, and cross-checked with ci.yml's own awk, which
-    # reports the same two totals. Remeasured by the recovery packet, which is
-    # where SUITE_FLOOR and DATABASE_TIER_FLOOR in ci.yml were raised to match
-    # in the same commit. The skip count is reported separately and on
+    # reports the same two totals. Remeasured on the MERGED tree: the recovery
+    # packet measured 1939 / 1715 and the observability packet measured
+    # 1864 / 1609, each on a branch that did not carry the other's tests, so
+    # neither number described this tree. SUITE_FLOOR and DATABASE_TIER_FLOOR
+    # in ci.yml were raised to match in the same commit as this measurement. The
+    # skip count is reported separately and on
     # purpose: it is zero, and a zero written next to the pass count is the only
     # way a reader learns the number was looked for.
     #
