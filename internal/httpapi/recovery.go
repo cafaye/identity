@@ -39,8 +39,10 @@ import (
 //
 // `acceptedResponse` is a constant. It is not a template with a field that happens
 // to be equal either way round — there is no field. `202 {"status":"accepted"}` is
-// what a registered address gets, what an unregistered one gets, and what an
-// address inside the cooldown gets.
+// what a registered address gets, what an unregistered one gets, what an address
+// inside the cooldown gets, and what an address whose account has already proved it
+// gets. The last of those was a 409 until 2026-10-02, on a route that requires no
+// credential; see recovery.Service.RequestVerification.
 //
 // The status is 202 rather than 200 and 204 rather than a 200 with a body, and it
 // is 202 because the request WAS accepted for processing: the message is either
@@ -408,9 +410,13 @@ func (o options) handleConfirmEmailChangeNew(w http.ResponseWriter, r *http.Requ
 //	                       so this is the same disclosure POST /v1/users already
 //	                       makes and the one place in this service it is safe.
 //	ErrSameAddress    422  a well-formed request for something that is not a change.
-//	ErrAlreadyVerified 409 the request was understood and asks for something that
-//	                       already holds.
 //	*users.FieldError 422  the request is not acceptable, per field.
+//
+// THERE IS NO CASE FOR "ALREADY VERIFIED", and its absence is the property rather
+// than an oversight. `security: []` means the caller is anonymous, so a status that
+// differed for a proved address published a list of verified accounts to whoever
+// typed the addresses. GET /v1/email-verification carries the same fact safely,
+// behind a session; see recovery.Service.RequestVerification for the whole of it.
 func (o options) writeRecoveryError(w http.ResponseWriter, r *http.Request, err error) {
 	var fieldErr *users.FieldError
 
@@ -426,10 +432,6 @@ func (o options) writeRecoveryError(w http.ResponseWriter, r *http.Request, err 
 	case errors.Is(err, recovery.ErrEmailTaken):
 		problemFor(w, r, http.StatusConflict, CodeConflict,
 			"an account already exists for that email address")
-
-	case errors.Is(err, recovery.ErrAlreadyVerified):
-		problemFor(w, r, http.StatusConflict, CodeConflict,
-			"this account's email address is already verified")
 
 	case errors.Is(err, recovery.ErrSameAddress):
 		writeProblem(w, r, newProblem(http.StatusUnprocessableEntity, CodeValidationFailed).

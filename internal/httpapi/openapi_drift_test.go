@@ -507,6 +507,12 @@ func TestEveryOperationHasAnOperationIdAndNoOperationIdIsUsedTwice(t *testing.T)
 // 1.4.0 is the admin surface — identity-11's three operations under the `admin`
 // tag. It is a non-breaking addition, which is what core's sync rule asks for, and
 // therefore the only thing that moved.
+//
+// 1.6.0 is the FIRST bump here that is not purely additive, and the pin is what
+// makes a consumer's generated code notice: identity-27 removed the 409 from
+// `POST /v1/email-verifications`, so a client with a branch on that status has to
+// be rebuilt. The alternative — leaving the version at 1.5.0 and describing the
+// removal in prose — is how a client finds out from a support ticket.
 func TestTheDocumentIsOpenAPI31AndCarriesAVersion(t *testing.T) {
 	doc, err := readOpenAPIDocument(v1Document)
 	if err != nil {
@@ -519,7 +525,7 @@ func TestTheDocumentIsOpenAPI31AndCarriesAVersion(t *testing.T) {
 			v1Document, doc.SpecVersion)
 	}
 
-	const want = "1.5.0"
+	const want = "1.6.0"
 	if doc.InfoVersion != want {
 		t.Errorf("%s declares info.version %q, not %q. core's sync rule is that the /v1 "+
 			"prefix says which contract and this says which build of it, and a non-breaking "+

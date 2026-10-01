@@ -190,10 +190,11 @@ func TestAPasswordResetGoesOutThroughARealCourier(t *testing.T) {
 // `welcome` carrying a `url`, with courier's own `message_id` and `event_id`.
 //
 // This is why `verify_email` maps to `welcome` and is not refused like the two
-// email-change messages are: the words are true. `recovery.RequestVerification`
-// already refuses with `ErrAlreadyVerified` for an account that has proved its
-// address, so this message only reaches an account that never has — which is what
-// "Welcome aboard" describes.
+// email-change messages are: the words are true of a first confirmation.
+// `recovery.RequestVerification` will also send it for an account that has already
+// proved its address — the route asks one question and answers it one way, because
+// a route that refused for a proved address was an enumeration oracle on an
+// anonymous route — and the words are still true of what the link does.
 func TestAVerificationLinkReachesCouriersWelcomeTemplate(t *testing.T) {
 	live := requireLiveCourier(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

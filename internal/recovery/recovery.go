@@ -223,13 +223,6 @@ var (
 	// described a move, and a "no-op" 202 would leave a caller believing an
 	// address change had been requested and confirmed.
 	ErrSameAddress = errors.New("that is already this account's address")
-
-	// ErrAlreadyVerified means the account's address has already been proved. A
-	// request for another verification link is refused rather than silently
-	// ignored, because a client rendering "we have emailed you" on the strength of
-	// a 202 it should never have been given is a client that tells a user to check
-	// an inbox that is never going to receive anything.
-	ErrAlreadyVerified = errors.New("this account's email address is already verified")
 )
 
 // Message is one email, and it is the whole of what leaves this process.

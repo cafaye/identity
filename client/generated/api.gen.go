@@ -1090,6 +1090,30 @@ type RecoveryTokenRequest struct {
 	// 43 characters, and the length is load-bearing on the client side rather
 	// than incidental: it is what tells a caller the value is complete before
 	// it is pasted into a URL.
+	//
+	// ### The service does not enforce the length, and a wrong one is a 404
+	//
+	// `minLength`/`maxLength` here describe what identity mints and what a
+	// client can check for itself. **Nothing between the handler and the token
+	// lookup looks at the length**, so a token of 42 characters or of 44 is
+	// answered exactly like one that never existed: **404**, with the same
+	// sentence as an expired or spent one. It is not a 422 and there is no
+	// `errors[]` entry naming `token` — this sentence exists because the
+	// opposite inference is the natural one to draw from a request schema with
+	// a length on it, and it was drawn by a reader of this document before it
+	// was drawn here.
+	//
+	// The reason is `recovery.ErrTokenNotFound`, whose contract is **one
+	// answer for every token that is not live**: never existed, expired,
+	// already spent, or minted for a different flow. A length check would be a
+	// fifth case told apart, and it would buy a caller with a bug in its own
+	// link builder a prettier error at the cost of a branch on the anonymous
+	// surface whose entire argument is that it has none.
+	//
+	// **The one 422 these routes really answer** is for a request body
+	// carrying a field the endpoint does not accept — `{"token": "…",
+	// "emial": "…"}` — which is `decodeBody`'s rule and applies to every
+	// operation in this document.
 	Token string `json:"token"`
 }
 
@@ -2214,14 +2238,35 @@ type ClientInterface interface {
 	// afterwards. That is one extra call in exchange for a registration that
 	// cannot fail because a mail provider is down.
 	//
+	// ### No 409 for an address that is already verified
+	//
 	// Same answer for every address, same constant body, same 202, and the same
 	// one-minute cooldown that sends nothing rather than superseding a live link —
 	// for the reasons on `requestPasswordReset`, which this route mirrors.
 	//
-	// 409 if the account's address is **already** verified. It is a 409 rather
-	// than a silent 202 because a client rendering "check your inbox" on the
-	// strength of a 202 it should never have been given tells a user to watch an
-	// inbox nothing is going to arrive in.
+	// **There is no 409 for an address that is already verified**, and the absence
+	// is the property rather than an oversight. `security: []` below means no
+	// credential is required, so a status that differed for a proved address
+	// turned this route into an account-enumeration oracle: post a list of
+	// addresses, read the statuses back as a list of verified accounts. It used to
+	// answer exactly that, and the reason is worth recording because it is the
+	// shape this whole platform keeps failing in — the branch was argued for on
+	// user-experience grounds ("a client told 'we emailed you' when nothing was
+	// sent renders a confirmation screen the user cannot leave") and never
+	// accounted for who was asking.
+	//
+	// **The same fact is published safely, on an authenticated route.**
+	// `GET /v1/email-verification` requires a session cookie and answers **200**
+	// for every signed-in account, proved or not, with `email_verified` and
+	// `email_verified_at`. A client that needs to tell a user "this address is
+	// already verified" asks the route that knows who is asking. The 409 published
+	// the same fact to a stranger.
+	//
+	// A proved address that asks for a link is sent one. The message confirms
+	// something that already holds, redeeming it changes no fact
+	// (`email_verified_at` records the FIRST proof and does not move), and
+	// refusing quietly would leave the route's behaviour a function of the row —
+	// which is the shape the 409 came from.
 	//
 	// Takes any type of body and a specified content type.
 	//
@@ -2243,14 +2288,35 @@ type ClientInterface interface {
 	// afterwards. That is one extra call in exchange for a registration that
 	// cannot fail because a mail provider is down.
 	//
+	// ### No 409 for an address that is already verified
+	//
 	// Same answer for every address, same constant body, same 202, and the same
 	// one-minute cooldown that sends nothing rather than superseding a live link —
 	// for the reasons on `requestPasswordReset`, which this route mirrors.
 	//
-	// 409 if the account's address is **already** verified. It is a 409 rather
-	// than a silent 202 because a client rendering "check your inbox" on the
-	// strength of a 202 it should never have been given tells a user to watch an
-	// inbox nothing is going to arrive in.
+	// **There is no 409 for an address that is already verified**, and the absence
+	// is the property rather than an oversight. `security: []` below means no
+	// credential is required, so a status that differed for a proved address
+	// turned this route into an account-enumeration oracle: post a list of
+	// addresses, read the statuses back as a list of verified accounts. It used to
+	// answer exactly that, and the reason is worth recording because it is the
+	// shape this whole platform keeps failing in — the branch was argued for on
+	// user-experience grounds ("a client told 'we emailed you' when nothing was
+	// sent renders a confirmation screen the user cannot leave") and never
+	// accounted for who was asking.
+	//
+	// **The same fact is published safely, on an authenticated route.**
+	// `GET /v1/email-verification` requires a session cookie and answers **200**
+	// for every signed-in account, proved or not, with `email_verified` and
+	// `email_verified_at`. A client that needs to tell a user "this address is
+	// already verified" asks the route that knows who is asking. The 409 published
+	// the same fact to a stranger.
+	//
+	// A proved address that asks for a link is sent one. The message confirms
+	// something that already holds, redeeming it changes no fact
+	// (`email_verified_at` records the FIRST proof and does not move), and
+	// refusing quietly would leave the route's behaviour a function of the row —
+	// which is the shape the 409 came from.
 	//
 	// Takes a body of the `application/json` content type.
 	//
@@ -3891,14 +3957,35 @@ func (c *Client) GetEmailVerificationStatus(ctx context.Context, reqEditors ...R
 // afterwards. That is one extra call in exchange for a registration that
 // cannot fail because a mail provider is down.
 //
+// ### No 409 for an address that is already verified
+//
 // Same answer for every address, same constant body, same 202, and the same
 // one-minute cooldown that sends nothing rather than superseding a live link —
 // for the reasons on `requestPasswordReset`, which this route mirrors.
 //
-// 409 if the account's address is **already** verified. It is a 409 rather
-// than a silent 202 because a client rendering "check your inbox" on the
-// strength of a 202 it should never have been given tells a user to watch an
-// inbox nothing is going to arrive in.
+// **There is no 409 for an address that is already verified**, and the absence
+// is the property rather than an oversight. `security: []` below means no
+// credential is required, so a status that differed for a proved address
+// turned this route into an account-enumeration oracle: post a list of
+// addresses, read the statuses back as a list of verified accounts. It used to
+// answer exactly that, and the reason is worth recording because it is the
+// shape this whole platform keeps failing in — the branch was argued for on
+// user-experience grounds ("a client told 'we emailed you' when nothing was
+// sent renders a confirmation screen the user cannot leave") and never
+// accounted for who was asking.
+//
+// **The same fact is published safely, on an authenticated route.**
+// `GET /v1/email-verification` requires a session cookie and answers **200**
+// for every signed-in account, proved or not, with `email_verified` and
+// `email_verified_at`. A client that needs to tell a user "this address is
+// already verified" asks the route that knows who is asking. The 409 published
+// the same fact to a stranger.
+//
+// A proved address that asks for a link is sent one. The message confirms
+// something that already holds, redeeming it changes no fact
+// (`email_verified_at` records the FIRST proof and does not move), and
+// refusing quietly would leave the route's behaviour a function of the row —
+// which is the shape the 409 came from.
 //
 // Takes any type of body and a specified content type.
 //
@@ -3930,14 +4017,35 @@ func (c *Client) RequestEmailVerificationWithBody(ctx context.Context, contentTy
 // afterwards. That is one extra call in exchange for a registration that
 // cannot fail because a mail provider is down.
 //
+// ### No 409 for an address that is already verified
+//
 // Same answer for every address, same constant body, same 202, and the same
 // one-minute cooldown that sends nothing rather than superseding a live link —
 // for the reasons on `requestPasswordReset`, which this route mirrors.
 //
-// 409 if the account's address is **already** verified. It is a 409 rather
-// than a silent 202 because a client rendering "check your inbox" on the
-// strength of a 202 it should never have been given tells a user to watch an
-// inbox nothing is going to arrive in.
+// **There is no 409 for an address that is already verified**, and the absence
+// is the property rather than an oversight. `security: []` below means no
+// credential is required, so a status that differed for a proved address
+// turned this route into an account-enumeration oracle: post a list of
+// addresses, read the statuses back as a list of verified accounts. It used to
+// answer exactly that, and the reason is worth recording because it is the
+// shape this whole platform keeps failing in — the branch was argued for on
+// user-experience grounds ("a client told 'we emailed you' when nothing was
+// sent renders a confirmation screen the user cannot leave") and never
+// accounted for who was asking.
+//
+// **The same fact is published safely, on an authenticated route.**
+// `GET /v1/email-verification` requires a session cookie and answers **200**
+// for every signed-in account, proved or not, with `email_verified` and
+// `email_verified_at`. A client that needs to tell a user "this address is
+// already verified" asks the route that knows who is asking. The 409 published
+// the same fact to a stranger.
+//
+// A proved address that asks for a link is sent one. The message confirms
+// something that already holds, redeeming it changes no fact
+// (`email_verified_at` records the FIRST proof and does not move), and
+// refusing quietly would leave the route's behaviour a function of the row —
+// which is the shape the 409 came from.
 //
 // Takes a body of the `application/json` content type.
 //
@@ -6897,14 +7005,35 @@ type ClientWithResponsesInterface interface {
 	// afterwards. That is one extra call in exchange for a registration that
 	// cannot fail because a mail provider is down.
 	//
+	// ### No 409 for an address that is already verified
+	//
 	// Same answer for every address, same constant body, same 202, and the same
 	// one-minute cooldown that sends nothing rather than superseding a live link —
 	// for the reasons on `requestPasswordReset`, which this route mirrors.
 	//
-	// 409 if the account's address is **already** verified. It is a 409 rather
-	// than a silent 202 because a client rendering "check your inbox" on the
-	// strength of a 202 it should never have been given tells a user to watch an
-	// inbox nothing is going to arrive in.
+	// **There is no 409 for an address that is already verified**, and the absence
+	// is the property rather than an oversight. `security: []` below means no
+	// credential is required, so a status that differed for a proved address
+	// turned this route into an account-enumeration oracle: post a list of
+	// addresses, read the statuses back as a list of verified accounts. It used to
+	// answer exactly that, and the reason is worth recording because it is the
+	// shape this whole platform keeps failing in — the branch was argued for on
+	// user-experience grounds ("a client told 'we emailed you' when nothing was
+	// sent renders a confirmation screen the user cannot leave") and never
+	// accounted for who was asking.
+	//
+	// **The same fact is published safely, on an authenticated route.**
+	// `GET /v1/email-verification` requires a session cookie and answers **200**
+	// for every signed-in account, proved or not, with `email_verified` and
+	// `email_verified_at`. A client that needs to tell a user "this address is
+	// already verified" asks the route that knows who is asking. The 409 published
+	// the same fact to a stranger.
+	//
+	// A proved address that asks for a link is sent one. The message confirms
+	// something that already holds, redeeming it changes no fact
+	// (`email_verified_at` records the FIRST proof and does not move), and
+	// refusing quietly would leave the route's behaviour a function of the row —
+	// which is the shape the 409 came from.
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -6926,14 +7055,35 @@ type ClientWithResponsesInterface interface {
 	// afterwards. That is one extra call in exchange for a registration that
 	// cannot fail because a mail provider is down.
 	//
+	// ### No 409 for an address that is already verified
+	//
 	// Same answer for every address, same constant body, same 202, and the same
 	// one-minute cooldown that sends nothing rather than superseding a live link —
 	// for the reasons on `requestPasswordReset`, which this route mirrors.
 	//
-	// 409 if the account's address is **already** verified. It is a 409 rather
-	// than a silent 202 because a client rendering "check your inbox" on the
-	// strength of a 202 it should never have been given tells a user to watch an
-	// inbox nothing is going to arrive in.
+	// **There is no 409 for an address that is already verified**, and the absence
+	// is the property rather than an oversight. `security: []` below means no
+	// credential is required, so a status that differed for a proved address
+	// turned this route into an account-enumeration oracle: post a list of
+	// addresses, read the statuses back as a list of verified accounts. It used to
+	// answer exactly that, and the reason is worth recording because it is the
+	// shape this whole platform keeps failing in — the branch was argued for on
+	// user-experience grounds ("a client told 'we emailed you' when nothing was
+	// sent renders a confirmation screen the user cannot leave") and never
+	// accounted for who was asking.
+	//
+	// **The same fact is published safely, on an authenticated route.**
+	// `GET /v1/email-verification` requires a session cookie and answers **200**
+	// for every signed-in account, proved or not, with `email_verified` and
+	// `email_verified_at`. A client that needs to tell a user "this address is
+	// already verified" asks the route that knows who is asking. The 409 published
+	// the same fact to a stranger.
+	//
+	// A proved address that asks for a link is sent one. The message confirms
+	// something that already holds, redeeming it changes no fact
+	// (`email_verified_at` records the FIRST proof and does not move), and
+	// refusing quietly would leave the route's behaviour a function of the row —
+	// which is the shape the 409 came from.
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -9359,11 +9509,6 @@ type RequestEmailVerificationResponse400Headers struct {
 	XTraceID string
 }
 
-// RequestEmailVerificationResponse409Headers the declared response headers of an HTTP 409 response for RequestEmailVerification
-type RequestEmailVerificationResponse409Headers struct {
-	XTraceID string
-}
-
 // RequestEmailVerificationResponse413Headers the declared response headers of an HTTP 413 response for RequestEmailVerification
 type RequestEmailVerificationResponse413Headers struct {
 	XTraceID string
@@ -9391,8 +9536,6 @@ type RequestEmailVerificationResponse struct {
 	JSON202 *Accepted
 	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
 	ApplicationProblemJSON400 *MalformedBody
-	// ApplicationProblemJSON409 the response for an HTTP 409 `application/problem+json` response
-	ApplicationProblemJSON409 *Problem
 	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
 	ApplicationProblemJSON413 *BodyTooLarge
 	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
@@ -9405,8 +9548,6 @@ type RequestEmailVerificationResponse struct {
 	Headers202 *RequestEmailVerificationResponse202Headers
 	// Headers400 the parsed response headers for an HTTP 400 response
 	Headers400 *RequestEmailVerificationResponse400Headers
-	// Headers409 the parsed response headers for an HTTP 409 response
-	Headers409 *RequestEmailVerificationResponse409Headers
 	// Headers413 the parsed response headers for an HTTP 413 response
 	Headers413 *RequestEmailVerificationResponse413Headers
 	// Headers422 the parsed response headers for an HTTP 422 response
@@ -9425,11 +9566,6 @@ func (r RequestEmailVerificationResponse) GetJSON202() *Accepted {
 // GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
 func (r RequestEmailVerificationResponse) GetApplicationProblemJSON400() *MalformedBody {
 	return r.ApplicationProblemJSON400
-}
-
-// GetApplicationProblemJSON409 returns the response for an HTTP 409 `application/problem+json` response
-func (r RequestEmailVerificationResponse) GetApplicationProblemJSON409() *Problem {
-	return r.ApplicationProblemJSON409
 }
 
 // GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
@@ -12016,14 +12152,35 @@ func (c *ClientWithResponses) GetEmailVerificationStatusWithResponse(ctx context
 // afterwards. That is one extra call in exchange for a registration that
 // cannot fail because a mail provider is down.
 //
+// ### No 409 for an address that is already verified
+//
 // Same answer for every address, same constant body, same 202, and the same
 // one-minute cooldown that sends nothing rather than superseding a live link —
 // for the reasons on `requestPasswordReset`, which this route mirrors.
 //
-// 409 if the account's address is **already** verified. It is a 409 rather
-// than a silent 202 because a client rendering "check your inbox" on the
-// strength of a 202 it should never have been given tells a user to watch an
-// inbox nothing is going to arrive in.
+// **There is no 409 for an address that is already verified**, and the absence
+// is the property rather than an oversight. `security: []` below means no
+// credential is required, so a status that differed for a proved address
+// turned this route into an account-enumeration oracle: post a list of
+// addresses, read the statuses back as a list of verified accounts. It used to
+// answer exactly that, and the reason is worth recording because it is the
+// shape this whole platform keeps failing in — the branch was argued for on
+// user-experience grounds ("a client told 'we emailed you' when nothing was
+// sent renders a confirmation screen the user cannot leave") and never
+// accounted for who was asking.
+//
+// **The same fact is published safely, on an authenticated route.**
+// `GET /v1/email-verification` requires a session cookie and answers **200**
+// for every signed-in account, proved or not, with `email_verified` and
+// `email_verified_at`. A client that needs to tell a user "this address is
+// already verified" asks the route that knows who is asking. The 409 published
+// the same fact to a stranger.
+//
+// A proved address that asks for a link is sent one. The message confirms
+// something that already holds, redeeming it changes no fact
+// (`email_verified_at` records the FIRST proof and does not move), and
+// refusing quietly would leave the route's behaviour a function of the row —
+// which is the shape the 409 came from.
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
@@ -12051,14 +12208,35 @@ func (c *ClientWithResponses) RequestEmailVerificationWithBodyWithResponse(ctx c
 // afterwards. That is one extra call in exchange for a registration that
 // cannot fail because a mail provider is down.
 //
+// ### No 409 for an address that is already verified
+//
 // Same answer for every address, same constant body, same 202, and the same
 // one-minute cooldown that sends nothing rather than superseding a live link —
 // for the reasons on `requestPasswordReset`, which this route mirrors.
 //
-// 409 if the account's address is **already** verified. It is a 409 rather
-// than a silent 202 because a client rendering "check your inbox" on the
-// strength of a 202 it should never have been given tells a user to watch an
-// inbox nothing is going to arrive in.
+// **There is no 409 for an address that is already verified**, and the absence
+// is the property rather than an oversight. `security: []` below means no
+// credential is required, so a status that differed for a proved address
+// turned this route into an account-enumeration oracle: post a list of
+// addresses, read the statuses back as a list of verified accounts. It used to
+// answer exactly that, and the reason is worth recording because it is the
+// shape this whole platform keeps failing in — the branch was argued for on
+// user-experience grounds ("a client told 'we emailed you' when nothing was
+// sent renders a confirmation screen the user cannot leave") and never
+// accounted for who was asking.
+//
+// **The same fact is published safely, on an authenticated route.**
+// `GET /v1/email-verification` requires a session cookie and answers **200**
+// for every signed-in account, proved or not, with `email_verified` and
+// `email_verified_at`. A client that needs to tell a user "this address is
+// already verified" asks the route that knows who is asking. The 409 published
+// the same fact to a stranger.
+//
+// A proved address that asks for a link is sent one. The message confirms
+// something that already holds, redeeming it changes no fact
+// (`email_verified_at` records the FIRST proof and does not move), and
+// refusing quietly would leave the route's behaviour a function of the row —
+// which is the shape the 409 came from.
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
@@ -14732,13 +14910,6 @@ func ParseRequestEmailVerificationResponse(rsp *http.Response) (*RequestEmailVer
 		}
 		response.ApplicationProblemJSON400 = &dest
 
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
-		var dest Problem
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.ApplicationProblemJSON409 = &dest
-
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
 		var dest BodyTooLarge
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14790,16 +14961,6 @@ func ParseRequestEmailVerificationResponse(rsp *http.Response) (*RequestEmailVer
 			headers.XTraceID = value
 		}
 		response.Headers400 = &headers
-	case rsp.StatusCode == 409:
-		var headers RequestEmailVerificationResponse409Headers
-		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
-			var value string
-			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
-				return nil, err
-			}
-			headers.XTraceID = value
-		}
-		response.Headers409 = &headers
 	case rsp.StatusCode == 413:
 		var headers RequestEmailVerificationResponse413Headers
 		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {

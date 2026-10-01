@@ -51,7 +51,18 @@ info:
   # generated client inherits both: the three anonymous confirmation routes take a
   # token where `security` is `[]` (the token IS the credential), and the two
   # request routes return a `Accepted` body with exactly one field, ever.
-  version: 1.5.0
+  #
+  # 1.6.0 REMOVES A STATUS from an existing operation rather than adding one, so
+  # this is the first bump in the file that a client with a switch on it will notice:
+  # `POST /v1/email-verifications` no longer answers **409** when the address it was
+  # given belongs to an account that has already proved its address. That route
+  # declares `security: []`, so the 409 was a line in a list of verified accounts for
+  # anybody who posted a list of addresses. Every address now gets the same 202 with
+  # the same body, exactly as `requestPasswordReset` has always answered. **A client
+  # that renders "this address is already verified" from a 409 must ask
+  # `GET /v1/email-verification` instead**, which requires a session and answers 200
+  # for every signed-in account whether or not it is proved.
+  version: 1.6.0
   summary: Authentication, sessions, multi-factor authentication, account recovery, accounts, tenancy, scoped API tokens, the admin surface and OIDC registrations.
   description: |
     `identity` is the cafaye platform's security boundary: it is what every other
@@ -1221,14 +1232,35 @@ paths:
         afterwards. That is one extra call in exchange for a registration that
         cannot fail because a mail provider is down.
 
+        ### No 409 for an address that is already verified
+
         Same answer for every address, same constant body, same 202, and the same
         one-minute cooldown that sends nothing rather than superseding a live link —
         for the reasons on `requestPasswordReset`, which this route mirrors.
 
-        409 if the account's address is **already** verified. It is a 409 rather
-        than a silent 202 because a client rendering "check your inbox" on the
-        strength of a 202 it should never have been given tells a user to watch an
-        inbox nothing is going to arrive in.
+        **There is no 409 for an address that is already verified**, and the absence
+        is the property rather than an oversight. `security: []` below means no
+        credential is required, so a status that differed for a proved address
+        turned this route into an account-enumeration oracle: post a list of
+        addresses, read the statuses back as a list of verified accounts. It used to
+        answer exactly that, and the reason is worth recording because it is the
+        shape this whole platform keeps failing in — the branch was argued for on
+        user-experience grounds ("a client told 'we emailed you' when nothing was
+        sent renders a confirmation screen the user cannot leave") and never
+        accounted for who was asking.
+
+        **The same fact is published safely, on an authenticated route.**
+        `GET /v1/email-verification` requires a session cookie and answers **200**
+        for every signed-in account, proved or not, with `email_verified` and
+        `email_verified_at`. A client that needs to tell a user "this address is
+        already verified" asks the route that knows who is asking. The 409 published
+        the same fact to a stranger.
+
+        A proved address that asks for a link is sent one. The message confirms
+        something that already holds, redeeming it changes no fact
+        (`email_verified_at` records the FIRST proof and does not move), and
+        refusing quietly would leave the route's behaviour a function of the row —
+        which is the shape the 409 came from.
       security: []
       requestBody:
         required: true
@@ -1238,7 +1270,7 @@ paths:
               $ref: '#/components/schemas/RecoveryEmailRequest'
       responses:
         '202':
-          description: Accepted. Identical for every address.
+          description: Accepted. Identical for every address, verified or not.
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/TraceId'
@@ -1250,23 +1282,6 @@ paths:
                 status: accepted
         '400':
           $ref: '#/components/responses/MalformedBody'
-        '409':
-          description: This account's address is already verified, so there is nothing to prove.
-          headers:
-            X-Trace-Id:
-              $ref: '#/components/headers/TraceId'
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-              example:
-                type: https://errors.cafaye.com/conflict
-                title: Conflict
-                status: 409
-                detail: this account's email address is already verified
-                instance: /v1/email-verifications
-                code: conflict
-                trace_id: 0af7651916cd43dd8448eb211c80319c
         '413':
           $ref: '#/components/responses/BodyTooLarge'
         '422':
@@ -1917,7 +1932,7 @@ paths:
                 id: ab000000-0000-0000-0000-0000000000a1
                 name: ci-deploy
                 account_id: ab000000-0000-0000-0000-0000000000c1
-                user_id: ab000000-0000-0000-0000-0000000000u1
+                user_id: ab000000-0000-0000-0000-0000000000b1
                 scopes: [accounts:read]
                 expires_at: '2026-12-29T12:00:00Z'
                 created_at: '2026-09-30T12:00:00Z'
@@ -1976,7 +1991,7 @@ paths:
                 - id: ab000000-0000-0000-0000-0000000000a1
                   name: ci-deploy
                   account_id: ab000000-0000-0000-0000-0000000000c1
-                  user_id: ab000000-0000-0000-0000-0000000000u1
+                  user_id: ab000000-0000-0000-0000-0000000000b1
                   scopes: [accounts:read]
                   expires_at: '2026-12-29T12:00:00Z'
                   created_at: '2026-09-30T12:00:00Z'
@@ -2156,7 +2171,7 @@ paths:
                 entries:
                   - id: ab000000-0000-0000-0000-0000000000d1
                     action: invitation.revoked
-                    actor_user_id: ab000000-0000-0000-0000-0000000000u1
+                    actor_user_id: ab000000-0000-0000-0000-0000000000b1
                     actor_key_id: ab000000-0000-0000-0000-0000000000a1
                     target: 4f2c0000-0000-4000-8000-00000000abcd
                     affected: 1
@@ -2464,7 +2479,7 @@ paths:
                   summary: A live token
                   value:
                     active: true
-                    sub: ab000000-0000-0000-0000-0000000000u1
+                    sub: ab000000-0000-0000-0000-0000000000b1
                     account_id: ab000000-0000-0000-0000-0000000000c1
                     scopes: accounts:read accounts:write
                     scope: accounts:read accounts:write
@@ -3665,6 +3680,30 @@ components:
             43 characters, and the length is load-bearing on the client side rather
             than incidental: it is what tells a caller the value is complete before
             it is pasted into a URL.
+
+            ### The service does not enforce the length, and a wrong one is a 404
+
+            `minLength`/`maxLength` here describe what identity mints and what a
+            client can check for itself. **Nothing between the handler and the token
+            lookup looks at the length**, so a token of 42 characters or of 44 is
+            answered exactly like one that never existed: **404**, with the same
+            sentence as an expired or spent one. It is not a 422 and there is no
+            `errors[]` entry naming `token` — this sentence exists because the
+            opposite inference is the natural one to draw from a request schema with
+            a length on it, and it was drawn by a reader of this document before it
+            was drawn here.
+
+            The reason is `recovery.ErrTokenNotFound`, whose contract is **one
+            answer for every token that is not live**: never existed, expired,
+            already spent, or minted for a different flow. A length check would be a
+            fifth case told apart, and it would buy a caller with a bug in its own
+            link builder a prettier error at the cost of a branch on the anonymous
+            surface whose entire argument is that it has none.
+
+            **The one 422 these routes really answer** is for a request body
+            carrying a field the endpoint does not accept — `{"token": "…",
+            "emial": "…"}` — which is `decodeBody`'s rule and applies to every
+            operation in this document.
 
     ConfirmPasswordResetRequest:
       type: object

@@ -679,7 +679,17 @@ jobs:
             TestTheBackupAccessoryMountsTheBackupConfig \
             TestTheBackupConfigNamesThisService \
             TestTheScheduleIsStatedAndTheWindowInTheReadmeMatchesIt \
-            TestTheContractCheckFailsOnAnInjectedPair; do
+            TestTheContractCheckFailsOnAnInjectedPair \
+            TestTheVerificationRequestCannotBeToldApartOverHTTP \
+            TestATruncatedTokenAnswers404Not422 \
+            TestEveryRouteThatAnswersAnAnonymousCallerIsInThisAudit \
+            TestEveryAuditedRouteStillAnswersWhatItsRowSays \
+            TestRegistrationPublishesOnlyThatAnAddressIsTaken \
+            TestALockedAccountIsToldApartOnlyFromThePassword \
+            TestTheRequestRoutesCarryNoIdentifierToEnumerate \
+            TestATokenRouteCannotBeToldApartFromASpentOne \
+            TestIntrospectionIsAnOracleByDesignAndGatedOnACredential \
+            TestEveryIdentifierInAnExampleIsAUuid; do
             # The trailing " (" is what makes this exact: `--- PASS: TestFooBar`
             # must not satisfy a check written for `TestFoo`, and go test always
             # puts the duration after the name.

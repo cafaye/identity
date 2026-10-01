@@ -108,13 +108,22 @@ func TestAnExpiredVerificationTokenIsRefused(t *testing.T) {
 	assertNotVerified(t, h, who)
 }
 
-// TestAVerificationRequestForAKnownAddressIsRefusedOnceVerified: the honest answer
-// to "send me another verification link" on an account that is already proved.
+// TestAVerificationRequestForAVerifiedAddressIsNotDistinguished: the answer to
+// "send me another verification link" on an account that is already proved is the
+// same answer every other address gets.
 //
-// It matters because the alternative is a 202 a client renders as "we emailed you",
-// and the user then sits in front of an inbox that is never going to receive
-// anything.
-func TestAVerificationRequestForAKnownAddressIsRefusedOnceVerified(t *testing.T) {
+// IT REPLACED A TEST THAT ASSERTED THE OPPOSITE. This function used to return
+// ErrAlreadyVerified for a verified account, which the HTTP layer answered 409 —
+// on a route with `security: []`, so the 409 was a line in a list of verified
+// accounts for anybody who posted a list of addresses. The eleven lines above the
+// branch named that exact threat and then took it.
+//
+// THE ASSERTION IS NOT ONLY "no error". A `if user.IsVerified() { return nil }`
+// would satisfy an error-only check while leaving the route's behaviour a function
+// of the row, which is the shape the 409 came from. So this also asserts the
+// message was SENT: a proved address is treated exactly as an unproved one, all the
+// way through the mint and the delivery.
+func TestAVerificationRequestForAVerifiedAddressIsNotDistinguished(t *testing.T) {
 	h := newHarness(t, true)
 	who := h.registerSimple()
 
@@ -122,13 +131,37 @@ func TestAVerificationRequestForAKnownAddressIsRefusedOnceVerified(t *testing.T)
 	if err := h.svc.RedeemVerification(t.Context(), RedeemVerificationInput{Token: token}); err != nil {
 		t.Fatalf("RedeemVerification: %v", err)
 	}
+	firstProof := h.now()
 
-	err := h.svc.RequestVerification(t.Context(), who.email)
-	if err != ErrAlreadyVerified {
-		t.Errorf("RequestVerification on a verified account = %v, want ErrAlreadyVerified", err)
+	// Past the cooldown, so the request is answered by the lookup and not by the
+	// window — otherwise "no second message" would prove nothing about the row.
+	h.clk.Advance(RequestWindow + time.Second)
+
+	if err := h.svc.RequestVerification(t.Context(), who.email); err != nil {
+		t.Errorf("RequestVerification on a verified account = %v, want nil: a proved address "+
+			"must not be a distinguishable case", err)
 	}
-	if got := h.mailer.count(); got != 1 {
-		t.Errorf("%d messages after a second request on a verified account, want 1", got)
+	if got := h.mailer.count(); got != 2 {
+		t.Errorf("%d messages after a second request on a verified account, want 2: the request "+
+			"is treated exactly as it is for an unverified account", got)
+	}
+
+	// And redeeming the second link is harmless rather than a second state change:
+	// the instant recorded is still the first proof, because `MarkEmailVerified` is
+	// conditional on the column still being null. That is what makes sending a
+	// confirmation to a proved address cost a message and nothing else.
+	if err := h.svc.RedeemVerification(t.Context(), RedeemVerificationInput{
+		Token: tokenFrom(t, h.mailer.last(t)),
+	}); err != nil {
+		t.Fatalf("redeeming the second verification: %v", err)
+	}
+	var at *time.Time
+	if err := h.pool.QueryRow(t.Context(),
+		`SELECT email_verified_at FROM users WHERE id = $1`, who.id).Scan(&at); err != nil {
+		t.Fatalf("reading the verification state: %v", err)
+	}
+	if at == nil || !at.Equal(firstProof) {
+		t.Errorf("email_verified_at = %v, want the first proof at %s", at, firstProof)
 	}
 }
 

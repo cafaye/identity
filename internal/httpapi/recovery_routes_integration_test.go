@@ -3,7 +3,9 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -189,6 +191,41 @@ func (f *recoveryServerFixture) userIDFor(t *testing.T, email string) id.UUID {
 	return out
 }
 
+// verifyAddress walks the whole verification flow over HTTP, so a test that needs a
+// VERIFIED account has one that was proved the way a user's would be — through the
+// two anonymous routes — rather than by writing the column.
+func (f *recoveryServerFixture) verifyAddress(t *testing.T, email string) {
+	t.Helper()
+
+	requested := post(t, f.handler, "/v1/email-verifications", `{"email":"`+email+`"}`)
+	if requested.Code != http.StatusAccepted {
+		t.Fatalf("POST /v1/email-verifications = %d, want 202; body: %s", requested.Code, requested.Body)
+	}
+	confirmed := sendWith(t, f.handler, http.MethodPost, "/v1/email-verifications/confirm", "",
+		"", `{"token":"`+tokenIn(t, f.mailer.last(t))+`"}`)
+	if confirmed.Code != http.StatusNoContent {
+		t.Fatalf("the confirmation = %d, want 204; body: %s", confirmed.Code, confirmed.Body)
+	}
+	if got := verificationState(t, f, email); got != "verified" {
+		t.Fatalf("the address is %s after a confirmation, want verified", got)
+	}
+}
+
+// verificationState reads the column, for a failure message that says which of the
+// three cases a response belonged to.
+func verificationState(t *testing.T, f *recoveryServerFixture, email string) string {
+	t.Helper()
+	var at *time.Time
+	if err := f.pool.QueryRow(t.Context(),
+		`SELECT email_verified_at FROM users WHERE email = $1`, email).Scan(&at); err != nil {
+		t.Fatalf("reading the verification state of %s: %v", email, err)
+	}
+	if at == nil {
+		return "unverified"
+	}
+	return "verified"
+}
+
 // TestTheWholeResetFlowOverHTTP: request, redeem, sign in again, and the old session
 // is gone.
 //
@@ -275,6 +312,107 @@ func TestTheTwoRequestRoutesAnswerIdenticallyOverHTTP(t *testing.T) {
 
 // TestTheWholeEmailChangeFlowOverHTTP: request, confirm the current address, confirm
 // the new one, and the address has moved.
+// TestATruncatedTokenAnswers404Not422 settles a
+// disagreement between the document and the service, which was found by another
+// service's worker and re-measured here rather than taken on trust.
+//
+// THE DISAGREEMENT. `RecoveryTokenRequest.token` declares `minLength: 43` and
+// `maxLength: 43`, and each of the three redemption routes lists a 422. A reader
+// derives from that a 422 with a field error naming `token` — and gets a 404,
+// because nothing between the handler and `tokens.Live` looks at the length at all.
+// A caller whose link builder truncated the query string is told "no such link",
+// which is the same sentence as an expired one.
+//
+// THE RESOLUTION IS THE DOCUMENT'S, and the schema already said so: the token's
+// description calls the length "load-bearing ON THE CLIENT SIDE … it is what tells
+// a caller the value is complete before it is pasted into a URL". What was missing
+// was the sentence that says the service does not enforce it, so the 422 read as
+// though it did. Adding a length check in the handler was the other answer and was
+// rejected: `ErrTokenNotFound`'s contract is ONE answer for every token that is not
+// live, and a fifth case told apart by a property of the input buys a developer a
+// prettier error while adding a branch to the anonymous surface whose whole argument
+// is that it has none.
+//
+// THE 422 IS STILL TRUE, and this proves it rather than asserting it: the one 422
+// these routes really answer is for a field the endpoint does not accept, which is
+// `decodeBody`'s rule and applies to every route in the service.
+func TestATruncatedTokenAnswers404Not422(t *testing.T) {
+	f := newRecoveryServerFixture(t)
+	email, _ := f.signUp(t)
+
+	// A real token, so the "43" in the schema is checked against something this
+	// service actually minted rather than against the constant.
+	post(t, f.handler, "/v1/email-verifications", `{"email":"`+email+`"}`)
+	live := tokenIn(t, f.mailer.last(t))
+	if want := 43; len(live) != want {
+		t.Fatalf("the token this service mailed is %d characters, and RecoveryTokenRequest "+
+			"declares minLength and maxLength %d. Fix the document or the mint; this test "+
+			"truncates on the declared length", len(live), want)
+	}
+
+	routes := []struct{ path, body string }{
+		{"/v1/email-verifications/confirm", `{"token":%q}`},
+		{"/v1/email-changes/current-address", `{"token":%q}`},
+		{"/v1/email-changes/new-address", `{"token":%q}`},
+	}
+	// Three shapes, and the point of the test is that they are one answer: a token
+	// truncated by one character, a token that is obviously not one, and a token one
+	// character too long. A SLICE, not a map, because the first answer becomes the
+	// reference and a map would make which one that be a property of Go's iteration
+	// order — so a failure would name a different pair of shapes on each run.
+	shapes := []struct{ name, token string }{
+		{"truncated by one", live[:len(live)-1]},
+		{"far too short", "t"},
+		{"one too long", live + "x"},
+		{"never existed", strings.Repeat("z", len(live))},
+	}
+
+	for _, route := range routes {
+		reference := ""
+		for _, shape := range shapes {
+			body := fmt.Sprintf(route.body, shape.token)
+			rec := sendWith(t, f.handler, http.MethodPost, route.path, "", "", body)
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("POST %s with a token %s = %d, want 404; body: %s",
+					route.path, shape.name, rec.Code, rec.Body)
+				continue
+			}
+
+			p := decodeProblem(t, rec)
+			if p.Code != CodeNotFound {
+				t.Errorf("POST %s with a token %s: code = %q, want %q",
+					route.path, shape.name, p.Code, CodeNotFound)
+			}
+			// Byte equality apart from the trace id, which is the only part of a
+			// problem document that may legitimately differ between two requests.
+			p.TraceID = ""
+			rendered, err := json.Marshal(p)
+			if err != nil {
+				t.Fatalf("re-marshalling the problem: %v", err)
+			}
+			switch {
+			case reference == "":
+				reference = string(rendered)
+			case string(rendered) != reference:
+				t.Errorf("POST %s answers differently for a token %s than for one %s:\n  %s\n  %s",
+					route.path, shape.name, shapes[0].name, rendered, reference)
+			}
+		}
+		if reference == "" {
+			t.Errorf("POST %s produced no comparable answer at all, so the comparison above "+
+				"passed vacuously", route.path)
+		}
+	}
+
+	// And the 422 the document lists is real, for the reason the document should
+	// name: a field this endpoint does not accept.
+	typo := sendWith(t, f.handler, http.MethodPost, "/v1/email-verifications/confirm", "", "",
+		`{"token":"`+live+`","emial":"x"}`)
+	if typo.Code != http.StatusUnprocessableEntity {
+		t.Errorf("a misspelled field on the confirm route = %d, want 422; body: %s", typo.Code, typo.Body)
+	}
+}
+
 func TestTheWholeEmailChangeFlowOverHTTP(t *testing.T) {
 	f := newRecoveryServerFixture(t)
 	email, token := f.signUp(t)
@@ -361,11 +499,80 @@ func TestTheWholeVerificationFlowOverHTTP(t *testing.T) {
 		t.Errorf("%d sessions after a verification, want 1: confirming an address must not sign "+
 			"the user out", got)
 	}
+}
 
-	// A second request is refused rather than quietly answering "we emailed you".
-	again := post(t, f.handler, "/v1/email-verifications", `{"email":"`+email+`"}`)
-	if again.Code != http.StatusConflict {
-		t.Errorf("a second verification request = %d, want 409; body: %s", again.Code, again.Body)
+// TestTheVerificationRequestCannotBeToldApartOverHTTP is the packet's finding, over
+// the real service and the real router.
+//
+// IT IS THREE CASES AND NOT TWO, and the third is the whole of it: an address with
+// no account, an account that has NOT proved its address, and an account that has.
+// This route used to answer 202, 202 and 409, and `security: []` means the caller
+// posting the list is anonymous — so a 409 was a line in a list of verified
+// accounts, handed to whoever typed the addresses.
+//
+// THE ASSERTION IS THE WHOLE RESPONSE, not the status: status, Content-Type and
+// body bytes. "One status, one body" is the property, and a check that compared
+// only the status would let a differing header or a differing byte through — which
+// is the shape the oracle takes when somebody adds a field to the response.
+//
+// THE MESSAGE COUNT IS THE OTHER HALF, and it is the half a status comparison
+// cannot see. The verified account gets a link exactly as the unverified one does,
+// because the route does not read the row's verification state at all; the unknown
+// address gets nothing, which is the one difference this service already documents
+// and accepts for the reset route it mirrors.
+func TestTheVerificationRequestCannotBeToldApartOverHTTP(t *testing.T) {
+	f := newRecoveryServerFixture(t)
+
+	unverified, _ := f.signUp(t)
+	verified, _ := f.signUp(t)
+	f.verifyAddress(t, verified)
+	unknown := dbtest.UniqueEmail(t)
+
+	// Past the cooldown, so nothing here is answered by the window rather than by
+	// the lookup. The window is per address and these are three different ones, so
+	// this is belt and braces — but a test whose third case is silently inside a
+	// cooldown proves less than it looks like it proves.
+	f.clk.Advance(recovery.RequestWindow + time.Second)
+
+	answers := make(map[string]*httptest.ResponseRecorder, 3)
+	sentBefore := f.mailer.count()
+	for _, address := range []string{unknown, unverified, verified} {
+		rec := post(t, f.handler, "/v1/email-verifications", `{"email":"`+address+`"}`)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("POST /v1/email-verifications for %s = %d, want 202; body: %s",
+				address, rec.Code, rec.Body)
+		}
+		answers[address] = rec
+	}
+
+	for _, address := range []string{unverified, verified} {
+		got, want := answers[address], answers[unknown]
+		if got.Body.String() != want.Body.String() {
+			t.Errorf("the answer for a %s account differs from the answer for an address with "+
+				"no account:\n%s: %s\nunknown: %s", verificationState(t, f, address), address,
+				got.Body, want.Body)
+		}
+		if ct1, ct2 := got.Header().Get("Content-Type"), want.Header().Get("Content-Type"); ct1 != ct2 {
+			t.Errorf("Content-Type for %s = %q, unknown = %q", address, ct1, ct2)
+		}
+		// A header is a channel too, and `Retry-After` is the one an error-mapping
+		// change tends to grow.
+		if h1, h2 := got.Header().Get("Retry-After"), want.Header().Get("Retry-After"); h1 != h2 {
+			t.Errorf("Retry-After for %s = %q, unknown = %q", address, h1, h2)
+		}
+	}
+
+	// Two messages, to the two addresses that have an account — the verified one
+	// included. A route that read the row and stayed quiet would answer 202 for both
+	// and pass the comparison above, and it would still be the route the comment
+	// eleven lines above `RequestVerification` says it must not be.
+	if got, want := f.mailer.count()-sentBefore, 2; got != want {
+		t.Errorf("the three requests sent %d messages, want %d: one per address that has an "+
+			"account, and none for the address that has not", got, want)
+	}
+	if got := f.mailer.last(t).To; got != verified {
+		t.Errorf("the last message went to %q, want the verified address %q: a verified "+
+			"account is treated exactly as an unverified one", got, verified)
 	}
 }
 

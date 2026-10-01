@@ -26,6 +26,7 @@ and its entry here is deleted; the number is never reused.**
 | [D5](#d5-bulk-and-single-revocations-do-not-share-a-shape) | does a bulk revocation take the same request shape as a single one? | RULED: no. `confirm` in the body, a higher minimum, and both counts returned |
 | [D6](#d6-the-generated-client-commits-a-dependency-that-md6-said-it-would-not) | the generated client commits a runtime dependency, which MD6 said it would not — and it takes the coverage floor | RULED, with MD6's stated REASON corrected: the client ships here, generated, and the dependency is paid for |
 | [D8](#d8-one-link-template-for-four-messages-and-what-the-deployment-inherits) | one link template served all four messages — so a verification mail's button opened the password-reset screen. What does the template a deployment already set now MEAN? | RULED: it is the DEFAULT for every purpose with no template of its own, so nothing breaks at boot, and a purpose with neither is refused by name at startup |
+| [D9](#d9-registration-publishes-that-an-address-is-taken-and-that-is-the-last-one) | `POST /v1/users` answers `409` for a taken address, so an unauthenticated caller can discover whether anybody has an account here. Is that disclosure accepted, or does registration change shape? | RULED for now: it is accepted, and it is named. Closing it is a decision about products, not about identity |
 
 ## D1: twelve served operations are in no document
 
@@ -755,3 +756,90 @@ where it has its own endpoints:
 maps onto courier's `welcome`, which is the honest mapping and stays: what changed
 is the **link**, not the message kind. There is still no `email_verification` type in
 courier, and this decision does not argue for one.
+## D9: registration publishes that an address is taken, and that is the last one
+
+**Raised** 2026-10-02 by packet `identity-27`, which removed an
+account-enumeration oracle from `POST /v1/email-verifications` and then audited every
+route a stranger can reach.
+
+**What identity-27 removed.** `POST /v1/email-verifications` answered **409** for an
+address whose account had already proved its address, and 202 for everything else.
+The route declares `security: []`, so no credential was required: a caller posting a
+list of addresses could read the statuses back as a list of **verified accounts**. The
+branch was defended on user-experience grounds — a client told "we emailed you" on
+the strength of a refused request renders a confirmation screen the user cannot leave
+— and never accounted for who was asking. It is gone, and the fact it published is
+available safely on `GET /v1/email-verification`, which requires a session and answers
+200 for every signed-in account.
+
+**What the audit found afterwards, which is why this entry exists.** One route on this
+service answers an anonymous caller with a status that distinguishes existence, and it
+is not the one just fixed:
+
+> **`POST /v1/users` answers `409 conflict` for an address that is already registered.**
+
+One unauthenticated request per candidate address, no side effect, no cooldown, and it
+covers **every** account rather than only the verified ones. So "does an account exist
+for this address" is not a secret identity keeps, and any argument that another route's
+disclosure is serious has to start by acknowledging this one.
+
+**RULED: it stands, it is named, and closing it is a decision about products.**
+
+Why it cannot simply be removed:
+
+1. **One account per address is a database fact.** `users.email` carries a unique
+   index. A registration cannot complete for a taken address, so a caller has to be
+   told rather than left watching a request time out.
+2. **There is no other route that can answer it.** Not the verification request — that
+   is exactly the route identity-27 had to blind, because answering it honestly is the
+   oracle. Not the login, which answers one 401 for everything. Registration is the
+   only operation whose entire purpose is to create the row, so it is the only place
+   the caller can learn whether the row is there.
+
+The three shapes that would close it, and what each costs:
+
+| shape | what it does | why it is not this packet's call |
+| --- | --- | --- |
+| answer `202` and mail a "somebody tried this" message | hides the bit; leaks it to the mailbox owner | requires a message identity does not have a template for, and tells a stranger's inbox about an account it does not have |
+| register into a pending state and confirm by mail | the honest fix; the bit never exists | **changes what a registration means for every product in the fleet**, and adds a route, a table state and a login branch |
+| a separate `GET /v1/email-availability` | same oracle, one endpoint instead of a side effect | it is the same disclosure wearing a new name, and it adds a surface to remove later |
+
+The middle one is very likely right eventually, and it is a product decision with a
+migration attached: every existing product has a flow that assumes a `201` means the
+account exists and can be signed into. **identity does not get to make that call for
+them**, so what this entry does is make the disclosure impossible to forget.
+
+**What is held instead, so the disclosure stays exactly one bit.**
+`TestRegistrationPublishesOnlyThatAnAddressIsTaken` registers two accounts — one whose
+address is proved and one whose is not — and asserts the two `409`s are the same seven
+fields and the same fixed sentence. `Problem` is compared as a whole document rather
+than by grepping the bytes, because a grep cannot see a field added later and fires on
+the envelope's own fixed text (`trace_id`, `instance: /v1/users`, and the word
+"account" in the sentence that has to be there).
+
+**And the second, smaller leak, which the same audit measured.**
+`POST /v1/session` answers **423** for a locked account, and the lock is checked
+*before* the password — so a stranger who posts five wrong passwords and then a sixth
+reads 423 where an address with no row would have read 401. Six requests per
+candidate, and the only side effect is a lockout the attacker caused themselves.
+
+It was left in place, and the reasoning is that it is strictly dominated by the
+registration `409`: same fact, one request instead of six, no state change. What the
+423 adds is "…and it is locked right now", for an account the attacker had to lock.
+`TestALockedAccountIsToldApartOnlyFromThePassword` holds the leak, measures it, and
+asserts the honest answer survives — a user who mistyped five times is still told to
+wait fifteen minutes rather than being told "wrong password".
+
+**THE ANSWER THAT WOULD CHANGE BOTH** is the middle row above. If registration stops
+answering "that address is taken", then the lockout's 423 becomes the only existence
+oracle on this service rather than the second one, and it should move to the same
+ruling: check the lock after the password, and pay one argon2id to keep the refusal
+honest for the account's owner.
+
+**WHERE THE OTHER ROUTES STAND.** The rest of the anonymous family answers no, each
+with a test: `internal/httpapi/anonymous_enumeration_test.go` is the census, and its
+table is required to be exactly the mounted family in both directions — a route added
+under those prefixes is red until somebody has answered the question for it.
+`POST /v1/introspections` answers **yes on purpose** and says so in a test, because
+resolving a presented token is what an introspection endpoint is for; its protection is
+the credential the caller must present.

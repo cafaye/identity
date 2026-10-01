@@ -6,6 +6,113 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed (packet identity-27: the enumeration oracle on /v1/email-verifications)
+
+- **`POST /v1/email-verifications` answered `409` when the address belonged to an
+  account that had already proved its address, and the route requires no credential.**
+  `security: []` is on the operation, so a caller posting a list of addresses could
+  read the statuses back as a list of **verified accounts**. The 409 is gone from the
+  service, from `openapi/v1.yaml` and from the generated client, and every address now
+  gets the same `202 {"status":"accepted"}`.
+
+- **The author named the threat eleven lines above the branch and then walked into
+  it.** `internal/recovery/service.go`'s own comment reads *"IT HAS THE SAME SHAPE AND
+  THE SAME ANSWER AS A RESET REQUEST — one status, one body, whatever the row says …
+  only one of them being careful would leave the other as the oracle"*, and the body
+  of that same function did `if user.IsVerified() { return ErrAlreadyVerified }`. The
+  branch was argued for on user-experience grounds — a client told "we emailed you"
+  on the strength of a refused request renders a confirmation screen the user cannot
+  leave — and **never accounted for the route being unauthenticated**.
+
+- **The information is still published, on an authenticated route.**
+  `GET /v1/email-verification` requires a session cookie and answers `200` for every
+  signed-in account, proved or not, with `email_verified` and `email_verified_at`. A
+  client that needs to say "this address is already verified" asks the route that knows
+  who is asking; the 409 published the same fact to a stranger. **`openapi/v1.yaml`
+  is at `info.version` 1.6.0, which is the first bump here that removes a status
+  rather than adding one** — a client with a branch on that 409 has to be rebuilt, and
+  the version is what makes that visible.
+
+- **No `return nil` branch either.** `if user.IsVerified() { return nil }` would keep
+  the 202 honest while leaving the route's behaviour a function of the row's state —
+  which is the shape the 409 came from and is one line away from being an oracle
+  again. A proved account that asks for a link is **sent** one: the message confirms
+  something already true, `users.Store.MarkEmailVerified` is conditional on the column
+  still being null so `email_verified_at` records the first proof and does not move,
+  and the cost is one message to the account's own inbox.
+
+- **`recovery.ErrAlreadyVerified` is deleted rather than left unused.** Grep found no
+  other caller: the HTTP layer's mapping was the only one, and a sentinel error that
+  names a behaviour nobody implements is a trap for the next reader.
+
+- **`openapi/v1.yaml:2467`'s `sub` example was `ab000000-0000-0000-0000-0000000000u1`,
+  which is not a uuid** — `u` is not a hex digit, on a field declared `format: uuid`.
+  It was in **four** places, not one (`sub`, `user_id` twice and `actor_user_id`), so
+  fixing the line the finding named would have left three of the same defect in the
+  tree. All four are hex now, and `TestEveryIdentifierInAnExampleIsAUuid` walks both
+  committed documents so the next one is a red build. The check asserts hex digits and
+  the canonical grouping and **not** the RFC 4122 version/variant nibbles, because
+  these examples are mnemonic on purpose (`a1` api key, `b1` user, `c1` account, `d1`
+  invitation). Its red proof was run: reinstating `u1` reds it with the file and line.
+
+- **`parlor-23` measured a truncated token answering `404` where `minLength: 43` implies
+  a `422`. Re-measured here rather than taken on trust, and confirmed: nothing between
+  the handler and `tokens.Live` looks at the token's length.**
+  `TestATruncatedTokenAnswers404Not422` drives a token
+  truncated by one character, one far too short, one too long and one that never
+  existed at all, at each of the three redemption routes, and asserts all four answer
+  the same `404` byte for byte — and that the `422` the document really does list is
+  reachable, for a field the endpoint does not accept.
+
+- **The document is the side that changed, and the reason is worth stating.** The
+  schema's own description already called the length "load-bearing **on the client
+  side** … it is what tells a caller the value is complete before it is pasted into a
+  URL"; what was missing was the sentence saying the service does not enforce it.
+  Adding a length check in the handler was the other answer and was rejected:
+  `recovery.ErrTokenNotFound`'s contract is **one answer for every token that is not
+  live**, and a fifth case told apart by a property of the input buys a caller with a
+  bug in its own link builder a prettier error at the cost of a branch on the
+  anonymous surface whose whole argument is that it has none.
+
+- **The sibling audit: one question per route a stranger can reach, answered in a test.**
+  `internal/httpapi/anonymous_enumeration_test.go` walks the router and requires its
+  table to be **exactly the mounted family in both directions**, so a route added under
+  `/v1/users`, `/v1/me`, `/v1/session`, `/v1/password-resets`,
+  `/v1/email-verification`, `/v1/email-changes` or `/v1/introspections` is red until
+  somebody has answered *can the response distinguish "exists" from "does not"?* — 14
+  routes, 14 rows. Both directions were shown to fire.
+
+- **Two rows answer YES, and they are named rather than quietly reclassified.**
+  `POST /v1/users` publishes "that address is taken" (one account per address is the
+  unique index, and a caller registering has to be told) and `POST /v1/session`
+  publishes "that account is locked" through a `423` the lock check reaches **before**
+  the password. The first is pinned to one bit; the second is measured, held, and
+  explained as strictly dominated by the first — one request instead of six, no state
+  change. **Whether registration should publish it at all is a product decision, and
+  it is DECISIONS.md D9.**
+
+- **`POST /v1/introspections` is an oracle BY DESIGN and now says so in a test.**
+  `TestIntrospectionIsAnOracleByDesignAndGatedOnACredential` asserts the answer differs
+  for a live token and a dead one — that is the endpoint working — and then asserts
+  what actually protects it: `401` with no credential, a token may read itself and not
+  a peer, and a session outside the account is refused.
+
+- **One flake was found by this packet's own gate run and fixed, because a gate that
+  is red half the time is not a gate.** `internal/courier`'s
+  `resolveLinkTemplates` ranged the `linkPurposeFor` MAP and returned on the first
+  purpose with no template, so a deployment with **neither** link template configured
+  was told to set a different variable on each boot — and
+  `TestTheConstructorRefusesAPurposeWithNoLinkTemplate`'s "no template for either" row,
+  which asserts which purpose gets named, failed roughly half of all runs. The order is
+  now fixed and **sorted by purpose rather than by mail subject**, because the refusal
+  is about a configuration variable and an answer that depends on courier's prose is
+  not one identity can state. Ten consecutive runs, green.
+
+- **One thing was found and deliberately not changed, and it is reported again here.**
+  `go mod tidy` promotes `otlptrace` from indirect to direct on a clean HEAD. That is
+  a pre-existing defect unrelated to this packet, and `go.mod` and `go.sum` are
+  untouched by it so the diff stays reviewable. It needs its own packet.
+
 ### Fixed (packet identity-26: the verification link opened the password-reset screen)
 
 - **A `welcome` mail's button said `https://app.example.com/reset?token=…`, so a
