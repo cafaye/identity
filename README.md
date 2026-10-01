@@ -973,6 +973,39 @@ Migrations are a deploy step, so they are not a test step — `goose up` is its 
 command above the suite, and a suite run against an unmigrated database fails
 loudly with `relation "public.users" does not exist` rather than skipping.
 
+**`internal/courier`'s live tier SKIPS loudly instead, and the difference is
+deliberate.** Three tests in that package drive a real courier process, and they
+read `TEST_COURIER_URL` and `TEST_COURIER_TOKEN`. Without them they **skip**, and
+the skip message names what would have been proven and how to run it — it is not a
+bare `t.Skip`, because a skip that says nothing is a test that silently passes
+without proving anything, which is the thing this section is about.
+
+The reason is the same one `TestTheDatabaseTierActuallyRan` gives for failing,
+applied to the tier it actually applies to: **CI supplies a database and cannot
+supply a courier.** The `gate` job declares postgres as a service container and
+applies the migrations above the gate, so an absent `TEST_DATABASE_URL` there is a
+misconfigured *run* and failing is honest. A courier would need a second service
+with its own database, its own migrations and its own principal resolver — the same
+seam that keeps the database tier in a separate `gate` job at all — so an absent
+`TEST_COURIER_URL` is an environment that *cannot run* the test, and skipping with a
+name is honest. A test that hard-failed on it would make the package unrunnable
+everywhere, and a permanently red gate is a red gate nobody reads.
+
+So the e2e file is not deleted, and what it cannot prove offline is proved offline
+instead: `wiring_test.go` holds the request identity, the closed body, and the
+**stable `Idempotency-Key`** (the property that stops a double-clicked reset mailing
+twice); `client_test.go` holds courier's request contract; `recorded_test.go` holds
+courier's byte-for-byte answers. What is left for the live tier is the one claim a
+fixture cannot make about itself: that a real implementation of courier's document
+accepts these bytes.
+
+CI knows about the skip rather than discovering it. `E2E_SKIP_EXCEPTIONS` in the
+`gate` job names exactly those three tests; both no-skip checks subtract them by
+whole name and still fail on any other skip. `internal/platform/ci` holds that list
+to those three names in **both** directions — it cannot grow, and it cannot be
+emptied — so the exemption cannot widen by accident, and a real skip cannot be
+hidden by deleting an entry.
+
 With no `TEST_DATABASE_URL`: **961 PASS lines, 364 SKIP, and 2 FAIL** — both
 fails are `TestTheDatabaseTierActuallyRan`, one in `internal/mfa` and one in
 `internal/apikeys`, and both are the point. With it:

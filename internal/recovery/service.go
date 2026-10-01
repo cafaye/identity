@@ -607,6 +607,7 @@ func (s *Service) ConfirmEmailChangeCurrent(ctx context.Context, in ConfirmEmail
 		Token:  targetToken,
 		Expiry: live.ExpiresAt,
 		To:     live.TargetEmail,
+		UserID: live.UserID,
 	}); err != nil {
 		return EmailChange{}, err
 	}
@@ -783,6 +784,7 @@ func (s *Service) mintAndSend(ctx context.Context, p mintParams) error {
 		Token:  token,
 		Expiry: expiresAt,
 		To:     p.Recipient(),
+		UserID: p.UserID,
 	})
 }
 
