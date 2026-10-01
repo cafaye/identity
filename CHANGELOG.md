@@ -6,6 +6,22 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed (kit-18 D12 sweep)
+
+- **The `env:` caveat no longer explains itself with a limitation core no longer
+  has.** This file named `gate.ci-disagrees` "reads `run:` bodies textually" as
+  the reason a workflow's environment is invisible to the static phase. That
+  reason was D12 — core's `RUN_KEY` matched only a `run: |` block — and core
+  `63fd319` fixed it, so the sentence sent the next reader looking for a
+  limitation that is gone.
+
+  The caveat is unchanged and still true, because it is a *different*
+  limitation: core reads a workflow's step bodies to confirm the gate is
+  invoked, and reads no `env:` block at all. The comment now says exactly that,
+  so both the claim and its reason are current. `tests/gate_declaration_check.py`
+  (kit-18) sweeps the adopting repositories for precisely this shape and is what
+  found it.
+
 ### Security (packet identity-16-d5)
 
 - **`/oidc/login/{requestID}` no longer completes an authorization request for a

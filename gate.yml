@@ -394,10 +394,12 @@ external:
   #   * the database schema. `gate.proof` is a line of output. Proving the tier
   #     ran against a MIGRATED schema is the `goose up` step's job in ci.yml,
   #     and this file cannot substitute for it.
-  #   * `env:` blocks in a workflow. `gate.ci-disagrees` reads `run:` bodies
-  #     textually, so a workflow that dropped TEST_DATABASE_URL from its env
-  #     would still pass the static phase — though it would then fail at run
-  #     time, which is the better of the two failures.
+  #   * the ENVIRONMENT a workflow hands the gate. The CI checker reads a
+  #     workflow's step bodies to confirm the gate is invoked; it reads no
+  #     `env:` block at all, because there is no core check that needs to. So a
+  #     workflow that dropped TEST_DATABASE_URL from its environment would still
+  #     pass the static phase — though it would then fail at run time, which is
+  #     the better of the two failures.
 
 ci:
   workflow: .github/workflows/ci.yml
