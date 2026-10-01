@@ -40,8 +40,18 @@ func (p ProviderSettings) halfConfigured() bool {
 //
 // It lives in this package rather than in internal/config so that the rules about
 // which combinations of these values make sense stay with the code that consumes
-// them. internal/config reads the environment into one of these and calls
-// Validate; it does not know what a client secret is.
+// them. When the surface mounts, internal/config reads the environment into one of
+// these and calls Validate; it does not know what a client secret is.
+//
+// THAT IS THE INTENDED SHAPE AND NOT THE CURRENT ONE. Nothing constructs a
+// Settings today: there is no `OAUTH_REDIRECT_BASE_URL`, no `OAUTH_ENCRYPTION_KEY`
+// and no per-provider client id or secret in internal/config, so Validate is
+// exercised only by its own tests. A deployment cannot turn social login on,
+// because there is nothing to turn it on with. This comment used to say
+// internal/config reads the environment into a Settings, and it did not — a
+// reader checking would have found no `OAUTH_` string in that package at all,
+// which is the same class of defect as a README describing an endpoint that
+// answers 404. See README.md's "Social login is not built".
 type Settings struct {
 	// RedirectBaseURL is this service's public base URL. Callback URLs are built
 	// from it and from nothing else — never from a Host header.

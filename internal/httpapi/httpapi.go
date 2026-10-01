@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -192,7 +193,30 @@ func New(checks []Check, opts ...Option) http.Handler {
 // per-request assertions, a service recording the concrete path instead of the
 // template passed every observability test. The route table is what makes the
 // distinction observable.
-var routeTable []string
+//
+// IT IS MUTEX-GUARDED, and that is a fix rather than decoration. An unguarded
+// package variable written by every router build is a data race the moment two
+// tests build routers concurrently, which this package does in dozens of
+// `t.Parallel` subtests: `go test -race` reported a WRITE/WRITE on this line from
+// two goroutines both in newMux, and the failures were whichever test happened to
+// be running — 52 to 64 failing tests on a clean checkout, varying per run. The
+// rule that caught it is AGENTS.md's own: no globals, no init-time state. A global
+// is not a convenience here; it is the defect.
+//
+// Readers go through recordedRouteTable, which returns a COPY under the lock. A
+// slice returned under a read lock is still a race — the header is copied but the
+// backing array is not — and the one caller ranges over it after releasing.
+var (
+	routeTableMu sync.RWMutex
+	routeTable   []string
+)
+
+// recordedRouteTable is the pattern list the last-built router recorded.
+func recordedRouteTable() []string {
+	routeTableMu.RLock()
+	defer routeTableMu.RUnlock()
+	return append([]string(nil), routeTable...)
+}
 
 func newMux(checks []Check, o options) *chi.Mux {
 	mux := chi.NewRouter()
@@ -237,7 +261,9 @@ func newMux(checks []Check, o options) *chi.Mux {
 	// to answer a probe for its own metadata.
 	o.registerOIDCWellKnownRoutes(r)
 	o.registerRoutes(r)
+	routeTableMu.Lock()
 	routeTable = r.patterns
+	routeTableMu.Unlock()
 	return mux
 }
 

@@ -32,7 +32,17 @@ const DefaultProviderTimeout = 10 * time.Second
 // mid-document and fails to parse rather than being read into memory.
 const maxIdentityBytes = 256 << 10
 
-// Client errors. The HTTP layer maps each to a status; see internal/httpapi/oauth.go.
+// Client errors, in the three groups a caller has to tell apart: the provider said
+// no, the provider could not be reached, and the provider said yes to something this
+// service cannot use.
+//
+// NOT MAPPED TO A STATUS ANYWHERE, because the social-login surface is not mounted.
+// A comment here used to point at internal/httpapi/oauth.go, which does not exist
+// and never has — a dangling pointer to the handler that would render these. When
+// the surface mounts, the mapping is ErrCodeRefused and ErrNoEmail to a refusal the
+// person at the browser sees, and ErrProviderUnavailable to a 5xx whose cause goes
+// to the log. See README.md's "Social login is not built" for why that is a packet
+// of its own rather than a line each.
 var (
 	// ErrCodeRefused means the provider rejected the authorization code: it was
 	// never issued, it has already been used, or the person declined consent. It is
@@ -173,10 +183,36 @@ func (c *Client) Identity(ctx context.Context, p Provider, tokens Tokens) (Ident
 // googleResponse is Google's OpenID Connect userinfo document. Only `sub` and
 // `email` matter here; the remaining claims are for an OIDC client, which is a
 // later packet.
+//
+// ## `email_verified` is deliberately absent, and that is a known gap
+//
+// Google's document carries `email_verified`, and it is not read. For an OIDC
+// *client* that is defensible, because the client is verifying a token it was
+// issued and the `email` claim inside it was already the subject of an
+// authorization the user performed. For a *relying party deciding whether to sign
+// somebody in* it is not: `email` alone is a string the account holder can set, and
+// this service's `users.email` is unique, so an unverified provider address that
+// matched an existing row would be a takeover.
+//
+// GitHub's path here is already stricter — githubEmail refuses an address that is
+// not `verified` — so the two providers are not held to the same bar and the weaker
+// one is Google's.
+//
+// It is left unfixed rather than fixed because nothing calls Identity: the surface
+// is unmounted, so the gap is unreachable, and "unreachable" is a weaker state than
+// "closed" and this comment is what makes the difference legible. Whoever mounts
+// social login must add `EmailVerified bool \`json:"email_verified"\“ here and
+// refuse an unverified address the way githubEmail does, BEFORE the value can reach
+// a `users.email` lookup. That is the first thing the mounting packet has to do and
+// it is recorded here so it cannot be discovered by a customer instead.
 type googleResponse struct {
 	Subject string `json:"sub"`
 	Email   string `json:"email"`
 	Name    string `json:"name"`
+	// `email_verified` is in the document and is NOT decoded into a field here, on
+	// purpose for now: adding the field without the check that uses it would read
+	// as though the check existed. See the comment above — it is the first thing the
+	// mounting packet does, and it brings the field and the refusal together.
 }
 
 func (c *Client) googleIdentity(ctx context.Context, p Provider, tokens Tokens) (Identity, error) {

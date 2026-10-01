@@ -1,7 +1,7 @@
 # identity
 
 `identity` is the cafaye service that knows who someone is: auth, sessions,
-MFA, OAuth, accounts and tenancy, and OIDC. Every other cafaye service — billing,
+MFA, accounts and tenancy, and OIDC. Every other cafaye service — billing,
 courier, guard, parlor — asks this one who is calling and what they may do. It
 is the platform's security boundary, and the reason `PLAN.md` §3 singles it out
 for a user-run security review before the phase closes.
@@ -817,7 +817,7 @@ These routes exist only when the three `OIDC_*` variables above are all set AND
 | `GET,POST /oidc/login/:requestId` | `200` / `302` | The sign-in page. This service's own sessions and cookie. |
 | `POST /oidc/token` | `200 {access_token, id_token, …}` | `grant_type=authorization_code` and nothing else. HTTP Basic client auth. |
 | `GET,POST /oidc/userinfo` | `200 {sub, email, …}` | The claims the token was granted, and only those. |
-| `GET /oidc/introspect`, `/oidc/revoke`, `/oidc/end-session`, `/oidc/device_authorization` | `404 not_found` | Not built. Absent from the discovery document too. |
+| `/oidc/introspect`, `/oidc/revoke`, `/oidc/end-session`, `/oidc/device_authorization` | `404 not_found` | Not built, on any method — the row carries no method because there is nothing behind it to answer one. Absent from the discovery document too. |
 
 **TWO ERROR SHAPES, AND THE SPLIT IS DELIBERATE.** `/v1/*` and the
 `/oidc/authorize` pre-checks answer `application/problem+json`; everything else
@@ -871,7 +871,11 @@ internal/admin/        the admin surface: invitation revocation, and the audit t
                        that records it. The two are one package because no method
                        here mutates without recording — see DECISIONS.md D3
 internal/apikeys/      scoped API tokens: the wire format, the scopes, the claims
-internal/oauth/        the social-login client side: state, token cipher, registry
+internal/oauth/        the social-login client side — WRITTEN AND NOT MOUNTED. State,
+                       token cipher, registry, code-for-token exchange and the
+                       connected_accounts store, with no route and no handler. Only
+                       the state half is live, reused by the OIDC login. See
+                       "Not built yet"
 internal/outbox/       transactional event envelope, SKIP LOCKED claim, publisher
 internal/platform/db/  the pgx pool, and the readiness ping
 internal/platform/ci/  the test that keeps .github/workflows/ci.yml honest
@@ -1009,6 +1013,42 @@ Four things about it are worth knowing before you touch a route:
 
 So adding a route means adding its document entry, with an `operationId` — that
 is the name of the method on every generated client in the fleet. The gate says so.
+
+### **The claims-versus-router tripwire, and the tripwire's own tripwire**
+
+A perfect OpenAPI document is not the same as an honest repository. `README.md`
+said this service does OAuth social login, its roadmap checked the box off, and
+`cafaye.yml` — the manifest a customer is handed — claimed the capability. The
+documents were **honest the whole time**: not one of them ever declared a
+social-login operation, because there is no route for one. Every claim was in
+prose, and `openapi_drift_test.go` reads `paths:` blocks, so it could not see any of
+it.
+
+`internal/httpapi/claims_test.go` closes that, holding three more places to the
+same router walk, **in both directions**:
+
+| Claim | Held by |
+|---|---|
+| README endpoint tables | `TestTheReadmeEndpointTablesAreTheRoutesTheRouterServes` |
+| README roadmap checkboxes | `TestEveryCheckedRoadmapItemIsBackedByTheRouter` |
+| `cafaye.yml` capability list | `TestTheManifestDescribesOnlyCapabilitiesThisServiceHas` |
+
+It **found the manifest claim and the roadmap claim by name on its first run**,
+which is the evidence that it would have found them before. A fourth file,
+`claims_reader_test.go`, injects faults into the readers themselves — a malformed
+route row, a block-scalar description, an emptied roadmap — because a check over
+nothing is green, and a reader that under-reads reports agreement over a subset.
+
+`claims_faults_test.go` holds the walk itself: it asserts a route from **each**
+conditional surface is visible (not that a field was set, which passes against a
+registrar that mounts nothing), that two options literals stay in step, and that
+each claim check goes **red** on a route that does not exist.
+
+`internal/httpapi/oauth_absent_test.go` is the inverse — it asserts the social-login
+surface is still unmounted, and **its failure message is the work order** for
+whoever mounts it. Finishing that work means deleting that file, because an absence
+test that outlives the absence is the repository lying to itself in a file nobody
+reads.
 
 That difference is the only thing that tells "ran" from "skipped" from the
 outside, and the wall-clock is where it shows. Same command, same machine, only
@@ -1172,7 +1212,9 @@ for a generated client, and `until=2027-03-31` fails the build in the meantime.
 goose SQL files in `migrations/`, numbered and annotated. `goose` is a CLI
 tool, not a module dependency. `00001_init.sql` establishes the convention and
 `00002`–`00004` create `users`, `sessions` and `outbox_events`, `00005`–`00008`
-the tenancy and social-login tables, `00009` the OIDC ones, `00010` the four MFA
+the tenancy and social-login tables (`00008`'s `connected_accounts` is defined and
+unused — the social-login surface is not mounted, see "Not built yet"), `00009` the
+OIDC ones, `00010` the four MFA
 tables, and `00011` the `api_keys` table. Migrations are a deploy step, not a boot
 step — see [migrations/README.md](migrations/README.md).
 
@@ -1190,6 +1232,106 @@ docker run --rm -p 8080:8080 identity
 
 Everything below is a later packet, and none of it is stubbed to look finished: the
 admin API, and key rotation.
+
+## Social login is not built, and the code that looks like it is
+
+**There is no "Continue with Google" or "Continue with GitHub".** No route, no
+handler, no use case, and nothing in either OpenAPI document. The path a social
+callback would use is `/v1/auth/oauth/{provider}/callback`, built by
+`Provider.RedirectURI` in `internal/oauth/provider.go` — and **nothing serves it.**
+A product that integrates against it gets a `404`, a clean one from a router that
+never had the route, rather than a `500` from a half-built flow. This section exists
+because
+`internal/oauth/` is a complete, well-tested package and a dead `connected_accounts`
+table, and **a reader who opens the tree will reasonably conclude the feature
+ships.** It does not, and the three places that used to say it did are now corrected
+rather than deleted: the roadmap box is unchecked, the manifest's `description` no
+longer names OAuth, and this paragraph is the record.
+
+What exists, and what each piece is:
+
+| Piece | State |
+|---|---|
+| `internal/oauth/state.go` | **Live.** `NewState`/`VerifyState` guard the OIDC login's round trip. |
+| `internal/oauth/provider.go` | Written. Google and GitHub endpoint definitions, the configured-provider `Registry`, and `RedirectURI`. No route calls them. |
+| `internal/oauth/client.go` | Written. The code-for-token exchange and the userinfo calls, with a real timeout and a response cap. |
+| `internal/oauth/cipher.go` | Written. AES-256-GCM for the provider tokens, with a versioned prefix. |
+| `internal/oauth/store.go` | Written and tested against a real database. `connected_accounts` — **nothing writes to it.** |
+| `internal/oauth/settings.go` | Written and validating. **`internal/config` does not read it**; there is no `OAUTH_*` variable and no deployment can turn this on. |
+| `migrations/00008_connected_accounts.sql` | Applied. The table and its `oauth_provider` enum exist and are empty. |
+| `internal/httpapi/oauth.go` | **Does not exist.** It never has. |
+
+The honest reading of that table is *written and unmounted*, not *half-built*: the
+parts that are hard — the exchange, the state, the ciphertext format, the
+uniqueness constraint, the provider-specific email resolution — are the parts that
+are done. What is missing is the part that is a **product decision**, and it is the
+reason this is a separate packet rather than a couple of hours of wiring.
+
+### Four places said it shipped, and all four are now wrong in the other direction
+
+The claim was not subtle. It was in the opening paragraph, in the roadmap, in
+`cafaye.yml`'s `description`, and — implicitly, and worst of all — in a directory
+of correct, well-tested, database-backed code. `internal/httpapi/openapi_drift_test.go`
+could not see any of it, because **none of it is in a `paths:` block**: the OpenAPI
+documents were honest the whole time, and a service can have a perfect contract and
+still advertise an endpoint that does not exist.
+
+So there is now a second check, `internal/httpapi/claims_test.go`, holding the
+README's endpoint tables, the roadmap's checkboxes and the manifest's capability
+list to the same router walk — **in both directions**. It found the manifest claim
+and the roadmap claim by name on its first run, which is the evidence that it
+would have found them before. `internal/httpapi/oauth_absent_test.go` is the
+inverse: it asserts the surface is *still* not mounted, and **its failure message is
+the work order** for whoever mounts it. Deleting that file is part of finishing the
+work, because an absence test that outlives the absence is the repository lying to
+itself in a file nobody reads.
+
+### Why the remaining work is a decision and not a handler
+
+A callback has to answer one question: *which user of this service is the person who
+just came back from Google?* There are four answers and only some of them are
+obvious. Jumpstart Pro — the parity baseline — makes all four explicit, and its
+callback is the reference for the shape:
+
+- the provider identity is already linked → sign that user in;
+- someone is signed in and has not linked this provider → attach the link;
+- **the provider returns an email that matches an existing user who has never linked
+  this provider → refuse**, and send them to the password flow;
+- the provider identity is new and no user holds the address → create the user.
+
+The third is the one that matters, and it is a **product decision, not an
+implementation detail**: refusing means a person who signed up with a password
+cannot later use "Continue with Google" until they set a password, and permitting it
+means an email assertion from a third party is enough to take over an account. The
+wrong choice here is silent and permanent, and this service is the security
+boundary.
+
+Two more things have to be settled before any of it mounts, and both are recorded
+because they are the kind of thing that is easiest to get subtly wrong:
+
+- **The callback is cross-site browser navigation, and this service has none.** A
+  social sign-in is a `302` out to a provider and a `302` back, and the failure path
+  is half the feature — a person whose provider declined consent, or whose callback
+  was rejected, has to be told something. Every surface here answers
+  `application/problem+json` to a programmatic client, and the one exception is the
+  OIDC login page. Where a social callback renders, and what it redirects to on
+  failure, is a contract decision this repository has not made.
+- **Google's `email_verified` is not read.** `internal/oauth/client.go` decodes
+  `sub`, `email` and `name` from Google's userinfo and never checks
+  `email_verified`, which that document carries and which exists precisely because
+  an address from a provider is not by itself proof of ownership. GitHub's path is
+  stricter already — `githubEmail` refuses an unverified address — so the two
+  providers are not held to the same bar, and the weaker one is Google's. That has
+  to be closed before a provider's address is ever allowed to match an existing
+  `users.email`.
+
+`connected_accounts` is left in place rather than dropped, and that is a decision
+with a reason: an applied migration is not edited, the table is a correct and
+carefully-constrained schema for the packet that will use it, and a `DROP TABLE` on
+the security boundary to tidy up an unused table is a bigger intervention than
+leaving it. What it must never be is *invisible* — and it is not, because this
+section, the unchecked roadmap box, the manifest and
+`TestTheSocialLoginSurfaceIsNotMounted` all say the same thing in four places.
 
 Three things on the recovery surface are **not** here, and each is a decision rather
 than an oversight:
@@ -1263,7 +1405,8 @@ express would be a rule with a bypass in it.
 - [x] Outbox: transactional events, SKIP LOCKED claim, publisher loop
 - [x] Email verification, password reset, email change (flows complete; the mail
       delivery path is courier's and is not wired)
-- [x] OAuth (social login) via goth
+- [ ] OAuth (social login) — the provider client is written and unmounted; see
+      [Not built yet](#not-built-yet)
 - [x] Accounts, memberships, roles, invitations
 - [x] OIDC provider (zitadel/oidc)
 - [x] MFA: TOTP + recovery codes

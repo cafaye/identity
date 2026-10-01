@@ -26,7 +26,7 @@
 # changing all five.
 name: identity
 
-description: Authentication, sessions, MFA, OAuth, accounts and tenancy, scoped API tokens, and the OIDC provider.
+description: Authentication, sessions, MFA, accounts and tenancy, scoped API tokens, and the OIDC provider.
 
 # Implementation language. One binary, no other runtime dependency.
 language: go

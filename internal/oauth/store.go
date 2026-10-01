@@ -78,6 +78,13 @@ type StoredTokens struct {
 }
 
 // Store is the connected_accounts table.
+//
+// UNWIRED. Every method here is tested against a real database and nothing calls
+// any of them, because the social-login surface is not mounted — see the package
+// doc in cipher.go. This is AGENTS.md's "tested but unwired" case, and the reason
+// it is kept rather than deleted is recorded there and in README.md's "Social
+// login is not built": the migration backing it is applied, an applied migration is
+// not edited, and this is the correct schema access for the packet that will use it.
 type Store struct {
 	pool db.Pool
 }

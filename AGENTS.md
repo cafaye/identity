@@ -396,6 +396,22 @@ CI closes the second half of that — `.github/workflows/ci.yml` derives the tie
 from the tree, fails on any `--- SKIP:` line, and holds a floor on the PASS count
 so a deleted test is visible.
 
+**A claim is only as good as the check that holds it to the router, and the
+router walk every check reads is a shared mutable thing.** `servedRoutes` walks the
+chi tree `newMux` assembles, and `newMux` records the pattern list it built into a
+package variable for the observability canary. That variable is **mutex-guarded,
+and the guard is load-bearing rather than tidiness**: unguarded, `go test -race`
+reports a WRITE/WRITE from two parallel subtests both building a router, and the
+failures are whichever tests happen to be running — **52 to 64 failing tests on a
+clean checkout, varying between runs.** `TestTheClaimWalkSeesEveryConditionalSurface`
+and `TestServedRoutesAndTheClaimWalkAgree` in `internal/httpapi/claims_faults_test.go`
+assert the walk can SEE a route per conditional surface rather than that a field was
+set, and `TestEveryClaimCheckFailsOnAnInjectedRoute` asserts the claim checks go red
+on a route that does not exist — because a comparison that never fires is
+indistinguishable from a correct one. Readers of `routeTable` go through
+`recordedRouteTable`, which copies under the lock, because a slice returned under a
+read lock still shares its backing array.
+
 ## Gates
 
 ```sh

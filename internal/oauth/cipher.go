@@ -7,6 +7,36 @@
 // not contain is the decision about *which user* a callback resolves to: that is
 // a use case, it sits in internal/auth alongside register and login, and this
 // package knows nothing about sessions.
+//
+// # THE SOCIAL-LOGIN SURFACE IS NOT MOUNTED
+//
+// Read that before concluding the feature ships. Of everything in this package,
+// only NewState and VerifyState are live — the OIDC login's round trip uses them.
+// The rest is written and tested against a real database, and **no route, handler
+// or use case reaches any of it**: there is no `/v1/auth/oauth`, no
+// `internal/httpapi/oauth.go`, no `OAUTH_*` configuration variable, and
+// `connected_accounts` is an applied migration nothing writes to. A product
+// integrating "Continue with Google" against this service gets a 404.
+//
+// The gap is deliberate and the reasoning is in README.md's "Social login is not
+// built, and the code that looks like it is". In short: the parts that are hard are
+// done, and what is missing is a product decision about which user a callback
+// resolves to, plus a cross-site browser surface this service does not have. Both
+// are a packet of their own on the platform's security boundary.
+//
+// Two consequences for anyone working in here:
+//
+//   - The code is kept rather than deleted because it is correct, and because the
+//     migration that backs it is applied and an applied migration is not edited.
+//     What it must not be is *invisible*, which is why the package doc, the
+//     README, `cafaye.yml` and TestTheSocialLoginSurfaceIsNotMounted all say the
+//     same thing.
+//   - AGENTS.md's "stubs stay honest" rule cuts the other way from the usual
+//     reading of it: a tested-but-unwired method is called a lie, and the honest
+//     state is "a paragraph in the README and no code". This package is the
+//     exception, and it earns that by being recorded in four places rather than
+//     one. Deleting it is the alternative, and it is a bigger intervention than
+//     leaving it — so the decision is written down instead of defaulted.
 package oauth
 
 import (
