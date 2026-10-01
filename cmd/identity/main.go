@@ -570,8 +570,11 @@ func buildRecovery(
 func buildMailer(cfg config.Config, logger *slog.Logger) (recovery.Mailer, error) {
 	if !cfg.CourierEnabled() {
 		logger.Warn("account recovery is mounted, but this deployment cannot send email. " +
-			"Set COURIER_BASE_URL, COURIER_TOKEN and RECOVERY_LINK_TEMPLATE to enable it; " +
-			"until then POST /v1/password-resets answers 503.")
+			"Set COURIER_BASE_URL, COURIER_TOKEN and at least one link template to enable " +
+			"it: PASSWORD_RESET_LINK_TEMPLATE for the screen that redeems a reset, " +
+			"EMAIL_VERIFICATION_LINK_TEMPLATE for the one that redeems an address " +
+			"confirmation, or RECOVERY_LINK_TEMPLATE to apply to every purpose. Until " +
+			"then POST /v1/password-resets answers 503.")
 		return recovery.Unavailable{}, nil
 	}
 
@@ -582,10 +585,14 @@ func buildMailer(cfg config.Config, logger *slog.Logger) (recovery.Mailer, error
 	if err != nil {
 		return nil, fmt.Errorf("building the courier client: %w", err)
 	}
+	// The RESOLVED templates are passed straight through, and this is the only place
+	// in the process that hands them to the adapter. A caller that re-applied the
+	// default here would be a second answer to "where does this link point", and the
+	// two would drift the first time somebody added a purpose.
 	mailer, err := courier.NewRecoveryMailer(courier.RecoveryMailerConfig{
-		Client:       client,
-		LinkTemplate: cfg.RecoveryLinkTemplate,
-		Logger:       logger,
+		Client:        client,
+		LinkTemplates: cfg.LinkTemplates,
+		Logger:        logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the courier mailer: %w", err)
@@ -598,12 +605,21 @@ func buildMailer(cfg config.Config, logger *slog.Logger) (recovery.Mailer, error
 	// "courier is reachable", and a send is where a misconfigured provider is
 	// found. An operator who reads "mail is wired" as "mail is being sent" has been
 	// told something this process cannot support.
-	logger.Info("account recovery can send email through courier",
+	//
+	// ONE ATTRIBUTE PER PURPOSE, and not one shared `link_template`, because the
+	// purposes point at different screens and an operator confirming one value has
+	// confirmed nothing about the other. `LinkTemplatePurposes` sorts them, so the
+	// line is the same on every restart and two log excerpts diff.
+	attrs := []any{
 		"courier", cfg.CourierBaseURL,
 		"send_timeout", courier.DefaultTimeout,
 		"probe_timeout", courier.DefaultProbeTimeout,
-		"link_template", cfg.RecoveryLinkTemplate,
-	)
+	}
+	for _, purpose := range cfg.LinkTemplatePurposes() {
+		attrs = append(attrs, "link_template."+string(purpose), cfg.LinkTemplateFor(purpose))
+	}
+	logger.Info("account recovery can send email through courier", attrs...)
+
 	// WHAT IS AND IS NOT DELIVERABLE, said out loud. courier's NotificationType is
 	// [welcome, password_reset, team_invitation], which covers this service's
 	// password reset and its address verification — the latter through courier's
@@ -617,7 +633,53 @@ func buildMailer(cfg config.Config, logger *slog.Logger) (recovery.Mailer, error
 		"POST /v1/email-changes answers 503 until courier's vocabulary includes them; " +
 		"password reset and address verification are delivered")
 
+	// THE SHARED-DEFAULT WARNING, which is the one that closes identity-24's finding
+	// from the operator's side rather than the test's.
+	//
+	// A deployment with only `RECOVERY_LINK_TEMPLATE` still boots — that is the
+	// compatibility promise and `internal/config` is where it is made — but its
+	// address-verification link points wherever its one template says, which for the
+	// configuration this shape was introduced to replace is the password reset
+	// screen. A verification token presented there is a 404. Nothing else in the
+	// process can see it: the mail renders, the send succeeds, the token redeems at
+	// its own endpoint, and the reader is the only one who finds out.
+	warnSharedLinkTemplates(cfg, logger)
+
 	return mailer, nil
+}
+
+// warnSharedLinkTemplates says which purposes resolve to the shared default, and
+// names the variable that would give each one its own.
+//
+// IT NAMES THE VARIABLES RATHER THAN DESCRIBING THE MIGRATION, because
+// `TestAnUnconfiguredDeploymentIsLoudAtStartup` exists for the same reason: an
+// operator told "consider configuring the links separately" has been told a symptom,
+// and the variable names are the whole of the difference between that and a fix.
+//
+// THE CHECK IS ON THE RESOLVED VALUE rather than on "was the variable set", so what
+// it says — these purposes resolve to RECOVERY_LINK_TEMPLATE — stays true for a
+// deployment that set both variables to the same string. A warning that is
+// occasionally redundant is a better trade than one that is occasionally wrong about
+// a state it describes as fact.
+func warnSharedLinkTemplates(cfg config.Config, logger *slog.Logger) {
+	shared := cfg.LinkPurposesUsingTheDefault()
+	if len(shared) == 0 {
+		return
+	}
+
+	purposes := make([]string, 0, len(shared))
+	variables := make([]string, 0, len(shared))
+	for _, purpose := range shared {
+		purposes = append(purposes, string(purpose))
+		if variable, ok := config.LinkTemplateVariable(purpose); ok {
+			variables = append(variables, variable)
+		}
+	}
+	logger.Warn("RECOVERY_LINK_TEMPLATE is the link for every purpose with no variable " +
+		"of its own, and it is currently the link for: " + strings.Join(purposes, ", ") + ". " +
+		"If that template is the password reset screen then an address confirmation " +
+		"lands the reader on a screen that answers 404 for a verification token. " +
+		"Set " + strings.Join(variables, " and ") + " to say where each kind of link goes.")
 }
 
 // buildAPIKeys assembles the scoped-token use cases, or returns nil when this

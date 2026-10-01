@@ -130,7 +130,7 @@ func TestAPasswordResetGoesOutThroughARealCourier(t *testing.T) {
 		Type:   TypePasswordReset,
 		UserID: message.UserID.String(),
 		To:     recipient,
-		URL:    renderTestLink(t, token),
+		URL:    renderTestLink(t, recovery.PurposePasswordReset, token),
 	})
 	if err != nil {
 		t.Fatalf("a real courier refused a password reset identity can compose: %v", err)
@@ -203,7 +203,7 @@ func TestAVerificationLinkReachesCouriersWelcomeTemplate(t *testing.T) {
 		Type:   TypeWelcome,
 		UserID: "7e8f9a0b-1c2d-4e3f-9a4b-5c6d7e8f9a0b",
 		To:     "identity-e2e-welcome@example.com",
-		URL:    renderTestLink(t, liveToken(t)),
+		URL:    renderTestLink(t, recovery.PurposeVerifyEmail, liveToken(t)),
 	})
 	if err != nil {
 		t.Fatalf("a real courier refused a verification welcome: %v", err)
@@ -324,8 +324,8 @@ func requireLiveCourier(t *testing.T) *liveCourier {
 		t.Fatalf("building a client for %s: %v", courierURLVariable, err)
 	}
 	mailer, err := NewRecoveryMailer(RecoveryMailerConfig{
-		Client:       client,
-		LinkTemplate: "https://app.example.com/reset?token=" + TokenPlaceholder,
+		Client:        client,
+		LinkTemplates: testLinkTemplates(),
 	})
 	if err != nil {
 		t.Fatalf("NewRecoveryMailer: %v", err)
@@ -429,13 +429,24 @@ func liveToken(t *testing.T) string {
 	return strings.ReplaceAll(token, "-", "")
 }
 
-// renderTestLink builds the link the same way the adapter does, so this test does
-// not assert against a URL the production path would not produce.
-func renderTestLink(t *testing.T, token string) string {
+// renderTestLink builds a link the same way the adapter does, FOR A GIVEN PURPOSE,
+// so this test does not assert against a URL the production path would not produce.
+//
+// IT TAKES A PURPOSE rather than rendering the reset template for everything, and
+// that is the change this packet made underneath it. The live tier built
+// `https://app.example.com/reset?token=…` for the verification message too — the
+// exact defect — and a real courier accepted those bytes, because nothing about a
+// URL says which screen it opens. The tier was green and the button was wrong, and
+// this helper is why: it was the one piece of the live path with no purpose in it.
+func renderTestLink(t *testing.T, purpose recovery.Purpose, token string) string {
 	t.Helper()
-	rendered, err := LinkTemplate("https://app.example.com/reset?token=" + TokenPlaceholder).render(token)
+	template, present := testLinkTemplates()[purpose]
+	if !present {
+		t.Fatalf("the fixtures configure no link template for the %s purpose", purpose)
+	}
+	rendered, err := LinkTemplate(template).render(token)
 	if err != nil {
-		t.Fatalf("rendering the link: %v", err)
+		t.Fatalf("rendering the %s link: %v", purpose, err)
 	}
 	return rendered
 }

@@ -6,6 +6,69 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed (packet identity-26: the verification link opened the password-reset screen)
+
+- **A `welcome` mail's button said `https://app.example.com/reset?token=…`, so a
+  user who clicked "Confirm your email address" landed on the password-reset screen,
+  where a verification token answers 404.** identity-24 drove the flows end to end
+  against a real courier and found it: the token itself was fine and redeemed
+  correctly at `POST /v1/email-verifications/confirm`, and the mail was well-formed.
+  **Nothing about a URL says which screen it opens**, so no assertion about bytes
+  could ever have caught this — every test in the repository was about the request
+  courier received, and the request was correct.
+
+- **The cause was structural and defended at length.** `RecoveryMailer` held ONE
+  `LinkTemplate` for all four of its messages. The single-template argument is sound
+  *for a recovery link* — a template with `{token}` beats a base URL plus a
+  platform-chosen convention — and it was applied to a verification link, which is
+  not a recovery link. **One template for two purposes is a template that must be
+  wrong for one of them.**
+
+- **Two templates now, keyed by `recovery.Purpose`, and a purpose with none is a
+  refusal rather than a fallback.** `RECOVERY_LINK_TEMPLATE` is the *default* for
+  every purpose with no variable of its own; `PASSWORD_RESET_LINK_TEMPLATE` and
+  `EMAIL_VERIFICATION_LINK_TEMPLATE` override it. `NewRecoveryMailer` refuses to
+  construct without one for every purpose it can deliver, and refuses a template for a
+  purpose no message carries — the same rule as a route with no declared scope, and a
+  variable that is honoured nowhere is a promise this service does not keep.
+  `ValidateLinkTemplate`'s three refusals (no `{token}`, not absolute, a fragment)
+  apply per purpose rather than once.
+
+- **`RECOVERY_LINK_TEMPLATE` still works, and a deployment that has only ever set it
+  still boots with the links it had.** That is the compatibility promise and it is
+  deliberate: the alternative is refusing to start every installation that exists, on
+  the security boundary, to fix a defect introduced after they were configured. **The
+  cost is that an unmigrated deployment's verification link still points wherever its
+  one template says**, and identity does not hide it — `buildMailer` warns at startup
+  when any purpose resolves to the shared default, naming the purpose, what a reader
+  would find (a 404), and the variable that gives that purpose a link of its own.
+  Adding `EMAIL_VERIFICATION_LINK_TEMPLATE` is the whole migration (DECISIONS.md D8).
+
+- **The test that would have caught it.** Nothing about a URL says which screen it
+  opens, so the check reads the **rendered link** and redeems what is in it:
+  `TestAVerificationLinkIsNotThePasswordResetLinkAndEachRedeemsAtItsOwnEndpoint`
+  builds the mailer from a `config.Load` of an environment rather than from a Go
+  literal — a relationship between two links cannot be tested by something that
+  cannot express it — sends a reset and a verification through the real flows over a
+  real database, and asserts the two links differ in **path** and that each token is
+  accepted by its own endpoint and refused by the other. Its **negative control**
+  proves one template really does render one link for both messages, so the inequality
+  is a comparison rather than a tautology, and the inequality was shown to fire by
+  injecting the original defect (making the verification purpose read the reset
+  variable).
+
+- **Three closed sets that nothing in the type system joins** are now walked against
+  each other in both directions: `internal/courier`'s `linkPurposeFor`, `internal/config`'s
+  `linkTemplateVariables`, and `recovery`'s purposes. A purpose with a variable nothing
+  renders, and a message with no variable at all, are both reachable by editing one
+  map.
+
+- **`validateMailBaseURL` no longer lies.** Its refusal said `want https` directly
+  above code that accepts `http` and a test that requires `http://localhost:4003` to
+  boot, so it told an operator a scheme this service starts up with is one it rejects.
+  Both courier messages now name `http or https`, and
+  `TestAnInsecureLinkTemplateIsDescribedAsThoughHTTPSWereTheOnlyOneAccepted` holds it
+  there.
 ### Fixed (the OAuth social-login claim, and the check that stops the next one)
 
 - **This service advertised OAuth social login in four places and served it in

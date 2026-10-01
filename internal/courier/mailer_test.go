@@ -208,8 +208,8 @@ func TestAMessageCourierHasNoTypeForIsRefused(t *testing.T) {
 			defer server.Close()
 
 			mailer, err := NewRecoveryMailer(RecoveryMailerConfig{
-				Client:       newTestClient(t, server.URL, "service-token-value"),
-				LinkTemplate: "https://app.example.com/reset?token=" + TokenPlaceholder,
+				Client:        newTestClient(t, server.URL, "service-token-value"),
+				LinkTemplates: testLinkTemplates(),
 			})
 			if err != nil {
 				t.Fatalf("NewRecoveryMailer: %v", err)
@@ -760,9 +760,9 @@ func testMailer(t *testing.T, baseURL string, logger *slog.Logger) *RecoveryMail
 		t.Fatalf("New: %v", err)
 	}
 	mailer, err := NewRecoveryMailer(RecoveryMailerConfig{
-		Client:       client,
-		LinkTemplate: "https://app.example.com/reset?token=" + TokenPlaceholder,
-		Logger:       logger,
+		Client:        client,
+		LinkTemplates: testLinkTemplates(),
+		Logger:        logger,
 	})
 	if err != nil {
 		t.Fatalf("NewRecoveryMailer: %v", err)

@@ -10,8 +10,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/cafaye/identity/internal/recovery"
 )
 
 const (
@@ -64,11 +67,12 @@ var (
 	ErrNoMFAEncryptionKey = errors.New("MFA_ENCRYPTION_KEY is not configured")
 
 	// ErrInvalidCourier means the courier block is present and unreadable: a base
-	// URL that is not one, or a recovery link template that cannot produce a
-	// working link. A startup failure rather than a degraded mode, for the reason
-	// the OIDC and MFA blocks are — a deployment whose mail configuration is wrong
-	// cannot send a password reset, and it would find out from a user who never got
-	// one, in front of somebody waiting on a link.
+	// URL that is not one, or a link template that cannot produce a working link for
+	// the purpose it was configured for — including a purpose with no template at
+	// all. A startup failure rather than a degraded mode, for the reason the OIDC and
+	// MFA blocks are — a deployment whose mail configuration is wrong cannot send a
+	// password reset or an address confirmation, and it would find out from a user
+	// who never got one, in front of somebody waiting on a link.
 	ErrInvalidCourier = errors.New("invalid courier configuration")
 
 	// ErrNoCourierToken means COURIER_TOKEN is not set at all, which is a
@@ -128,19 +132,48 @@ type Config struct {
 	// The courier block: the platform's mail service, and the only thing that can
 	// deliver a recovery message.
 	//
-	// ALL THREE ARE REQUIRED TOGETHER OR NOT AT ALL, for the same all-or-nothing
+	// ALL OF IT IS REQUIRED TOGETHER OR NONE OF IT, for the same all-or-nothing
 	// reason the OIDC block is. A base URL with no credential would send every
 	// request as an anonymous caller, and courier's answer to that is a 401 on a
 	// mail egress; a credential with no base URL is a secret with nowhere to go; and
-	// a link template is what turns a reset token into a link a person can follow,
-	// so without it a "sent" reset mail would arrive with nothing to click.
+	// a link template is what turns a token into a link a person can follow, so
+	// without one a "sent" reset mail would arrive with nothing to click.
 	//
 	// The token is never logged and never rendered, and it is read from the
 	// environment rather than a file so the secret is whatever the deployment's
 	// secret store already is.
-	CourierBaseURL       string
-	CourierTokenValue    string
-	RecoveryLinkTemplate string
+	CourierBaseURL    string
+	CourierTokenValue string
+
+	// LinkTemplates is where each PURPOSE's link points, resolved at Load: a
+	// purpose with a variable of its own gets it, and a purpose without one gets
+	// DefaultLinkTemplate.
+	//
+	// IT IS PER PURPOSE RATHER THAN ONE TEMPLATE FOR EVERYTHING, and the reason is
+	// that the two purposes want different SCREENS. A password reset and an address
+	// confirmation are finished on different pages of a product, and a link that
+	// points at the wrong one is a mail that renders perfectly and sends the reader
+	// somewhere useless: a verification token presented to the reset screen is a
+	// 404. So a deployment says where each one goes.
+	//
+	// THE KEY IS `recovery.Purpose` AND NOT A STRING, so that a purpose cannot be
+	// misspelled into a template nothing reads. It is the one place this package
+	// names a recovery concept, and the dependency runs the right way: `recovery` is
+	// a cafaye concept, `internal/courier` is the platform adapter that implements
+	// its seam, and neither of them imports this package.
+	LinkTemplates map[recovery.Purpose]string
+
+	// DefaultLinkTemplate is the value of RECOVERY_LINK_TEMPLATE, kept separately
+	// because it is a different QUESTION from LinkTemplates and the startup log
+	// needs the answer to both: what each purpose resolved to, and which of them
+	// resolved to the shared default rather than to a variable of their own.
+	//
+	// IT IS WHAT MAKES EVERY DEPLOYMENT CONFIGURED BEFORE THIS CHANGE STILL BOOT.
+	// An unmigrated deployment's verification link therefore still points at
+	// whatever its one template says, which is the defect this exists to let a
+	// deployment fix — and `buildMailer` says so in a warning rather than leaving an
+	// operator to discover it from a user.
+	DefaultLinkTemplate string
 }
 
 // MFAEncryptionKey returns the configured key, or ErrNoMFAEncryptionKey.
@@ -206,11 +239,86 @@ func (c Config) CourierToken() (string, error) {
 
 // CourierEnabled reports whether this deployment can send a message.
 //
-// One boolean rather than three checks at the use site, because the decision is one
-// thing — either this process has a mail path or it does not — and a caller that
-// checked three fields could get a combination this service does not allow.
+// One boolean rather than a pile of checks at the use site, because the decision is
+// one thing — either this process has a mail path or it does not — and a caller
+// that checked the fields itself could get a combination this service does not
+// allow.
+//
+// THE TEMPLATE CHECK IS `len(LinkTemplates) > 0` AND NOT "every purpose has one",
+// and the difference is deliberate. `Load` refuses a courier block that does not
+// resolve a template for every purpose it can configure one for, so a Config from
+// `Load` with a base URL and a token has a complete set — and the completeness of
+// anything else is enforced where the links are rendered, in
+// `courier.NewRecoveryMailer`, which refuses a purpose with no template rather than
+// substituting another purpose's.
 func (c Config) CourierEnabled() bool {
-	return c.CourierBaseURL != "" && c.CourierTokenValue != "" && c.RecoveryLinkTemplate != ""
+	return c.CourierBaseURL != "" && c.CourierTokenValue != "" && len(c.LinkTemplates) > 0
+}
+
+// LinkTemplateFor reports the template a purpose resolved to, or "" for a purpose
+// this deployment configured nothing for.
+//
+// It exists so a caller reads the RESOLVED value — the one that will actually be
+// rendered — rather than reaching for the default and applying the fallback itself,
+// which is how a second, subtly different answer to "where does this link point"
+// gets written.
+func (c Config) LinkTemplateFor(purpose recovery.Purpose) string {
+	return c.LinkTemplates[purpose]
+}
+
+// LinkTemplateVariable names the environment variable that configures a purpose's
+// link.
+//
+// IT IS EXPORTED FOR THE DRIFT CHECK and not for convenience. `internal/courier`
+// knows which messages it can deliver and this package knows which variables name
+// them, and nothing in the type system joins the two — so a purpose with a variable
+// nobody renders, and a message with no variable at all, are both reachable by
+// editing one map. `internal/courier`'s test walks both directions through this
+// function, which is cheaper and less fragile than either side reading the other's
+// source.
+func LinkTemplateVariable(purpose recovery.Purpose) (string, bool) {
+	variable, ok := linkTemplateVariables[purpose]
+	return variable, ok
+}
+
+// LinkTemplatePurposes lists the purposes this deployment has a link for, in a
+// stable order.
+//
+// A map's iteration order is random, so a startup log built from one would print a
+// different line order on every restart and a diff of two log excerpts would be
+// meaningless.
+func (c Config) LinkTemplatePurposes() []recovery.Purpose {
+	purposes := make([]recovery.Purpose, 0, len(c.LinkTemplates))
+	for purpose := range c.LinkTemplates {
+		purposes = append(purposes, purpose)
+	}
+	slices.Sort(purposes)
+	return purposes
+}
+
+// LinkPurposesUsingTheDefault reports the purposes whose link came from
+// RECOVERY_LINK_TEMPLATE rather than from a variable of their own.
+//
+// # WHAT THE CALLER DOES WITH IT, AND WHY IT IS A QUERY AND NOT A FIELD
+//
+// `buildMailer` warns when this is not empty, because an unmigrated deployment's
+// verification link points at its reset screen and nothing else in the process can
+// see that. The comparison is on the VALUE rather than on "was the variable set",
+// so what the warning says — "these purposes resolve to RECOVERY_LINK_TEMPLATE" —
+// stays true for a deployment that set both variables to the same string. A warning
+// that is occasionally redundant is a better trade than one that is occasionally
+// wrong about a state it is describing as fact.
+func (c Config) LinkPurposesUsingTheDefault() []recovery.Purpose {
+	if c.DefaultLinkTemplate == "" {
+		return nil
+	}
+	var shared []recovery.Purpose
+	for _, purpose := range c.LinkTemplatePurposes() {
+		if c.LinkTemplates[purpose] == c.DefaultLinkTemplate {
+			shared = append(shared, purpose)
+		}
+	}
+	return shared
 }
 
 // Load reads the environment through lookup and returns a validated Config.
@@ -299,13 +407,55 @@ func (c *Config) loadMFA(lookup Lookup) error {
 	return nil
 }
 
+// defaultLinkTemplateVariable is the one link template a deployment configured
+// before there were per-purpose ones, and it is the DEFAULT for every purpose that
+// has no variable of its own.
+//
+// # WHY THE DEFAULT EXISTS, AND WHAT IT COSTS
+//
+// Every deployment in existence has this variable set and nothing else, and this
+// repository does not get to break their boots to fix a bug that only exists
+// because the bug predates the fix. So it is honoured, and an unmigrated
+// deployment's address-verification link keeps pointing wherever its single
+// template says — which, for the configuration this shape was introduced to
+// replace, is the password reset screen.
+//
+// # THE ALTERNATIVES, because the honest cost above deserves the argument
+//
+//	DERIVE A VERIFICATION PATH FROM THE RESET ONE, by replacing the last path
+//	segment or appending a convention. Rejected: it is the platform choosing a
+//	product's URL, which is the exact thing `LinkTemplate` exists to avoid, and it
+//	is wrong for every product whose verify screen is not spelled the way identity
+//	guessed. It would also make the defect INVISIBLE in a way this one is not.
+//
+//	REQUIRE `EMAIL_VERIFICATION_LINK_TEMPLATE`. Rejected: it breaks every
+//	installation at boot, which is the failure mode the packet exists to rule out.
+//
+// So: a default, a warning at startup naming what is still shared, and one more
+// variable for a deployment to set.
+const defaultLinkTemplateVariable = "RECOVERY_LINK_TEMPLATE"
+
+// linkTemplateVariables is the per-purpose table: which variable names which
+// purpose's link.
+//
+// IT IS THE COMPLETE SET OF PURPOSES A DEPLOYMENT CAN PUT A LINK IN, and
+// `email_change` is deliberately absent — courier has no message for an address
+// change, its messages are refused before a link is ever rendered, and a variable
+// for it would be a setting an operator changes and nothing happens.
+// `internal/courier`'s `TestEveryPurposeThisAdapterCanDeliverHasAVariableToConfigureItsLink`
+// is what holds that absence against the adapter's own set.
+var linkTemplateVariables = map[recovery.Purpose]string{
+	recovery.PurposePasswordReset: "PASSWORD_RESET_LINK_TEMPLATE",
+	recovery.PurposeVerifyEmail:   "EMAIL_VERIFICATION_LINK_TEMPLATE",
+}
+
 // loadCourier reads and validates the courier block.
 //
-// IT MIRRORS `loadOIDC`'s all-or-nothing rule and for the same reason: three
-// variables that only make sense together, and a partial block is a deployment that
-// believes it can send mail.
+// IT MIRRORS `loadOIDC`'s all-or-nothing rule and for the same reason: variables
+// that only make sense together, and a partial block is a deployment that believes
+// it can send mail.
 //
-// Absent is supported. All three unset is a process with no mail path, which is a
+// Absent is supported. Everything unset is a process with no mail path, which is a
 // legitimate deployment — a local stack, or one where courier is not deployed yet —
 // and it mounts `recovery.Unavailable{}` so every route that needs a message answers
 // 503 with a sentence saying why.
@@ -317,33 +467,158 @@ func (c *Config) loadMFA(lookup Lookup) error {
 func (c *Config) loadCourier(lookup Lookup) error {
 	baseURL := lookupValue(lookup, "COURIER_BASE_URL")
 	token := lookupValue(lookup, "COURIER_TOKEN")
-	linkTemplate := lookupValue(lookup, "RECOVERY_LINK_TEMPLATE")
 
+	// THE TWO CREDENTIALS ARE ALL-OR-NOTHING WITH EACH OTHER, and the link templates
+	// are all-or-nothing WITH THEM. Counting over the block as a whole is what makes
+	// that one rule rather than two, and a rule an operator can hold in their head is
+	// the point: either this process has a mail path or it does not.
 	present := 0
-	for _, value := range []string{baseURL, token, linkTemplate} {
+	for _, value := range []string{baseURL, token} {
 		if value != "" {
 			present++
 		}
 	}
 	if present == 0 {
+		if configured, variable := anyLinkTemplateConfigured(lookup); configured {
+			return fmt.Errorf("%w: %s is set but COURIER_BASE_URL and COURIER_TOKEN are "+
+				"not, so the link has nowhere to go: a deployment with a link template "+
+				"and no mail path believes it can send, and every route that needs to "+
+				"will answer 503", ErrInvalidCourier, variable)
+		}
 		return nil
 	}
-	if present != 3 {
-		return fmt.Errorf("%w: COURIER_BASE_URL, COURIER_TOKEN and RECOVERY_LINK_TEMPLATE "+
-			"must all be set, or none of them", ErrInvalidCourier)
+	if present != 2 {
+		return fmt.Errorf("%w: COURIER_BASE_URL and COURIER_TOKEN must both be set, or "+
+			"neither of them: a base URL with no credential sends every message as an "+
+			"anonymous caller and courier answers 401", ErrInvalidCourier)
 	}
 
 	if err := validateMailBaseURL(baseURL); err != nil {
 		return err
 	}
-	if err := validateRecoveryLinkTemplate(linkTemplate); err != nil {
+	templates, err := resolveLinkTemplates(lookup)
+	if err != nil {
 		return err
 	}
 
 	c.CourierBaseURL = baseURL
 	c.CourierTokenValue = token
-	c.RecoveryLinkTemplate = linkTemplate
+	c.LinkTemplates = templates
+	c.DefaultLinkTemplate = lookupValue(lookup, defaultLinkTemplateVariable)
 	return nil
+}
+
+// anyLinkTemplateConfigured reports whether any link variable is set, and which one
+// was seen.
+//
+// THE ORDER IS NOT MAP ORDER, because the variable named in a startup log has to be
+// the same one on every restart: an operator reading "PASSWORD_RESET_LINK_TEMPLATE
+// is set but…" on Tuesday and "EMAIL_VERIFICATION_LINK_TEMPLATE" on Wednesday has
+// been told two different things about the same mistake.
+func anyLinkTemplateConfigured(lookup Lookup) (bool, string) {
+	if value := lookupValue(lookup, defaultLinkTemplateVariable); value != "" {
+		return true, defaultLinkTemplateVariable
+	}
+	for _, variable := range sortedLinkTemplateVariables() {
+		if value := lookupValue(lookup, variable); value != "" {
+			return true, variable
+		}
+	}
+	return false, ""
+}
+
+// sortedLinkTemplateVariables lists the per-purpose variables in name order, so
+// every message built from this table is the same on every run.
+func sortedLinkTemplateVariables() []string {
+	variables := make([]string, 0, len(linkTemplateVariables))
+	for _, variable := range linkTemplateVariables {
+		variables = append(variables, variable)
+	}
+	slices.Sort(variables)
+	return variables
+}
+
+// sortedPurposes lists a purpose-keyed table's purposes in name order, for the same
+// reason `sortedLinkTemplateVariables` does: a refusal has to name the same variable
+// on every run.
+func sortedPurposes(table map[recovery.Purpose]string) []recovery.Purpose {
+	purposes := make([]recovery.Purpose, 0, len(table))
+	for purpose := range table {
+		purposes = append(purposes, purpose)
+	}
+	slices.Sort(purposes)
+	return purposes
+}
+
+// resolveLinkTemplates turns the three link variables into one template per purpose.
+//
+// # THE REFUSALS, AND WHY EACH IS THE FAILURE DIRECTION
+//
+//	no template anywhere      a deployment that can send mail cannot say where a
+//	                         link goes, so every message would arrive with nothing
+//	                         to click.
+//	a purpose with neither    a deployment has said where the reset link goes and
+//	                         nothing about the verification one. Falling back to
+//	                         another purpose's template IS THE DEFECT: the mail
+//	                         renders, every test passes, and the button leads to a
+//	                         404 for the reader.
+//	a template that will not  checked against a SUBSTITUTED copy, because `{token}`
+//	                         is not a legal URI character and validating the template
+//	                         as written would let through a shape courier's
+//	                         `format: uri` rejects once the real token is in it.
+//
+// # THE DEFAULT IS VALIDATED EVEN WHEN NOTHING FALLS BACK TO IT
+//
+// A variable that is present but unreadable is a startup failure everywhere else in
+// this package, and this one is no different: an operator who set
+// `RECOVERY_LINK_TEMPLATE` to something broken has a typo, and finding it at boot
+// costs one log line while finding it later costs an afternoon.
+func resolveLinkTemplates(lookup Lookup) (map[recovery.Purpose]string, error) {
+	defaultTemplate := lookupValue(lookup, defaultLinkTemplateVariable)
+	if defaultTemplate != "" {
+		if err := validateLinkTemplate(defaultLinkTemplateVariable, defaultTemplate); err != nil {
+			return nil, err
+		}
+	}
+
+	configured := 0
+	for _, variable := range sortedLinkTemplateVariables() {
+		if lookupValue(lookup, variable) != "" {
+			configured++
+		}
+	}
+	if configured == 0 && defaultTemplate == "" {
+		return nil, fmt.Errorf("%w: a deployment that can send mail needs at least one link "+
+			"template: set %s to the screen that redeems a password reset, %s to the "+
+			"screen that redeems an address confirmation, or %s to apply to every "+
+			"purpose. Without one a message arrives with nothing to click",
+			ErrInvalidCourier,
+			linkTemplateVariables[recovery.PurposePasswordReset],
+			linkTemplateVariables[recovery.PurposeVerifyEmail],
+			defaultLinkTemplateVariable)
+	}
+
+	out := make(map[recovery.Purpose]string, len(linkTemplateVariables))
+	for _, purpose := range sortedPurposes(linkTemplateVariables) {
+		variable := linkTemplateVariables[purpose]
+		value := lookupValue(lookup, variable)
+		if value != "" {
+			if err := validateLinkTemplate(variable, value); err != nil {
+				return nil, err
+			}
+			out[purpose] = value
+			continue
+		}
+		if defaultTemplate == "" {
+			return nil, fmt.Errorf("%w: %s is not set and neither is %s, so a %s link has "+
+				"nowhere to point and the mail would carry a button that goes nowhere. "+
+				"Set %s to the screen that redeems one, or set %s to apply to every "+
+				"purpose", ErrInvalidCourier, variable, defaultLinkTemplateVariable,
+				purpose, variable, defaultLinkTemplateVariable)
+		}
+		out[purpose] = defaultTemplate
+	}
+	return out, nil
 }
 
 // validateMailBaseURL refuses a courier address that is not one.
@@ -353,13 +628,20 @@ func (c *Config) loadCourier(lookup Lookup) error {
 // service should refuse to start on a bad URL whether or not a courier client is
 // built, and the client should refuse to exist on one whether or not something else
 // validated it. `TestTheBootRulesAndTheClientRulesAgree` holds them in step.
+//
+// THE MESSAGE NAMES BOTH SCHEMES THE CODE ACCEPTS, which is a fix rather than a
+// style preference. It used to say "want https" directly above a line that accepts
+// http, and above a test that requires `http://localhost:4003` to boot — so it told
+// an operator that a scheme this service starts up with is one it rejects.
+// `TestAnInsecureLinkTemplateIsDescribedAsThoughHTTPSWereTheOnlyOneAccepted` holds
+// it there.
 func validateMailBaseURL(raw string) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return fmt.Errorf("%w: COURIER_BASE_URL is not a URL: %v", ErrInvalidCourier, err)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("%w: COURIER_BASE_URL scheme is %q, want https",
+		return fmt.Errorf("%w: COURIER_BASE_URL scheme is %q, want http or https",
 			ErrInvalidCourier, parsed.Scheme)
 	}
 	if parsed.Host == "" {
@@ -374,39 +656,49 @@ func validateMailBaseURL(raw string) error {
 	return nil
 }
 
-// validateRecoveryLinkTemplate refuses a template that cannot produce a link a
-// person can follow.
+// validateLinkTemplate refuses a template that cannot produce a link a person can
+// follow.
 //
-// THE PLACEHOLDER IS REQUIRED and the check runs against a SUBSTITUTED copy rather
-// than the raw string, because `{token}` is not a legal URI character: validating
-// the template as written would let through a shape courier's `format: uri` rejects
-// once the real token is in it.
-func validateRecoveryLinkTemplate(raw string) error {
+// IT TAKES THE VARIABLE NAME and names it in every refusal, which is why it is a
+// parameter and not a constant: a deployment sets up to three of these, and "the
+// link template is invalid" makes an operator diff three values against a rule they
+// have to remember.
+//
+// THE REFUSALS ARE `internal/courier`'s, duplicated for the reason
+// `validateMailBaseURL` gives — this service must refuse to start on a broken link
+// whether or not a courier client is built — and they are applied PER PURPOSE rather
+// than once. One template used to be validated once, which meant a single validation
+// covered every message by accident of there being one template.
+func validateLinkTemplate(variable, raw string) error {
 	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("%w: %s is empty", ErrInvalidCourier, variable)
+	}
 	if !strings.Contains(trimmed, recoveryTokenPlaceholder) {
-		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE has no %s in it, so a reset link "+
-			"would carry no token", ErrInvalidCourier, recoveryTokenPlaceholder)
+		return fmt.Errorf("%w: %s has no %s in it, so a link would carry no token and the "+
+			"reader would reach a screen with nothing to redeem", ErrInvalidCourier,
+			variable, recoveryTokenPlaceholder)
 	}
 	probe := strings.ReplaceAll(trimmed, recoveryTokenPlaceholder, "6f5d4c3b-2a19-4e8f-9c07-1b2d3e4f5061")
 	parsed, err := url.Parse(probe)
 	if err != nil {
-		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE is not a URL: %v", ErrInvalidCourier, err)
+		return fmt.Errorf("%w: %s is not a URL: %v", ErrInvalidCourier, variable, err)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE scheme is %q, want https",
-			ErrInvalidCourier, parsed.Scheme)
+		return fmt.Errorf("%w: %s scheme is %q, want http or https",
+			ErrInvalidCourier, variable, parsed.Scheme)
 	}
 	if parsed.Host == "" {
-		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE has no host", ErrInvalidCourier)
+		return fmt.Errorf("%w: %s has no host", ErrInvalidCourier, variable)
 	}
 	if parsed.Fragment != "" {
 		// A fragment is not sent to a server, so a token in one reaches a browser
 		// and never the screen that redeems it.
-		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE has a fragment; a mail client "+
-			"does not send one to a server", ErrInvalidCourier)
+		return fmt.Errorf("%w: %s has a fragment; a mail client "+
+			"does not send one to a server", ErrInvalidCourier, variable)
 	}
 	if parsed.User != nil {
-		return fmt.Errorf("%w: RECOVERY_LINK_TEMPLATE has a userinfo section", ErrInvalidCourier)
+		return fmt.Errorf("%w: %s has a userinfo section", ErrInvalidCourier, variable)
 	}
 	return nil
 }

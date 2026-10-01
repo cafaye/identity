@@ -25,6 +25,7 @@ and its entry here is deleted; the number is never reused.**
 | [D4](#d4-the-admin-surface-is-token-only) | may a browser session reach the admin surface? | RULED: no. Token-only, and the refusal is asserted per route |
 | [D5](#d5-bulk-and-single-revocations-do-not-share-a-shape) | does a bulk revocation take the same request shape as a single one? | RULED: no. `confirm` in the body, a higher minimum, and both counts returned |
 | [D6](#d6-the-generated-client-commits-a-dependency-that-md6-said-it-would-not) | the generated client commits a runtime dependency, which MD6 said it would not — and it takes the coverage floor | RULED, with MD6's stated REASON corrected: the client ships here, generated, and the dependency is paid for |
+| [D8](#d8-one-link-template-for-four-messages-and-what-the-deployment-inherits) | one link template served all four messages — so a verification mail's button opened the password-reset screen. What does the template a deployment already set now MEAN? | RULED: it is the DEFAULT for every purpose with no template of its own, so nothing breaks at boot, and a purpose with neither is refused by name at startup |
 
 ## D1: twelve served operations are in no document
 
@@ -666,3 +667,91 @@ recover.** The flows are complete and tested; there is nowhere for the link to g
 That is recorded in README.md's "Not built yet" with the reason, because the honest
 state for "we depend on a service that is not ready" is a paragraph and not a
 stub that returns 202 and drops the mail.
+
+## D8: one link template for four messages, and what the deployment inherits
+
+**Raised** 2026-10-02 by packet `identity-26`, after `identity-24` drove the flows
+end to end against a real courier and found the verification mail's button pointing
+at the password-reset screen.
+
+**The problem.** `RecoveryMailer` held ONE `LinkTemplate` for all four of its
+messages, and the design was defended at length in `internal/courier/mailer.go`: a
+template with `{token}` beats a base URL plus a platform-chosen convention, and
+`ValidateLinkTemplate` refuses a template that cannot render a working link. The
+argument is sound **for a recovery link**. It was then applied to a verification
+link, which is not a recovery link, and the result was a mail that renders
+perfectly, passes every assertion in the repository, and sends the reader to a
+screen where the token is a `404`.
+
+The single template had to go — one template for two purposes is a template that
+must be wrong for one of them. **What had to be decided is what the variable that
+already exists now means**, and that is a question about deployments rather than
+about code.
+
+**The four shapes.**
+
+1. **Require `EMAIL_VERIFICATION_LINK_TEMPLATE`.** Correct in the strictest sense and
+   rejected: it refuses to start every installation that exists, on the security
+   boundary, to fix a defect introduced after they were configured. The brief for
+   this packet names that outcome as the one to avoid.
+2. **Derive the verification path from the reset one** — replace the last path
+   segment, or append a convention. Rejected: it is the platform choosing a
+   product's URL, which is the exact thing `LinkTemplate` exists to avoid, and it is
+   wrong for every product whose confirm screen is not spelled the way identity
+   guessed. It would also make the defect **invisible in a way the chosen answer
+   does not**: a derived path looks configured, and an operator reading the config
+   would have nothing to notice.
+3. **Make the legacy variable mean "recovery" specifically**, so a verification link
+   becomes mandatory. Same failure as 1, wearing a hat.
+4. **RULED: `RECOVERY_LINK_TEMPLATE` is the default for every purpose that has no
+   variable of its own.** A purpose names a template and gets it; a purpose that
+   names nothing takes the default; a purpose with neither its own nor the default
+   is a **startup failure naming the variable**.
+
+**Why 4, and what it costs.** The cost is real and is the whole of the argument:
+**an unmigrated deployment's address-confirmation link still points at whatever its
+one template says.** The compatibility promise is about booting and about the reset
+link continuing to work, and it does not pretend to fix the verification link for a
+deployment that has not configured one — because fixing it automatically means
+guessing where the screen is.
+
+So identity says it out loud instead. `buildMailer` warns on startup when any
+purpose resolves to the shared default, naming the purpose and the variable that
+would give it a link of its own. That warning is the load-bearing part of the
+decision, and it is there because **nothing else in the process can see the
+problem**: the send succeeds, the token redeems at its own endpoint, every existing
+test is green, and the reader is the only person who discovers they are on the wrong
+screen. A compatibility promise that is silent about its own remaining cost is a
+worse trade than one that names it.
+
+**Why a purpose with NEITHER is a boot failure rather than a fallback.** The
+fallback is the defect. A deployment that sets `PASSWORD_RESET_LINK_TEMPLATE` and
+forgets it also dropped its default for verification has, by omission, reproduced
+exactly the state this decision exists to end — and it would do so with every mail
+rendering correctly. Failing at boot costs one line in a startup log naming the
+variable; failing later costs a user.
+
+**The checks, and what each one is for.** The interesting question was never the
+configuration shape — it is that **nothing about a URL says which screen it opens**,
+so no assertion about bytes can catch this. Identity cannot catch it either, except
+where it has its own endpoints:
+
+- `internal/courier/link_purpose_test.go` builds the mailer from an
+  **`internal/config` environment** rather than from a Go literal — a relationship
+  between two links can only be tested by something that can express it — sends a
+  reset and a verification through the real flows over a real database, and asserts
+  the two rendered links have **different paths** and that **each token redeems at
+  its own endpoint and is refused at the other**. The token is read back out of the
+  URL rather than out of the message, because the claim is about what the *recipient*
+  holds.
+- The same file holds a **negative control**: one template for both purposes really
+  does render one link for both messages, so the inequality above is a comparison and
+  not a tautology.
+- The inequality was shown to fire by injecting the real defect — making the
+  verification purpose read the reset variable — which reds at the path comparison
+  with a message naming what a reader would have found.
+
+**WHAT WAS DELIBERATELY NOT DONE.** courier was not touched. `verify_email` still
+maps onto courier's `welcome`, which is the honest mapping and stays: what changed
+is the **link**, not the message kind. There is still no `email_verification` type in
+courier, and this decision does not argue for one.

@@ -158,7 +158,12 @@ service quietly listening on the wrong port.
 | `OIDC_ALLOW_INSECURE` | `false` | Permits an `http` issuer. For `localhost` and compose stacks only. |
 | `MFA_ENCRYPTION_KEY` | *(unset)* | base64url, **exactly 32 bytes**. Seals the TOTP secret at rest. Never generated. Unset means MFA is not turned on: the management routes are absent and the login challenge is still enforced. A value of the wrong length is a startup failure. |
 | `MFA_ISSUER` | `cafaye identity` | The account label an authenticator app displays. A display string, not a secret; changing it does not affect any confirmed credential. |
-| `IDENTITY_OTEL_ENDPOINT` | `http://otel-collector:4318` | The OTLP endpoint spans go to. **The only contract** (core D16), and the collector that ships with kit's stack is just its default value — so tracing is on by default and a deployer who already runs Datadog or Grafana sets one variable and kit's stack goes quiet. Unset costs spans and nothing else: no queue, no retry loop, no dial at boot. |
+| `COURIER_BASE_URL` | *(unset)* | The mail service's base URL. With `COURIER_TOKEN` and a link template it makes recovery deliverable; unset, the recovery routes stay mounted and answer `503` with a sentence naming the problem. `http` is accepted for a compose stack. |
+| `COURIER_TOKEN` | *(unset)* | The service credential courier authenticates `POST /v1/messages` with. Never logged, never rendered. |
+| `RECOVERY_LINK_TEMPLATE` | *(unset)* | **The link for every purpose that has no template of its own.** `https://app.example.com/reset?token={token}` is a working example, and `{token}` is required. **This is the single template a deployment set before the per-purpose variables existed, and it is honoured** — so setting it alone keeps an existing deployment booting with the links it had, which for the configuration that shape was introduced to replace means the address-confirmation link still points at the password-reset screen. Setting it is enough to deliver; setting it *alone* is a migration still in progress. |
+| `PASSWORD_RESET_LINK_TEMPLATE` | *(unset)* | Where the **password reset** link points. Overrides `RECOVERY_LINK_TEMPLATE` for that purpose only. |
+| `EMAIL_VERIFICATION_LINK_TEMPLATE` | *(unset)* | Where the **address confirmation** link points. Overrides `RECOVERY_LINK_TEMPLATE` for that purpose only — and setting this one variable is the whole migration out of the state above. |
+| `IDENTITY_OTEL_ENDPOINT` | `http://otel-collector:4318` | The OTLP endpoint spans go to. **The only contract** (core D16), and the collector that ships with kit's stack is just its default value — so tracing is on by default and a deployer who already runs Datadog or Grafana sets one variable and kit's stack goes quiet. Unset costs spans and nothing else: no queue, no retry loop, no dial at boot. | **The only contract** (core D16), and the collector that ships with kit's stack is just its default value — so tracing is on by default and a deployer who already runs Datadog or Grafana sets one variable and kit's stack goes quiet. Unset costs spans and nothing else: no queue, no retry loop, no dial at boot. |
 | `IDENTITY_TENANT_ID` | *(unset)* | The `tenant_id` **resource** attribute. Never a span attribute — see the allowlist rule in [AGENTS.md](AGENTS.md). Unset by default, because an empty one shows up as a second service row in every collector's service list. |
 | `DEPLOYMENT_ENVIRONMENT` | *(unset)* | The `deployment.environment` resource attribute. An enum in core's resource schema (`development`/`test`/`staging`/`production`), so there is no fourth spelling to invent. |
 | `OTEL_SERVICE_VERSION` | *(detected)* | The `service.version` resource attribute. Absent is treated as "unknown" rather than defaulted to a string, because a configured-but-empty version renders as a second service row in a collector's service list. |
@@ -959,6 +964,56 @@ committed file differs, and CI fails the build when four named security tests do
 PASS by name — among them the credential-leak test, the unknown-problem-code test, the
 regeneration gate and the lint-exclusion narrowness check.
 
+## The URLs a recovery link points at
+
+**identity does not know where a product puts its reset screen, and it does not
+guess.** A deployment says, per purpose, and identity substitutes the token. The
+template is a whole URL with `{token}` in it, and the substitution is the only
+thing identity writes — so the path, the host, the query parameter name and whether
+the token is in the path at all are the deployment's to choose.
+
+| Purpose | Variable | Example | Redeemed by |
+|---|---|---|---|
+| Password reset | `PASSWORD_RESET_LINK_TEMPLATE` | `https://app.example.com/reset?token={token}` | `POST /v1/password-resets/confirm` |
+| Address confirmation | `EMAIL_VERIFICATION_LINK_TEMPLATE` | `https://app.example.com/verify-email?token={token}` | `POST /v1/email-verifications/confirm` |
+
+**These are two links and they must be two screens.** A verification token
+presented to a password-reset screen is a `404` — the tokens live in one table
+behind a `purpose` column, so one is not the other — and a reader who follows the
+wrong link is told nothing happened. The single-template design this replaced is
+defended at length in `internal/courier/mailer.go` and it is sound *for a recovery
+link*: a template with `{token}` beats a base URL plus a platform-chosen
+convention. It was applied to a verification link too, and the result was a mail
+that rendered perfectly, passed every assertion in this repository, and sent the
+user somewhere useless. Nothing about a URL says which screen it opens, which is
+why the check that catches it reads the rendered link and redeems what is in it:
+`TestAVerificationLinkIsNotThePasswordResetLinkAndEachRedeemsAtItsOwnEndpoint`.
+
+Three things are refused at boot, for every template and not just once: no
+`{token}` (a link with no credential on it), a relative URL (courier's schema says
+`format: uri`, and a mail cannot render one), and a fragment (a mail client does
+not send a fragment to a server, so a token in one never reaches the screen that
+redeems it). `internal/config` and `internal/courier` each apply all three, and
+they must agree — one is the deployment's boot and the other is the constructor,
+and a deployment that boots on what the client would refuse is a deployment that
+starts and then cannot send.
+
+### Migrating from one template to two
+
+`RECOVERY_LINK_TEMPLATE` is the link for **every** purpose that has no variable of
+its own, so a deployment that has only ever set that one keeps booting with the
+links it had. That is the compatibility promise and it is deliberate; the cost is
+that an unmigrated deployment's address-confirmation link still points wherever its
+single template says, which for the configuration that shape was introduced to
+replace is the password reset screen.
+
+So identity does not hide it. On startup, a deployment with any purpose resolving
+to the shared default gets a warning naming that purpose and the variable that would
+give it a link of its own, and nothing else in the process can see the problem: the
+send succeeds, the token redeems at its own endpoint, and the reader is the only one
+who finds out. Adding `EMAIL_VERIFICATION_LINK_TEMPLATE` is the whole migration;
+`PASSWORD_RESET_LINK_TEMPLATE` can wait, or be set at the same time, or the legacy
+variable can be deleted once both are in place.
 ## Testing
 
 **`go test ./...` is red on a machine with no database, and that is the design.**

@@ -227,6 +227,61 @@ re-evaluation alone lets a re-invitation resurrect a credential: the join is
 satisfied again. If you add a column that would let a token answer "what may I do"
 without a membership read, the packet's reason has been undone.
 
+**A recovery link is configured PER PURPOSE, and a purpose with no template is a
+refusal rather than a fallback.** `RECOVERY_LINK_TEMPLATE` is the *default* for
+every purpose with no variable of its own; `PASSWORD_RESET_LINK_TEMPLATE` and
+`EMAIL_VERIFICATION_LINK_TEMPLATE` override it. `internal/courier`'s
+`RecoveryMailer` holds `LinkTemplates map[recovery.Purpose]LinkTemplate`, and
+`NewRecoveryMailer` refuses to construct without one for **every purpose it can
+deliver**.
+
+The rule exists because of what happened when it did not. One template served four
+messages, so a `welcome` mail's button said `https://app.example.com/reset?token=…`
+and a user who clicked "Confirm your email address" landed on the password-reset
+screen, where a verification token is a **404**. The token redeemed. The mail was
+well-formed. **Every test in the repository was about the bytes, and the bytes were
+correct** — which is why the whole failure was invisible until a real run found it
+(identity-24). One template for two purposes is a template that must be wrong for one
+of them.
+
+Three properties, each with a check that fires:
+
+- **A purpose with no template is REFUSED, never filled in from another purpose.**
+  `resolveLinkTemplates` returns an error naming the purpose. Filling the gap is the
+  defect, and it is the direction everything else here fails in: a mail that renders
+  correctly and leads nowhere. Same rule as a route with no declared scope.
+- **The key is `recovery.Purpose`, never a subject and never a courier
+  `NotificationType`.** The purpose is what says which screen the link belongs on; a
+  courier type would make that a fact about a delivery decision. And three closed
+  sets have to agree — `linkPurposeFor`, `config`'s `linkTemplateVariables`, and
+  `recovery.Purpose` — with nothing in the type system joining them, so
+  `linkPurposeFor` is walked against the other two in both directions by
+  `internal/courier/link_purpose_test.go`. **A fourth set, a fourth purpose, or a
+  template for a purpose nothing delivers, is a completeness obligation on whoever
+  writes it**, exactly like a struct literal that configures a check.
+- **`ValidateLinkTemplate`'s three refusals apply per purpose, not once.** They were
+  applied once because there was one template; there are two now.
+
+**Nothing about a URL says which screen it opens, so the check reads the rendered
+link and redeems what is in it.** `TestAVerificationLinkIsNotThePasswordResetLinkAndEachRedeemsAtItsOwnEndpoint`
+builds the mailer from a `config.Load` of an **environment** rather than a Go
+literal — a relationship between two links cannot be tested by something that cannot
+express it — and asserts the two rendered links differ in **path**, and that each
+purpose's token, read back out of the URL, is accepted by its own endpoint and
+refused by the other. Its **negative control** is that one template really does
+render one link for both messages, so the inequality is a comparison rather than a
+tautology; and the inequality was shown to fire by injecting the real defect.
+
+**The backwards-compatible default is announced, never silent.** `RECOVERY_LINK_TEMPLATE`
+is honoured so no deployment breaks at boot (DECISIONS.md D8), which means an
+unmigrated deployment's verification link still points wherever its one template
+says. `buildMailer` therefore **warns on startup** when any purpose resolves to the
+shared default, naming the purpose and the variable that would give it a link of its
+own — because nothing else in the process can see it: the send succeeds, the token
+redeems at its own endpoint, every test is green, and the reader is the only one who
+finds out. **If you add a purpose, add it to that warning's inputs; do not let a new
+purpose silently inherit the default.**
+
 **A route with no declared scope is closed to tokens.** The scope table in
 `internal/httpapi/accounts.go` is keyed by the chi pattern, `scopeRequiredBy`
 returns `""` for a route that is not in it, and `Allows("")` is false for every
