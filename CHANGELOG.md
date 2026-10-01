@@ -6,6 +6,99 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed (the OAuth social-login claim, and the check that stops the next one)
+
+- **This service advertised OAuth social login in four places and served it in
+  none.** `README.md`'s opening paragraph listed "OAuth" among the things identity
+  owns, the roadmap carried `- [x] OAuth (social login) via goth`,
+  `cafaye.yml`'s `description` claimed the capability in the manifest customers
+  are handed, and a directory of correct, database-tested code said so by
+  implication. **There is no route, no handler, no use case, no `internal/httpapi/oauth.go`,
+  and no `OAUTH_*` configuration variable.** A customer integrating "Continue with
+  Google" against this service got a `404`.
+
+  All four claims are now false in the other direction, and
+  `internal/httpapi/claims_test.go` is what holds them there. It found the manifest
+  claim and the roadmap claim **by name on its first run**, which is the evidence
+  that it would have found them before.
+
+- **`internal/oauth` is written, tested against a real database, and unmounted —
+  and now says so in its own package doc.** `NewState`/`VerifyState` are live (the
+  OIDC login uses them); the registry, the code-for-token exchange, the token
+  cipher and the `connected_accounts` store have no caller. `migrations/00008_connected_accounts.sql`
+  is applied and nothing writes to it. The table is **left in place deliberately**:
+  an applied migration is not edited, and a `DROP TABLE` on the security boundary to
+  tidy an unused table is a bigger intervention than leaving it.
+
+  Three comments in that package asserted things about the code that were not
+  true, and each is now corrected in place rather than deleted:
+  `client.go` pointed at `internal/httpapi/oauth.go`, a file that has never
+  existed; `settings.go` said `internal/config` reads the environment into a
+  `Settings`, and that package contains no `OAUTH_` string at all; and
+  `provider.go` named `migrations/00005_connected_accounts.sql`, which was
+  renumbered to `00008` when the accounts packet moved it.
+
+- **Google's `email_verified` is not read, and is now recorded as a gap rather
+  than left as a silent one.** `internal/oauth/client.go` decodes Google's `email`
+  with no check on `email_verified`, while the GitHub path already refuses an
+  unverified address. For a relying party deciding whether to sign somebody in,
+  that is a takeover primitive. It is unreachable while the surface is unmounted,
+  which is a weaker state than "closed", and the comment now says so and names it
+  as the first task of the packet that mounts this.
+
+- **A second tripwire: the README, the roadmap and the manifest are held to the
+  router, in both directions.** `openapi_drift_test.go` answers "is the contract
+  the router?"; this one answers "is everything the repository says about the
+  router true?" — a service can have a perfect OpenAPI document and still
+  advertise an endpoint that does not exist, and the prose is what a customer
+  believes. Four files:
+
+  - `claims_test.go` — the three claim sources above, both directions, plus a
+    manifest capability→route table that is pinned in both directions and a
+    roadmap table that **cannot grow** (growth is how a capability gets excused of
+    having a route).
+  - `claims_reader_test.go` — faults injected into the readers. A block-scalar
+    `description`, a malformed route row, an emptied roadmap. Every way the reader
+    could under-read is an error, because two readers that both find nothing agree.
+  - `claims_faults_test.go` — the walk itself. It asserts a route from **each**
+    conditional surface is visible rather than that a field was set (a field test
+    passes against a registrar that mounts nothing), that the two options literals
+    stay in step, and that each claim check goes **red** on a route that does not
+    exist.
+  - `oauth_absent_test.go` — the inverse, asserting the social-login surface is
+    still unmounted, with **its failure message as the work order** for whoever
+    mounts it. Finishing that work means deleting the file.
+
+- **`go test -race` was failing on 52 to 64 tests per run, before this packet, and
+  is now clean.** `newMux` recorded the pattern list it built into a package
+  variable for the observability canary, and the variable was unguarded. This
+  package builds routers from dozens of parallel subtests, so the race detector
+  reported a WRITE/WRITE from two goroutines and failed whichever test happened to
+  be running — a different set on every run, which is the shape of a flake nobody
+  can chase. The variable is now mutex-guarded and read through
+  `recordedRouteTable`, which copies under the lock. This is AGENTS.md's own rule
+  — no globals, no init-time state — and it was a real violation, not a tidy-up.
+  Verified as a **pre-existing** condition by running `go test -race` on a clean
+  clone of HEAD: 62, 64 and 52 failing tests across three runs. `go test -race ./...`
+  is green three times over.
+
+- **One README row could not be read by a correct reader and was rewritten.**
+  `| GET /oidc/introspect, /oidc/revoke, ... |` was one methoded path and three
+  bare ones in a single cell — a promise and a refusal in one row. The method is
+  gone, which is also more accurate: there is nothing behind those paths to answer
+  a method.
+
+**What was deliberately not done.** The surface was not mounted, and that is a
+decision rather than an omission: the missing piece is a **product decision about
+which user a callback resolves to** (a provider email matching an existing
+`users.email` is a takeover if permitted and a support call if refused — Jumpstart
+Pro refuses, and this repository has not chosen), and a cross-site browser surface
+this service does not have. Wiring the routes without settling either would have
+produced a plausible implementation with a subtle flaw, on the platform's security
+boundary, and `PLAN.md` §3 puts identity behind a user-run security review. The
+README's "Social login is not built" section records all of it, and the absence
+test's failure message is the checklist for the packet that will do it properly.
+
 ### Changed (merge of the recovery and observability packets)
 
 - **Both CI floors were remeasured on the merged tree**, and this is the third

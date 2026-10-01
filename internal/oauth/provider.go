@@ -11,8 +11,13 @@ import (
 )
 
 // Provider names. These are the two values of the `oauth_provider` enum in
-// migrations/00005_connected_accounts.sql, the two scopes in OpenAPI, and the
-// two keys accepted in the URL. There is one list of them and it is here.
+// migrations/00008_connected_accounts.sql, and the two keys the URL would accept
+// once the surface is mounted. There is one list of them and it is here.
+//
+// The OpenAPI mention this comment used to make was false: no document in this
+// repository declares a social-login operation, because there is no route for one.
+// The migration number was stale for the same kind of reason — the table was
+// renumbered from 00005 to 00008 when the accounts packet moved it.
 const (
 	ProviderGoogle = "google"
 	ProviderGitHub = "github"
@@ -145,6 +150,13 @@ func (p Provider) oauth2Config() *oauth2.Config {
 // It is derived from the configured base rather than taken from the request: a
 // Host header an attacker chose must not become part of an OAuth redirect_uri, or
 // the code is delivered to wherever they asked.
+//
+// The path it appends is not served by anything today, and the value is the same
+// one the exchange sends: Client.Exchange calls this with the same base, so the
+// authorize step and the token step cannot disagree about it. When the surface
+// mounts, the route it names has to be this one — a callback at any other path is
+// a second redirect_uri, and one that is not the configured one is refused by the
+// provider without saying which of the two was wrong.
 func (p Provider) RedirectURI(baseURL string) string {
 	return strings.TrimSuffix(baseURL, "/") + "/v1/auth/oauth/" + p.Name + "/callback"
 }
@@ -165,6 +177,11 @@ type Registry struct {
 //
 // Providers with no credentials are dropped rather than stored as broken entries.
 // The returned error is only about baseURL, which every caller needs.
+//
+// Unwired: no route constructs a Registry today, and Empty is the flag the
+// not-yet-written mount would consult to decide whether to serve social login at
+// all. It is the honest shape for the decision — absent rather than 404-per-provider
+// — and it is untested against a real process until something mounts it.
 func NewRegistry(baseURL string, providers ...Provider) (*Registry, error) {
 	if err := validateRedirectBase(baseURL); err != nil {
 		return nil, err

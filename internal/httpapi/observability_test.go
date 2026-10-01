@@ -134,8 +134,13 @@ func TestAParameterisedRouteRecordsItsTemplateNotThePath(t *testing.T) {
 	// parameterised pattern. Without this the test could pass for the wrong
 	// reason: a route that turned out to be literal would satisfy the assertions
 	// below while proving nothing.
+	// Through recordedRouteTable, which copies under the lock. Reading routeTable
+	// directly was a data race: this package builds routers from many parallel
+	// subtests, and newMux writes the variable on every build.
+	patterns := recordedRouteTable()
+
 	var sawTemplate bool
-	for _, pattern := range routeTable {
+	for _, pattern := range patterns {
 		if pattern == parameterised {
 			sawTemplate = true
 		}
@@ -143,7 +148,7 @@ func TestAParameterisedRouteRecordsItsTemplateNotThePath(t *testing.T) {
 	if !sawTemplate {
 		t.Fatalf("the route table is %v, which does not contain %q. Every assertion below "+
 			"assumes the route really is parameterised, and a literal route would satisfy "+
-			"them while proving nothing.", routeTable, parameterised)
+			"them while proving nothing.", patterns, parameterised)
 	}
 
 	// Two different accounts, one endpoint.
