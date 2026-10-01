@@ -878,9 +878,15 @@ internal/oauth/        the social-login client side — WRITTEN AND NOT MOUNTED.
                        "Not built yet"
 internal/outbox/       transactional event envelope, SKIP LOCKED claim, publisher
 internal/platform/db/  the pgx pool, and the readiness ping
-internal/platform/ci/  the test that keeps .github/workflows/ci.yml honest
+internal/platform/ci/  the test that keeps .github/workflows/ci.yml honest, and
+                       the one that holds config/kamal-backup.yml and
+                       config/deploy.yml to their cross-file secret contract
 client/               THE GO CLIENT — a generated transport and the wrapper over it
 migrations/            goose SQL files
+config/                THE DEPLOYMENT CONFIG: deploy.yml (the Kamal config, and the
+                       backup accessory that runs the backup) and kamal-backup.yml
+                       (what is backed up, where, for how long). Both copied from
+                       cafaye/kit at the ref in kit.ref; see "Backups"
 ```
 
 `cmd/` + `internal/` is the layout from `refs/goreleaser`. `main` owns nothing
@@ -1239,6 +1245,163 @@ input is left alone on purpose — 45 is the rejected option and 0 is a weakened
 the boundary a compile-time fact rather than a config entry. It changes the import
 path of a published client, so it waits; the signal is a second repository asking
 for a generated client, and `until=2027-03-31` fails the build in the meantime.
+
+## Backups
+
+**A scheduled dump is configured. No backup has been taken, and nothing here
+claims one has.** This section is written so that sentence is impossible to
+miss, because the failure mode is a README that reads as reassurance.
+
+Two files, committed together and copied from cafaye/kit at the ref in
+`kit.ref`:
+
+| File | What it is |
+|---|---|
+| [`config/kamal-backup.yml`](config/kamal-backup.yml) | what to back up, where, and for how long |
+| [`config/deploy.yml`](config/deploy.yml) | the Kamal config, including the `backup` accessory that runs the first |
+
+Both were accepted by the real binaries — kamal 2.12.0 and kamal-backup 0.5.2:
+`kamal config` renders the deploy config, and `kamal-backup validate` resolves
+every secret the backup config names out of the backup accessory's environment.
+That second check is the load-bearing one, because it is a **cross-file**
+contract that no per-file parse can see — a secret named in `kamal-backup.yml`
+and missing from the accessory's `env.secret` list is valid YAML in both files,
+each internally consistent, and a deployment failure. Removing one secret from a
+copy of this pair and re-running `validate` reproduces that failure with
+`RESTIC_REPOSITORY or RESTIC_REPOSITORY_FILE is required`, which is how the
+claim above is known to bite rather than assumed to.
+
+**Those binaries are not in this repository's gate**, and a check that runs only
+on a machine that happens to have kamal and the gem installed is a check that
+runs for whoever has them and for nobody else. So the same contract is asserted
+on every commit by
+[`internal/platform/ci/backup_config_test.go`](internal/platform/ci/backup_config_test.go):
+every secret the backup config names is declared by its accessory, the accessory
+mounts the file, `app:` names this service, and the configured schedule and this
+section's data-loss window agree with each other. Each of those four was checked
+by injecting the fault it exists to catch — removing the secret, removing the
+mount, renaming the service, shortening the schedule — and watching the
+corresponding test go red.
+
+### What covers what
+
+`pg_dump` of **one** Postgres database — the one `DATABASE_URL` names — piped
+through restic into a Cloudflare R2 bucket. It is a dump of the **whole**
+database, not a table list, so it covers all seventeen of identity's tables:
+`users`, `sessions`, `recovery_tokens`, `api_keys`, the four `mfa_*` tables,
+the three `oidc_*` tables, `accounts`, `account_users`,
+`account_invitations`, `account_audit_log`, `outbox_events` and
+`connected_accounts` (defined, unwritten — see "Not built yet"). A table added by
+a later migration is covered without touching this config, which is the reason
+there is no table list here to fall out of date.
+
+**No database name is written anywhere in the config**, which is the reason the
+backup cannot be pointed at a different database than the service. The
+connection is `{ secret: DATABASE_URL }` — the same DSN the service opens. An
+operator note that follows from that: the `postgres` accessory in
+`config/deploy.yml` sets only `POSTGRES_PASSWORD`, so the image's defaults name
+the role and database, and a deployment's `DATABASE_URL` has to match those
+rather than the `identity`/`identity` pair `docker-compose.yml` provisions
+locally.
+
+Retention is roughly 26 snapshots: every one from the last week, one a day back
+a month, one a week back two months, one a month back a year, two a year
+indefinitely. **The oldest restorable thing is about a year old.**
+
+### What it does not cover
+
+- **A dump is one point in time, not a running log.** See the window below.
+- **Postgres roles and tablespaces.** The dump carries no `CREATE ROLE` and no
+  ownership. Restoring into a differently-named role means that role has to
+  exist first.
+- **The keys.** A restic repository is encrypted with `RESTIC_PASSWORD` and
+  nothing else — **lose it and every snapshot is permanently unreadable,
+  including ones you have not lost yet.** `MFA_ENCRYPTION_KEY` is a second such
+  value: without it `mfa_credentials.secret_ciphertext` is unreadable, so a
+  restored MFA enrolment cannot be verified. `OIDC_SIGNING_KEY` is a third, and
+  it is not a column: without it every token in the restored database fails
+  verification, which is service-wide breakage rather than an unreadable table.
+  All three must be stored **somewhere other than the repository**.
+- **Any object storage or uploaded files — because identity has none.** This is
+  the verified fact rather than a general caveat: there is no `storage_key`, no
+  bucket, no multipart upload, no attachment, and no `os.Create` /
+  `os.WriteFile` / `os.MkdirAll` anywhere in `cmd/`, `internal/` or `client/`.
+  The image is distroless-nonroot with no shell. A restored database has nothing
+  pointing at anything outside Postgres, which is *not* true of darkroom, whose
+  `assets` rows point at bytes in a bucket a `pg_dump` cannot reach.
+  **The day a packet adds an upload or a bucket, this paragraph becomes the first
+  thing to lose** and `paths:` becomes a decision rather than an omission.
+- **A second copy of anything.** There is one restic repository in one bucket on
+  one provider. `prune` deletes from it by design and nothing else keeps a copy,
+  and **R2 has no object versioning and no Object Lock** — a deleted object is
+  gone. This meets 3-2-1's off-site rule and neither of its other two. The
+  mitigation is bucket access control, not the retention policy.
+- **A backup that nobody notices failing.** The scheduler logs a failure and
+  sleeps the interval. **The alert is the backup** — if nobody watches the
+  accessory's log, a nightly failure is invisible for a day and a backup failing
+  for a week is not a backup.
+
+### The data-loss window
+
+**With the configured `schedule: 1d`, up to 24 hours of committed transactions
+are lost if the primary database is destroyed.**
+
+That number is not a wall-clock deadline, and three details all push it wider
+rather than narrower:
+
+1. **It is measured from when the previous backup _finished_.** The scheduler's
+   loop is *run a backup, then sleep the interval*, so one cycle is the interval
+   **plus the previous run's duration**. `pg_dump` also opens a single
+   repeatable-read transaction, so the snapshot is taken at the **start** of the
+   dump — the gap between two snapshot points is that whole cycle.
+2. **There is no WAL shipping and no base backup.** This is a scheduled dump,
+   not point-in-time recovery. `kamal-backup` will not do PITR for you; the next
+   step is Postgres's own continuous archiving, which is an infrastructure
+   decision rather than a config one.
+3. **A failed backup is not retried until the next interval.** A dump failing
+   for six hours has not been retried six times. The operator-facing half: a
+   failure does not update the state file, so the next backup is already due and
+   `kamal-backup backup` by hand retries immediately.
+
+### Turning it on
+
+Committed is not running. An operator still has to:
+
+```sh
+# 1. The R2 bucket must exist BEFORE the first backup. `init_if_missing: true`
+#    initialises the repository inside a bucket you created; it does not create
+#    the bucket. This is the difference between "backups are on" and "backups are
+#    on after somebody created the bucket".
+# 2. Six secrets in .kamal/secrets: DATABASE_URL, DATABASE_PASSWORD,
+#    RESTIC_REPOSITORY, RESTIC_PASSWORD, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+#    DATABASE_PASSWORD must equal the password inside DATABASE_URL, and identity
+#    itself never reads it — it exists so pg_dump gets the credential in its
+#    environment rather than in its argv.
+# 3. The five non-secret KIT_* variables the ERB in config/deploy.yml requires:
+#    KIT_SERVICE, KIT_REGISTRY_ORG, KIT_REPO, KIT_WEB_HOST, KIT_APP_DOMAIN.
+kamal setup
+kamal accessory boot backup
+
+# Take one now, ignoring the schedule, and prove it wrote something:
+kamal accessory exec --reuse backup kamal-backup backup --force
+kamal accessory exec --reuse backup kamal-backup list
+kamal accessory exec --reuse backup kamal-backup evidence   # keep this output
+```
+
+**Then drill it before you need it.** A backup nobody has restored is a
+hypothesis. `cafaye/kit`'s `templates/kamal/drill.sh`, copied to `bin/drill`,
+restores into a scratch database, asserts the tables came back with rows, and
+drops the scratch database on every exit path:
+
+```sh
+bin/drill --table users --table sessions --table api_keys
+```
+
+This repository does **not** contain `bin/drill` yet. Copying kit's `drill.sh`
+into `bin/` is a separate, unmade change, and until it is made the restore path
+is described in `cafaye/docs`'s
+[backup-and-restore runbook](https://github.com/cafaye/docs) rather than being
+exercisable from here.
 
 ## Migrations
 

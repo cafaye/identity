@@ -220,10 +220,12 @@ jobs:
       # Decrease detectors, not targets. Measured on 2026-10-01 against
       # `go test -v -count=1 ./...` with the database tier applied, from a
       # complete log: 1989 PASS lines across the whole suite, 1732 of them in the
-      # 14 packages that open a pool, zero SKIP anywhere. A lower number is a
-      # deleted test and this goes red; a higher one is a new test, which is a
-      # one-line edit here. They are not read out of the run, so a run cannot
-      # satisfy itself by having fewer tests.
+      # 14 packages that open a pool, zero SKIP anywhere. The backup-config packet
+      # then added 31 more, all in internal/platform/ci, which opens no pool, so
+      # the totals are 2020 and 1732. A lower number is a deleted test and this
+      # goes red; a higher one is a new test, which is a one-line edit here. They
+      # are not read out of the run, so a run cannot satisfy itself by having
+      # fewer tests.
       #
       # `-race` is NOT in the command this was measured with, and deliberately so:
       # the race detector changes neither how many tests run nor how many PASS
@@ -249,8 +251,12 @@ jobs:
       # from its own branch: the recovery packet measured 1939 / 1715, and the
       # observability packet measured 1864 / 1609. Neither number was ever true
       # of this tree, because each was measured without the other's tests. The
-      # real counts are 1989 and 1732 — higher than BOTH, since the two packets
-      # added tests in overlapping files rather than replacing them.
+      # real counts were 1989 and 1732 — higher than BOTH, since the two packets
+      # added tests in overlapping files rather than replacing them. The
+      # backup-config packet added 31 tests in internal/platform/ci, which opens
+      # no pool, so the tier floor is unchanged and the suite floor rises to
+      # 2020. A floor measured per packet describes the tree that packet shipped
+      # on, not the tree that merged.
       #
       # This is the floor rule stated as an event rather than as a principle: a
       # floor is a claim about the present tree, so the merge that makes two
@@ -265,7 +271,7 @@ jobs:
       # `go test -json -count=1 ./...` against a real postgres:17-alpine with
       # migrations applied, counting per-package PASS events rather than reading
       # a summary line — the same partition the check below computes.
-      SUITE_FLOOR: '1989'
+      SUITE_FLOOR: '2020'
       DATABASE_TIER_FLOOR: '1732'
       MODULE: github.com/cafaye/identity
       # # THE ONE PERMITTED SKIP, AND WHY IT IS A LIST AND NOT A RULE
@@ -668,7 +674,12 @@ jobs:
             TestADeploymentWithNoMailerRefusesBeforeItLearnsAnything \
             TestAResetRequestInsideTheWindowSendsNothing \
             TestOneTokenSpentOnceUnderConcurrency \
-            TestNoSubjectCarriesAToken; do
+            TestNoSubjectCarriesAToken \
+            TestEverySecretTheBackupConfigNamesIsDeclaredByItsAccessory \
+            TestTheBackupAccessoryMountsTheBackupConfig \
+            TestTheBackupConfigNamesThisService \
+            TestTheScheduleIsStatedAndTheWindowInTheReadmeMatchesIt \
+            TestTheContractCheckFailsOnAnInjectedPair; do
             # The trailing " (" is what makes this exact: `--- PASS: TestFooBar`
             # must not satisfy a check written for `TestFoo`, and go test always
             # puts the duration after the name.

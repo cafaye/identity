@@ -27,6 +27,16 @@ internal/telemetry/    OpenTelemetry: the allowlist, the exporter, and the insta
 internal/httpapi/telemetry.go  the request span, and the route TEMPLATE it records
 migrations/            goose SQL files
 client/                THE GO CLIENT: a generated transport and the hand-written wrapper
+config/deploy.yml      the Kamal config, copied from kit's deploy.yml.erb. Its ONE
+                       identity-specific change is healthcheck.path: /readyz, because
+                       identity serves /healthz and /readyz and not kit's /up
+config/kamal-backup.yml what identity backs up, where and for how long, copied from
+                       kit's kamal-backup.yml.erb. Committed as a PAIR with
+                       deploy.yml, and that pairing is the rule: the backup config is
+                       read by nothing except deploy.yml's `backup` accessory, so a
+                       file nobody references is the same defect one layer down — and
+                       `kamal-backup validate` can only check their cross-file secret
+                       contract with both present
 kit.ref                the pinned kit commit the local stack comes from
 bin/prime              the gate: go mod download && go build ./... && go test ./...
 bin/migrate            migrations as a deploy step, for `bin/dev`
@@ -275,6 +285,44 @@ operations that normalise onto one, a missing file — into an error. **A reader
 that finds nothing agrees with another reader that finds nothing, and that is how
 a check over nothing goes green.** A new test in that file is a test of the
 rule the reader applies, not of a document.
+
+**The two deployment config files are ONE contract, and the commit that matters
+is the one that only one of them is in.** `config/kamal-backup.yml` names its
+credentials as `{ secret: NAME }`; `config/deploy.yml`'s `backup` accessory
+carries an `env.secret` list, and kamal-backup builds that accessory's
+environment from that list **and from nothing else**. So a secret named in the
+backup config and missing from the accessory is valid YAML in both files, each
+internally consistent, and a deployment that fails validation with both files
+reading correctly in review. `kamal-backup validate` is the tool that catches
+it, and it is **not in this repository's gate** — so
+`internal/platform/ci/backup_config_test.go` asserts the same contract on every
+commit, in the direction that fails loudly: every secret the backup config names
+is declared by the accessory. An accessory may declare a secret the backup config
+does not use; that is not a failure, and the test says so rather than comparing
+as sets.
+
+Four properties of that pair are checks and not comments, and each has been shown
+to fire by injecting the fault it catches rather than by being assumed to bite:
+the secret contract, the `files:` mount (`config/kamal-backup.yml` into the
+accessory — an accessory that does not mount the file schedules backups against
+a config it cannot read), `app:` naming `identity` (a mismatch writes snapshots
+under one path and looks for them under another, which restic does not report as
+an error because restic tracks by path), and the schedule agreeing with the
+data-loss window README.md states. **That last one exists because "24 hours" is
+a promise made to a customer**: shorten `backup.schedule` to `6h` and leave the
+README alone and the test fails in the direction where the README is claiming
+more loss than actually occurs.
+
+**A committed config is a specification until somebody boots it.** Neither file
+says a backup has been taken, and neither claims one has. The R2 bucket must
+exist before the first backup — `init_if_missing: true` initialises the
+*repository* inside a bucket you created — six secrets must be in
+`.kamal/secrets`, and nobody has run a drill here. README.md § "Backups" states
+that in the place an operator reads, and the runbook in `cafaye/docs` is the
+procedure. **The template is copied, so a kit bump means re-copying and
+re-applying identity's one change** (`healthcheck.path: /readyz`, because
+identity does not serve kit's `/up`); both files say which kit ref they came
+from.
 
 **Stubs stay honest.** A packet that is not written yet is absent, not a
 `not implemented` fake that looks finished. The README's "Not built yet" list is

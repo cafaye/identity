@@ -1,0 +1,269 @@
+---
+# `config/deploy.yml` — the Kamal configuration for identity.
+#
+# WHY THIS FILE IS IN THE REPOSITORY, INSTEAD OF ONLY A TEMPLATE SOMEONE
+# COPIES LATER.
+#
+#   `config/kamal-backup.yml` says what identity backs up. It is read by
+#   exactly one thing: the `backup` accessory at the bottom of this file, which
+#   mounts it at /app/config/kamal-backup.yml and builds its secret environment.
+#   With no `config/deploy.yml`, the backup configuration is a file nothing
+#   references — the same defect one layer down — and the documentation would
+#   describe a procedure no deployment is configured to run. So the pair is
+#   committed together, which is also the only shape in which
+#   `kamal-backup validate` can check the contract between them.
+#
+# IT IS A VERBATIM COPY of `templates/kamal/deploy.yml.erb` in cafaye/kit at the
+# ref in `kit.ref` (a0959929), with ONE identity-specific change, marked below:
+# the healthcheck path. Re-copy on a kit bump and re-apply that one line.
+#
+# THE ERB IS STILL IN IT, ON PURPOSE, so nothing here is a guessed operator
+# fact. Kamal evaluates this file through ERB before it parses it
+# (Kamal::Configuration uses `ERB.new(...).result`), so the copy below works as
+# committed: an operator exports the five KIT_* variables the preamble requires
+# and runs kamal. `servers.web`, the proxy host and the registry org are
+# therefore NOT written down in this repository — they are facts about the box
+# this installation runs on, and a config that guesses them is a config that
+# deploys to a host somebody chose by accident. A missing variable fails the
+# render with a message naming it, rather than rendering empty and surfacing
+# three layers away as "cannot find a host".
+#
+# NOTHING SECRET IS IN THIS FILE, AND NOTHING BELOW IS A VALUE. Every credential
+# is a NAME in `env.secret`; the values live in `.kamal/secrets` on the
+# operator's machine. One honest limitation of the Kamal model is recorded in
+# kit's AGENTS.md and is worth stating here too: at run time a secret IS in the
+# container's environment, and `docker inspect` on the host shows it.
+#
+# THE PIECES THAT ARE IDENTITY'S RATHER THAN KIT'S:
+#
+#   - `healthcheck.path: /readyz`, not kit's `/up`. identity does not serve `/up`
+#     — it serves `/healthz` (liveness, never touches a dependency) and `/readyz`
+#     (readiness, every dependency bounded at 2s). Pointing the proxy at a path
+#     the service does not serve makes every deploy fail its healthcheck and roll
+#     back, which reads as a broken release rather than a broken config.
+#   - NO `migrate:` command, deliberately. kit's template has none, and adding
+#     one would be wrong for this service: identity's image is distroless with no
+#     shell and no `psql`, and the service must not migrate itself at boot (see
+#     AGENTS.md, "Migrations are a deploy step, not a boot step"). Migrations are
+#     applied by an operator with `bin/migrate` or `goose` against the Postgres
+#     accessory, which means a deploy does not apply them for you — see README.md
+#     § "Backups" and migrations/README.md.
+#   - `builder.arch: arm64`, which is kit's value, kept unchanged. It is NOT a
+#     statement about the host: change it to `amd64` for an x86-64 box. Kamal
+#     refuses to build without it, and a wrong architecture fails at run time
+#     rather than at build time.
+<%
+# WHY ERB, AND WHY ONLY FOR THESE FOUR VALUES.
+#
+#   The four things below are the ones that differ per operator rather than per
+#   service: where the boxes are, what the registry org is called, and the
+#   two names that make an image unambiguous. Everything else in this file is a
+#   decision, and a decision belongs in the file where a reviewer can read it.
+#
+#   Kamal evaluates this file with ERB before it parses it (Kamal::Configuration
+#   uses `ERB.new(...).result`), so ERB is free for anyone who already has
+#   Kamal — it is the same interpreter, not a second tool. That is the whole
+#   reason this is not "just write the values out": the alternative to ERB is a
+#   second config file per environment, and a second config file is a second
+#   thing to keep correct forever.
+#
+#   A MISSING VALUE FAILS LOUDLY, ON PURPOSE.
+#
+#   The obvious spelling interpolates ENV["WEB_HOST"] directly, which renders
+#   an empty string when the variable is unset. Empty renders as a null list
+#   item, the hosts array becomes [null], and the failure surfaces several
+#   layers away as a deploy that cannot find a host. The four calls below turn
+#   that into a message naming the variable at the moment it is read. This is
+#   the kit habit — refuse by name, print what to do — applied to a template
+#   rather than to a command.
+#
+#   AND A WARNING ABOUT WRITING THIS BLOCK, WHICH COST ONE RUN TO LEARN.
+#   Nothing in the comments above may contain a literal ERB tag, even inside a
+#   Ruby comment. The first version of this file spelled the obvious form out
+#   in full, angle brackets and all, and ERB compiled that comment as code: the
+#   tag closed the block early, the rest of the preamble was emitted as literal
+#   YAML, and the file failed with "undefined local variable or method
+#   `service'" at the first real interpolation below — several lines away from
+#   the mistake. The error names a variable that is plainly defined two lines
+#   up, which is what made it worth writing down rather than just fixing.
+#
+#   NOTHING SECRET IS RENDERED HERE, AND THAT IS THE POINT OF THE WHOLE FILE.
+#   Every credential below is a NAME in `env.secret`, never a value. A rendered
+#   config is an ordinary file that gets committed, pasted into a ticket, and
+#   read over someone's shoulder; the only safe content for one is the name of
+#   the secret and where to find it. The values live in `.kamal/secrets` on the
+#   operator's machine, which is git-ignored, and nowhere else in the repo.
+require = lambda do |name|
+  value = ENV[name].to_s.strip
+  raise "config/deploy.yml: #{name} is not set. It is a non-secret deployment value, so it belongs in the shell that runs kamal, not in .kamal/secrets: export #{name}=... (an address or a name, never a credential)." if value.empty?
+  value
+end
+
+service     = require.call("KIT_SERVICE")
+org         = require.call("KIT_REGISTRY_ORG")
+repo        = require.call("KIT_REPO")
+registry    = ENV.fetch("KIT_REGISTRY", "ghcr.io")
+web_host    = require.call("KIT_WEB_HOST")
+app_domain  = require.call("KIT_APP_DOMAIN")
+%>
+# `config/deploy.yml` — the Kamal configuration for <%= service %>.
+#
+# Copy this file from cafaye/kit at the ref your `kit.ref` names, rename it to
+# `config/deploy.yml`, and export the five KIT_* variables above. Every value
+# that is a DECISION rather than a deployment fact is written out below with
+# the reason it was made, because a number without its reason is not a
+# decision — it is a default nobody will revisit.
+
+# Names the application, and therefore every container, network and volume
+# Kamal creates for it. Changing it renames the containers, which orphans the
+# old ones; treat it as permanent.
+service: <%= service %>
+
+# THE IMAGE NAME MUST NOT CARRY THE REGISTRY HOST.
+#
+# `registry.server` below is prepended to this value by Kamal, so
+# `image: ghcr.io/org/repo` with `server: ghcr.io` resolves to
+# `ghcr.io/ghcr.io/org/repo` and the deploy fails at the push, not here.
+# Measured on kamal 2.12.0: `kamal config` reports
+# `:repository: ghcr.io/ghcr.io/cafaye/courier` for exactly that spelling.
+# The host appears in `registry.server` and nowhere else.
+image: <%= org %>/<%= repo %>
+
+servers:
+  web:
+    - <%= web_host %>
+
+proxy:
+  ssl: true
+  hosts:
+    - <%= app_domain %>
+  healthcheck:
+    # A READINESS endpoint, not a liveness one. It must exercise the service's
+    # real dependencies, because this is the signal `kamal deploy` gates the
+    # rollout on: a container that answers 200 while its database is unreachable
+    # is a container Kamal will happily declare healthy. The interval is
+    # deliberately short for the same reason — the window in which a broken
+    # release is receiving traffic is interval x timeout.
+    #
+    # `/readyz`, CHANGED FROM KIT'S `/up`: identity serves `/healthz` and
+    # `/readyz` and nothing else at the root (internal/httpapi/httpapi.go). Of
+    # the two, `/readyz` is the right one for a rollout gate and `/healthz`
+    # would be wrong — it is unconditionally 200 while the process serves, so it
+    # would approve a release whose database is gone.
+    path: /readyz
+    interval: 2
+    timeout: 5
+  # Do not let kamal-proxy outlive a bad deploy silently. `kamal deploy`
+  # already refuses to finish a rollout that never goes green, and this is the
+  # setting that makes "never went green" observable in the proxy's own log
+  # rather than only in the deploy output.
+  #
+  # A proxy that keeps routing to a container Docker has stopped is the failure
+  # that turns a bad deploy into user-facing 502s. Kamal's default is to leave
+  # the running container up until the new one is healthy, which is the
+  # behaviour we want; this block is here to say so rather than to change it.
+  #
+  # service_timeout: 10
+
+# RAISED FROM KAMAL'S 30s DEFAULT, AND THE REASON IS THE ONLY PART THAT MATTERS.
+#
+# The number is not a preference. A container that boots by running migrations
+# and then warming caches on a loaded host takes longer than 30 seconds to
+# answer its first healthcheck, and when the grace expires Kamal reports
+# "target failed to become healthy", tears the rollout back, and the operator
+# retries — a deploy that cannot succeed rather than a deploy that failed.
+#
+# 180 seconds is generous on purpose: the cost of the extra window is a slow
+# deploy in the failure case, and the cost of too small a window is a deploy
+# that rolls back a perfectly good release. If you raise it, replace this
+# paragraph with the failure you actually observed. If you cannot name one, set
+# it back to 30 and say why.
+deploy_timeout: 180
+
+# `clear` is what lands in the container's environment, and it is printed by
+# `docker inspect` and by `docker compose config` — so nothing here may be a
+# credential, ever. `secret` is the list of NAMES whose VALUES come from
+# `.kamal/secrets` on the operator's machine.
+env:
+  clear:
+    # Telemetry endpoint. The value is a plain address, not a secret, and it is
+    # the ONE contract a service honours: a self-hoster running a vendor
+    # backend sets it and the collector chain is bypassed, which is a supported
+    # deployment rather than a degraded one.
+    <%= service.upcase %>_OTEL_ENDPOINT: http://localhost:4318
+  secret:
+    # The database URL. It carries a password, which is why it is a secret and
+    # never a clear value: at runtime it will be in the container's
+    # environment, and that is the one honest limitation of Kamal's model,
+    # recorded in DECISIONS.md.
+    - DATABASE_URL
+    - KAMAL_REGISTRY_PASSWORD
+
+# Credentials for the image host. The password is a NAME, resolved from
+# `.kamal/secrets`. `kamal registry login --password-stdin` is the supported
+# way to populate it and writes the file for you.
+registry:
+  server: <%= registry %>
+  username: <%= org %>
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+# Built in CI and pushed; the server only pulls. Building on the host means
+# the build's peak memory competes with the running service, which on a small
+# box is an OOM during a deploy. `arch` is not optional — kamal 2.12.0 refuses
+# the config outright with "builder: Builder arch not set" when it is absent,
+# because a wrong architecture produces an exec-format error at run time rather
+# than at build time.
+builder:
+  arch: arm64
+  cache:
+    type: registry
+    options: mode=max,image-manifest=true,oci-mediatypes=true
+
+accessories:
+  postgres:
+    image: postgres:17-alpine
+    host: <%= web_host %>
+    port: 5432
+    volumes:
+      - <%= service %>_postgres:/var/lib/postgresql
+    # AN OPERATOR FACT TO KNOW, not a defect in this block: `POSTGRES_DB` and
+    # `POSTGRES_USER` are absent, so the postgres image's defaults apply and they
+    # name the role and the database. identity's DATABASE_URL therefore has to
+    # name those, NOT the `identity` role and `identity` database that
+    # docker-compose.yml provisions locally — those are the dev stack's own
+    # arrangement and they do not travel. Adding `POSTGRES_DB: identity` here
+    # would be a second decision about a deployed database's name, taken in a
+    # config file whose subject is containers; leave it to the DSN.
+    env:
+      secret:
+        - POSTGRES_PASSWORD
+
+  backup:
+    # kamal-backup, as an ordinary container. The image ships its own Ruby, so
+    # the SERVICE IMAGE NEVER NEEDS RUBY — see templates/kamal/README.md for
+    # the full answer on which side of the boundary Ruby lives.
+    image: ghcr.io/crmne/kamal-backup:0.5.2
+    host: <%= web_host %>
+    files:
+      - config/kamal-backup.yml:/app/config/kamal-backup.yml:ro
+    env:
+      # Every secret `config/kamal-backup.yml` names MUST also be listed here.
+      # This is not a convention: `kamal-backup validate` builds the accessory's
+      # environment from this list and from nothing else, so a secret that is
+      # named in the backup config and missing here fails validation with
+      # "RESTIC_REPOSITORY or RESTIC_REPOSITORY_FILE is required" — measured on
+      # kamal-backup 0.5.2, not inferred. The two files are one contract.
+      secret:
+        - DATABASE_URL
+        - DATABASE_PASSWORD
+        - RESTIC_REPOSITORY
+        - RESTIC_PASSWORD
+        - AWS_ACCESS_KEY_ID
+        - AWS_SECRET_ACCESS_KEY
+    volumes:
+      # The scheduler's state: when the last backup finished. This volume is
+      # what makes `backup.schedule` mean "at most every 1d" rather than
+      # "every time the container restarts", and it is the reason a reboot does
+      # not trigger a full dump.
+      - <%= service %>_backup_state:/var/lib/kamal-backup
