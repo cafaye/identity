@@ -258,6 +258,12 @@ func servedRoutes(t *testing.T) map[operationKey]string {
 		// struct's own field list, so the next conditional surface added to
 		// internal/httpapi fails there until somebody adds its double to this walk.
 		admin: newFakeAdmin(),
+		// recovery is here for the same reason, and it is a NEW instance of the bug
+		// the block above describes rather than a hypothetical one: eight routes are
+		// mounted off this field's absence being handled, and a walk that did not
+		// set it would report the documents as agreeing about a service that is
+		// smaller than the one that runs.
+		recovery: newFakeRecovery(),
 	}
 
 	served := map[operationKey]string{}
@@ -513,7 +519,7 @@ func TestTheDocumentIsOpenAPI31AndCarriesAVersion(t *testing.T) {
 			v1Document, doc.SpecVersion)
 	}
 
-	const want = "1.4.0"
+	const want = "1.5.0"
 	if doc.InfoVersion != want {
 		t.Errorf("%s declares info.version %q, not %q. core's sync rule is that the /v1 "+
 			"prefix says which contract and this says which build of it, and a non-breaking "+

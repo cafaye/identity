@@ -66,6 +66,14 @@ type options struct {
 	// audit trail. It is token-only (see requireAdminToken) and absent without it,
 	// like every other optional surface here.
 	admin Admin
+	// recovery is the ACCOUNT-RECOVERY surface: password reset, address
+	// verification and email change. It is absent without a database, like every
+	// other surface here, and it is deliberately NOT conditional on a mailer: a
+	// deployment that cannot deliver answers 503 on the routes that send one, which
+	// is the same shape as the login's second step answering 503 with no MFA key.
+	// A 404 here would tell a product this service has never heard of password
+	// recovery, and that is the one answer that is both false and useless.
+	recovery Recovery
 }
 
 // Option customises the handler built by New.

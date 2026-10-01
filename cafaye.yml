@@ -124,6 +124,23 @@ exposes:
     # README.md, "Not built yet".
     - identity.api_key.created
     - identity.api_key.revoked
+    # From the recovery packet. Both are core's catalog rows under these exact
+    # names, so there is no divergence to record.
+    #
+    # `identity.user.email_verified` is emitted when a verification link is
+    # redeemed. NOT emitted for an email change: a change CLEARS the verification
+    # rather than setting it, so a moved address produces this only when the new
+    # one is confirmed in its own right — which is a separate request, and one a
+    # product has to make.
+    #
+    # `identity.session.revoked` is emitted ONLY where every credential the account
+    # held is gone — a password reset, or an email change. DELETE /v1/session ends
+    # ONE session and emits nothing, which is the gap the constant's own comment in
+    # internal/outbox/recovery.go records. A subscriber can therefore treat this
+    # type as "this account's credentials are all gone" without a payload field
+    # telling it, and `reason` (a closed set of two) says which flow did it.
+    - identity.user.email_verified
+    - identity.session.revoked
 
     # Every name below is written in core's 0.2 three-segment form, because that
     # is the form the schema accepts and the form `event.own-prefix` reads. The
@@ -132,10 +149,11 @@ exposes:
     # pattern refuses.
     #
     # NOT EMITTED, and deliberately absent rather than declared and unimplemented:
-    #   identity.user.email_verified   the email-verification packet
     #   identity.member.joined         see the note on identity.member.accepted
-    #   identity.session.revoked       a later packet; DELETE /v1/session does
-    #                                  not emit it yet
+    #
+    # `identity.user.email_verified` and `identity.session.revoked` were in this
+    # list until the recovery packet landed, and are now declared above because the
+    # code emits them.
     #
     # EMITTED BUT NOT DECLARED HERE, which is a real gap and not an oversight:
     #   identity.account.created       internal/accounts/service.go

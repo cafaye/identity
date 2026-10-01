@@ -120,6 +120,10 @@ migration would take the process down with it.
 
 ## Where the schema is going
 
-Not written yet, and not in this packet. `identity` in Phase 1 grows accounts
-and memberships, then OIDC, MFA and API tokens. Each of those arrives as its
-own numbered migration with the tests that prove it (PLAN.md §3).
+Not written yet. Accounts and memberships, OIDC, MFA and API tokens have all
+landed; each arrived as its own numbered migration with the tests that prove it
+(PLAN.md §3). `00014` (address verification) and `00015` (`recovery_tokens`) are
+the recovery packet's two, and the next thing this schema will want is a sweep job
+for expired rows — `recovery_tokens_expires_at_idx` already exists so it is one
+statement, and the read queries filter on `expires_at` in the meantime so an
+unswept row is harmless.

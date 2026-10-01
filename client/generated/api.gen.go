@@ -42,6 +42,21 @@ func (e APIKeyScope) Valid() bool {
 	}
 }
 
+// Defines values for AcceptedStatus.
+const (
+	AcceptedStatusAccepted AcceptedStatus = "accepted"
+)
+
+// Valid indicates whether the value is a known member of the AcceptedStatus enum.
+func (e AcceptedStatus) Valid() bool {
+	switch e {
+	case AcceptedStatusAccepted:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for AuditLogEntryAction.
 const (
 	InvitationRevoked  AuditLogEntryAction = "invitation.revoked"
@@ -444,6 +459,22 @@ type APIKey struct {
 // rather than being treated as "and so anything goes".
 type APIKeyScope string
 
+// Accepted The body of every route that has been asked to send a message.
+//
+// **Exactly one field, with one value, ever.** That is the whole of the
+// account-enumeration defence on `requestPasswordReset`,
+// `requestEmailVerification` and `confirmEmailChangeCurrentAddress`: a
+// registered address, an unregistered one and an address inside the cooldown
+// all get these same bytes. Adding an `expires_at`, an `email` or a `sent`
+// boolean here would reinstate an oracle without touching a test, so the
+// handler's type is a constant for the same reason.
+type Accepted struct {
+	Status AcceptedStatus `json:"status"`
+}
+
+// AcceptedStatus defines model for Accepted.Status.
+type AcceptedStatus string
+
 // AuditLogEntry One admin action.
 //
 // **There is no field here that could hold a credential, and that is
@@ -602,6 +633,21 @@ type ConfirmEnrollmentRequest struct {
 	Code string `json:"code"`
 }
 
+// ConfirmPasswordResetRequest defines model for ConfirmPasswordResetRequest.
+type ConfirmPasswordResetRequest struct {
+	// Password The same rules and the same argon2id hashing a registration uses, and
+	// enforced identically. A new password is not an excuse to accept one
+	// that registration would have refused.
+	//
+	// The upper bound is a DoS control on an unauthenticated route: argon2id's
+	// cost is fixed in memory but its input is not, so without it a caller
+	// with no session chooses the size of the hashing work.
+	Password string `json:"password"`
+
+	// Token The token from the emailed link. See `RecoveryTokenRequest`.
+	Token string `json:"token"`
+}
+
 // ConfirmedEnrollment MFA is live, and here are the recovery codes, once.
 //
 // **Every session this account holds was revoked to produce this response**,
@@ -638,6 +684,33 @@ type ConfirmedEnrollmentEnabled bool
 
 // ConfirmedEnrollmentMethod defines model for ConfirmedEnrollment.Method.
 type ConfirmedEnrollmentMethod string
+
+// EmailChange The state of a two-sided address change.
+//
+// **Both addresses are named** and neither is secret: `current_email` is the
+// address the account has now and `new_email` is the one that was typed. What
+// it does not carry is a token, a digest or a row id — this flow is addressed
+// by its tokens, and there is no id in it for a client to hold.
+//
+// On the `200` from `confirmEmailChangeNewAddress` the move has completed, so
+// `current_email` and `new_email` are the same value, `expires_at` is absent,
+// and `email_verified` is present and **false**.
+type EmailChange struct {
+	CurrentEmail openapi_types.Email `json:"current_email"`
+
+	// EmailVerified Present only on the `200` from `confirmEmailChangeNewAddress`, where it
+	// is always false. An email change CLEARS the verification, so a client
+	// that reads this has to prompt for a fresh one rather than assuming the
+	// address it just moved to is proved.
+	EmailVerified *bool `json:"email_verified,omitempty"`
+
+	// ExpiresAt The deadline for the change. 24 hours from the request, and **both
+	// halves share it** rather than each getting its own clock — a change
+	// cannot be kept alive indefinitely by confirming the first half over and
+	// over. Absent once the move has completed.
+	ExpiresAt *time.Time          `json:"expires_at,omitempty"`
+	NewEmail  openapi_types.Email `json:"new_email"`
+}
 
 // FactorRequest The body of every route that changes or relies on an existing second
 // factor.
@@ -988,6 +1061,38 @@ type RecoveryCodesResponse struct {
 // wants N and not a round trip to learn it.
 type RecoveryCodesResponseRecoveryCodesRemaining int
 
+// RecoveryEmailRequest An address to look an account up by, on the three routes that start a
+// flow.
+//
+// **It is never the address that gets proved or moved.** On
+// `requestEmailVerification` it identifies the account whose *stored* address
+// is proved, and on `requestEmailChange` it is the address being moved TO.
+// A token that verified whatever address this field carried would be a
+// registration of somebody else's inbox.
+type RecoveryEmailRequest struct {
+	// Email Normalized to lower case and trimmed before comparison.
+	Email openapi_types.Email `json:"email"`
+}
+
+// RecoveryTokenRequest A single-use token from an emailed link. It is one field on purpose, and
+// the three routes that take it do not all accept the same set: a shared type
+// with an optional `password` would invite a client to send a password to a
+// verification endpoint, where it would be ignored — and "ignored" is a worse
+// answer than "refused", because a caller that believed the field was
+// accepted would not know to retry.
+//
+// **The token is the credential.** These routes are anonymous, so the only
+// thing being authenticated is the value in this field.
+type RecoveryTokenRequest struct {
+	// Token 256 bits from crypto/rand, base64url without padding. Only its SHA-256
+	// is stored, so a database dump yields no usable credential.
+	//
+	// 43 characters, and the length is load-bearing on the client side rather
+	// than incidental: it is what tells a caller the value is complete before
+	// it is pasted into a URL.
+	Token string `json:"token"`
+}
+
 // RegisterOIDCClientRequest defines model for RegisterOIDCClientRequest.
 type RegisterOIDCClientRequest struct {
 	GrantTypes   []RegisterOIDCClientRequestGrantTypes `json:"grant_types"`
@@ -1188,6 +1293,27 @@ type User struct {
 	ID openapi_types.UUID `json:"id"`
 }
 
+// VerificationStatus Whether one address is proved, as `GET /v1/email-verification` reports it.
+//
+// The boolean and the timestamp say the same thing in two shapes and both are
+// present because a client needs one and not the other: a boolean for a
+// conditional render, an instant for "verified on". The timestamp is
+// **absent** rather than null when the address was never verified — "never
+// verified" and "verified at the epoch" are different answers and only the
+// first is true.
+type VerificationStatus struct {
+	// Email The address on the account. Always lower case.
+	Email openapi_types.Email `json:"email"`
+
+	// EmailVerified False both for an address that was never proved AND for one that was
+	// proved and then moved — a changed address lands unverified.
+	EmailVerified bool `json:"email_verified"`
+
+	// EmailVerifiedAt RFC3339 UTC, absent when `email_verified` is false. Judged against the
+	// service's clock, not the database's.
+	EmailVerifiedAt *time.Time `json:"email_verified_at,omitempty"`
+}
+
 // AccountID defines model for AccountId.
 type AccountID = openapi_types.UUID
 
@@ -1205,6 +1331,11 @@ type Forbidden = Problem
 // Every non-2xx response from this service is this shape. No service invents
 // its own error body.
 type InternalError = Problem
+
+// MailUnavailable The cafaye error envelope: RFC 9457 plus core's `code` and `trace_id`.
+// Every non-2xx response from this service is this shape. No service invents
+// its own error body.
+type MailUnavailable = Problem
 
 // MalformedBody The cafaye error envelope: RFC 9457 plus core's `code` and `trace_id`.
 // Every non-2xx response from this service is this shape. No service invents
@@ -1249,6 +1380,21 @@ type RevokeAPIKeyJSONRequestBody = RevokeAPIKeyRequest
 // RegisterOIDCClientJSONRequestBody defines body for RegisterOIDCClient for application/json ContentType.
 type RegisterOIDCClientJSONRequestBody = RegisterOIDCClientRequest
 
+// RequestEmailChangeJSONRequestBody defines body for RequestEmailChange for application/json ContentType.
+type RequestEmailChangeJSONRequestBody = RecoveryEmailRequest
+
+// ConfirmEmailChangeCurrentAddressJSONRequestBody defines body for ConfirmEmailChangeCurrentAddress for application/json ContentType.
+type ConfirmEmailChangeCurrentAddressJSONRequestBody = RecoveryTokenRequest
+
+// ConfirmEmailChangeNewAddressJSONRequestBody defines body for ConfirmEmailChangeNewAddress for application/json ContentType.
+type ConfirmEmailChangeNewAddressJSONRequestBody = RecoveryTokenRequest
+
+// RequestEmailVerificationJSONRequestBody defines body for RequestEmailVerification for application/json ContentType.
+type RequestEmailVerificationJSONRequestBody = RecoveryEmailRequest
+
+// ConfirmEmailVerificationJSONRequestBody defines body for ConfirmEmailVerification for application/json ContentType.
+type ConfirmEmailVerificationJSONRequestBody = RecoveryTokenRequest
+
 // IntrospectAPIKeyJSONRequestBody defines body for IntrospectAPIKey for application/json ContentType.
 type IntrospectAPIKeyJSONRequestBody = IntrospectRequest
 
@@ -1263,6 +1409,12 @@ type ConfirmMFAEnrollmentJSONRequestBody = ConfirmEnrollmentRequest
 
 // RegenerateMFARecoveryCodesJSONRequestBody defines body for RegenerateMFARecoveryCodes for application/json ContentType.
 type RegenerateMFARecoveryCodesJSONRequestBody = FactorRequest
+
+// RequestPasswordResetJSONRequestBody defines body for RequestPasswordReset for application/json ContentType.
+type RequestPasswordResetJSONRequestBody = RecoveryEmailRequest
+
+// ConfirmPasswordResetJSONRequestBody defines body for ConfirmPasswordReset for application/json ContentType.
+type ConfirmPasswordResetJSONRequestBody = ConfirmPasswordResetRequest
 
 // CreateSessionJSONRequestBody defines body for CreateSession for application/json ContentType.
 type CreateSessionJSONRequestBody = LoginRequest
@@ -1851,6 +2003,296 @@ type ClientInterface interface {
 	// Corresponds with GET /v1/accounts/{account_id}/oidc-clients/{client_id} (the `GetOIDCClient` operationId).
 	GetOIDCClient(ctx context.Context, accountID AccountID, clientID openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// RequestEmailChangeWithBody Start a move to a new address
+	//
+	// Records the intent and mails a link to the address the account has **now**.
+	// Nothing moves yet: this creates the first of two tokens, and the second
+	// does not exist until the first is redeemed.
+	//
+	// That ordering is the whole of the hijack property. A stolen session can
+	// reach this route, and what it produces is a link in the victim's inbox and
+	// nowhere else — the attacker cannot advance the change, and the victim gets a
+	// message saying their address is being changed, which is the only warning
+	// they would otherwise get. A single-token design, where the link goes to the
+	// NEW address and completing it moves the account, is a takeover on anybody
+	// who can read the new inbox and nothing else.
+	//
+	// **Session only.** There is no scope in the machine vocabulary for "may move
+	// an account's recovery path", and there is not going to be one. A scoped API
+	// token is refused on all eight routes of this surface.
+	//
+	// Two refusals are worth reading, because both are the alternative being
+	// rejected:
+	//
+	// * **409** when the new address already has an account. This is the one
+	//   disclosure this surface makes and it is safe here — the caller is
+	//   authenticated as the person asking, and the alternative is a change that
+	//   fails at the last step after two emails and two clicks. It is the same
+	//   answer `POST /v1/users` gives.
+	// * **422 `already_current`** when the new address is the one already on the
+	//   row. Refused rather than treated as a no-op, because a 202 here would
+	//   leave the caller believing a change had been requested and confirmed.
+	//
+	// 201 rather than 202: this is not a message being sent in the background, it
+	// is a change that has been recorded and has a deadline.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/email-changes (the `RequestEmailChange` operationId).
+	RequestEmailChangeWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RequestEmailChange Start a move to a new address
+	//
+	// Records the intent and mails a link to the address the account has **now**.
+	// Nothing moves yet: this creates the first of two tokens, and the second
+	// does not exist until the first is redeemed.
+	//
+	// That ordering is the whole of the hijack property. A stolen session can
+	// reach this route, and what it produces is a link in the victim's inbox and
+	// nowhere else — the attacker cannot advance the change, and the victim gets a
+	// message saying their address is being changed, which is the only warning
+	// they would otherwise get. A single-token design, where the link goes to the
+	// NEW address and completing it moves the account, is a takeover on anybody
+	// who can read the new inbox and nothing else.
+	//
+	// **Session only.** There is no scope in the machine vocabulary for "may move
+	// an account's recovery path", and there is not going to be one. A scoped API
+	// token is refused on all eight routes of this surface.
+	//
+	// Two refusals are worth reading, because both are the alternative being
+	// rejected:
+	//
+	// * **409** when the new address already has an account. This is the one
+	//   disclosure this surface makes and it is safe here — the caller is
+	//   authenticated as the person asking, and the alternative is a change that
+	//   fails at the last step after two emails and two clicks. It is the same
+	//   answer `POST /v1/users` gives.
+	// * **422 `already_current`** when the new address is the one already on the
+	//   row. Refused rather than treated as a no-op, because a 202 here would
+	//   leave the caller believing a change had been requested and confirmed.
+	//
+	// 201 rather than 202: this is not a message being sent in the background, it
+	// is a change that has been recorded and has a deadline.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/email-changes (the `RequestEmailChange` operationId).
+	RequestEmailChange(ctx context.Context, body RequestEmailChangeJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ConfirmEmailChangeCurrentAddressWithBody Prove control of the address the account has now
+	//
+	// Spends the first token and mails the second one to the **new** address.
+	// Answers 202 with the same constant body every other accepted route gives.
+	//
+	// **The 202 body says nothing about the second link**, and that is the point.
+	// The caller has just proved they can read the current inbox, so they know
+	// they asked for this and know the next message goes to the address they
+	// typed. Naming the destination here would tell a hijacked session — which can
+	// reach this route with a token it does not have — nothing at all, while
+	// telling a legitimate user nothing they need.
+	//
+	// Presenting the second token here is a 404, not a partial success: the two
+	// tokens are for different inboxes and a token that worked on the wrong side
+	// would mean the wrong inbox proved something.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/email-changes/current-address (the `ConfirmEmailChangeCurrentAddress` operationId).
+	ConfirmEmailChangeCurrentAddressWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ConfirmEmailChangeCurrentAddress Prove control of the address the account has now
+	//
+	// Spends the first token and mails the second one to the **new** address.
+	// Answers 202 with the same constant body every other accepted route gives.
+	//
+	// **The 202 body says nothing about the second link**, and that is the point.
+	// The caller has just proved they can read the current inbox, so they know
+	// they asked for this and know the next message goes to the address they
+	// typed. Naming the destination here would tell a hijacked session — which can
+	// reach this route with a token it does not have — nothing at all, while
+	// telling a legitimate user nothing they need.
+	//
+	// Presenting the second token here is a 404, not a partial success: the two
+	// tokens are for different inboxes and a token that worked on the wrong side
+	// would mean the wrong inbox proved something.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/email-changes/current-address (the `ConfirmEmailChangeCurrentAddress` operationId).
+	ConfirmEmailChangeCurrentAddress(ctx context.Context, body ConfirmEmailChangeCurrentAddressJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ConfirmEmailChangeNewAddressWithBody Complete a move to a new address
+	//
+	// Spends the second token: the account's address moves, the verification is
+	// cleared, and every session and every live OIDC access token is revoked — in
+	// one transaction, with the session cookie cleared on the response.
+	//
+	// **It is a 200 with a body rather than a 204**, because this route does
+	// change three things the caller needs to know. A 204 would leave a client to
+	// rediscover all three by making three other requests.
+	//
+	// `email_verified` is **false**, and that is not a bug. Clicking a link proves
+	// you can read an inbox, not that the new address belongs to this account,
+	// and the write that moves the address clears `email_verified_at` in the same
+	// statement. A client rendering "your address is updated" from this body is
+	// correct; a client rendering "your address is verified" is not — prompt for
+	// `POST /v1/email-verifications` instead, which now targets the new address.
+	//
+	// Scoped API keys survive, for the reasons on `confirmPasswordReset`.
+	//
+	// Presenting the first token here is a 404, for the same reason the other way
+	// round is.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/email-changes/new-address (the `ConfirmEmailChangeNewAddress` operationId).
+	ConfirmEmailChangeNewAddressWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ConfirmEmailChangeNewAddress Complete a move to a new address
+	//
+	// Spends the second token: the account's address moves, the verification is
+	// cleared, and every session and every live OIDC access token is revoked — in
+	// one transaction, with the session cookie cleared on the response.
+	//
+	// **It is a 200 with a body rather than a 204**, because this route does
+	// change three things the caller needs to know. A 204 would leave a client to
+	// rediscover all three by making three other requests.
+	//
+	// `email_verified` is **false**, and that is not a bug. Clicking a link proves
+	// you can read an inbox, not that the new address belongs to this account,
+	// and the write that moves the address clears `email_verified_at` in the same
+	// statement. A client rendering "your address is updated" from this body is
+	// correct; a client rendering "your address is verified" is not — prompt for
+	// `POST /v1/email-verifications` instead, which now targets the new address.
+	//
+	// Scoped API keys survive, for the reasons on `confirmPasswordReset`.
+	//
+	// Presenting the first token here is a 404, for the same reason the other way
+	// round is.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/email-changes/new-address (the `ConfirmEmailChangeNewAddress` operationId).
+	ConfirmEmailChangeNewAddress(ctx context.Context, body ConfirmEmailChangeNewAddressJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetEmailVerificationStatus Whether the caller's own address is proved
+	//
+	// The caller's verification state, and nothing else.
+	//
+	// **It is a separate route rather than a field on `GET /v1/me`**, and the
+	// reason is a test: `/v1/me`'s projection is asserted field-by-field to be
+	// exactly `id` and `email`, so adding `email_verified` there would either
+	// break that invariant or weaken it. And "is this address proved" is not the
+	// question "who am I" — a settings page asks the first, an app asks the
+	// second.
+	//
+	// `email_verified_at` is **absent** when the address has never been verified,
+	// which is different from an epoch timestamp, and different again from
+	// `email_verified: false` on an address that was proved and then changed:
+	// changing an address clears the verification, so the two unverified states
+	// are genuinely different and a client may want to tell them apart.
+	//
+	// A `200` for every signed-in account, never a 404 for an unverified one: the
+	// question has an answer for everybody, and a 404 would be indistinguishable
+	// from "this is not your account".
+	//
+	// Corresponds with GET /v1/email-verification (the `GetEmailVerificationStatus` operationId).
+	GetEmailVerificationStatus(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RequestEmailVerificationWithBody Ask for a link that proves the account's address
+	//
+	// Mails a link to the account's registered address, valid for 24 hours.
+	//
+	// **The address is the one on the account, never one the request supplies.**
+	// There is no `email` in the body that means "verify this address" — the body
+	// carries the address to look the account up by, and what gets proved is the
+	// address already stored on the row. A token that verified whatever address the
+	// request carried would be a registration of somebody else's inbox.
+	//
+	// Verification is not automatic at registration. `POST /v1/users` does not
+	// send anything, and a client that wants an address proved calls this route
+	// afterwards. That is one extra call in exchange for a registration that
+	// cannot fail because a mail provider is down.
+	//
+	// Same answer for every address, same constant body, same 202, and the same
+	// one-minute cooldown that sends nothing rather than superseding a live link —
+	// for the reasons on `requestPasswordReset`, which this route mirrors.
+	//
+	// 409 if the account's address is **already** verified. It is a 409 rather
+	// than a silent 202 because a client rendering "check your inbox" on the
+	// strength of a 202 it should never have been given tells a user to watch an
+	// inbox nothing is going to arrive in.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/email-verifications (the `RequestEmailVerification` operationId).
+	RequestEmailVerificationWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RequestEmailVerification Ask for a link that proves the account's address
+	//
+	// Mails a link to the account's registered address, valid for 24 hours.
+	//
+	// **The address is the one on the account, never one the request supplies.**
+	// There is no `email` in the body that means "verify this address" — the body
+	// carries the address to look the account up by, and what gets proved is the
+	// address already stored on the row. A token that verified whatever address the
+	// request carried would be a registration of somebody else's inbox.
+	//
+	// Verification is not automatic at registration. `POST /v1/users` does not
+	// send anything, and a client that wants an address proved calls this route
+	// afterwards. That is one extra call in exchange for a registration that
+	// cannot fail because a mail provider is down.
+	//
+	// Same answer for every address, same constant body, same 202, and the same
+	// one-minute cooldown that sends nothing rather than superseding a live link —
+	// for the reasons on `requestPasswordReset`, which this route mirrors.
+	//
+	// 409 if the account's address is **already** verified. It is a 409 rather
+	// than a silent 202 because a client rendering "check your inbox" on the
+	// strength of a 202 it should never have been given tells a user to watch an
+	// inbox nothing is going to arrive in.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/email-verifications (the `RequestEmailVerification` operationId).
+	RequestEmailVerification(ctx context.Context, body RequestEmailVerificationJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ConfirmEmailVerificationWithBody Spend a verification link
+	//
+	// Sets `email_verified_at` on the account and returns 204.
+	//
+	// **It revokes nothing and mints nothing.** A verification is not a credential
+	// — it is a fact about an address, and a link that sets a boolean changes no
+	// secret. Ending every session over it would punish somebody for clicking a
+	// link that proved who they already were, and minting a session here would be
+	// a second way to turn a mailbox into a credential.
+	//
+	// 404 for every token that is not live, for the reasons on
+	// `confirmPasswordReset`.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/email-verifications/confirm (the `ConfirmEmailVerification` operationId).
+	ConfirmEmailVerificationWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ConfirmEmailVerification Spend a verification link
+	//
+	// Sets `email_verified_at` on the account and returns 204.
+	//
+	// **It revokes nothing and mints nothing.** A verification is not a credential
+	// — it is a fact about an address, and a link that sets a boolean changes no
+	// secret. Ending every session over it would punish somebody for clicking a
+	// link that proved who they already were, and minting a session here would be
+	// a second way to turn a mailbox into a credential.
+	//
+	// 404 for every token that is not live, for the reasons on
+	// `confirmPasswordReset`.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/email-verifications/confirm (the `ConfirmEmailVerification` operationId).
+	ConfirmEmailVerification(ctx context.Context, body ConfirmEmailVerificationJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// IntrospectAPIKeyWithBody Resolve a presented API token to its claims
 	//
 	// Asks "what may this token do, and for which account". It exists because the
@@ -2158,6 +2600,150 @@ type ClientInterface interface {
 	//
 	// Corresponds with POST /v1/mfa/recovery-codes (the `RegenerateMFARecoveryCodes` operationId).
 	RegenerateMFARecoveryCodes(ctx context.Context, body RegenerateMFARecoveryCodesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RequestPasswordResetWithBody Ask for a password-reset link
+	//
+	// Mails a single-use link to the account's registered address, valid for 30
+	// minutes.
+	//
+	// **The response is the same for every address, and the body is a constant.**
+	// A registered address, an unregistered one and an address inside the
+	// one-minute cooldown all get `202 {"status":"accepted"}` with identical
+	// bytes. This is the entire account-enumeration defence on this route, and it
+	// is why `acceptedResponse` in the handler is a constant rather than a template
+	// with a field that happens to render the same either way: a field is a field,
+	// and the next person to add an `expires_at` to it reinstates the oracle
+	// without touching a test.
+	//
+	// The status is 202, not 200 and not 204. The request *was* accepted for
+	// processing; whether the message is delivered is not something the caller is
+	// entitled to learn before they have proved which account they are asking
+	// about.
+	//
+	// **A second request inside the cooldown sends nothing at all**, and answers
+	// identically. It does not supersede the first link: a request route that
+	// invalidated a live token would let anybody invalidate a victim's pending
+	// reset, which is a denial of recovery dressed up as a convenience.
+	//
+	// A cooldown is not a rate limiter, and this service does not have one here.
+	// It bounds mail to one message per address per minute, which stops the
+	// obvious abuse of an anonymous endpoint pointed at one victim. It does
+	// nothing about a flood spread across a thousand addresses and is not
+	// per-client. Per-source throttling belongs to courier, which is in the path
+	// of every message this service sends.
+	//
+	// Resetting revokes **sessions and OIDC access tokens** when the link is
+	// redeemed, and **not** scoped API keys — the same rule the second-factor
+	// removal already follows, and the reason is the same.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/password-resets (the `RequestPasswordReset` operationId).
+	RequestPasswordResetWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RequestPasswordReset Ask for a password-reset link
+	//
+	// Mails a single-use link to the account's registered address, valid for 30
+	// minutes.
+	//
+	// **The response is the same for every address, and the body is a constant.**
+	// A registered address, an unregistered one and an address inside the
+	// one-minute cooldown all get `202 {"status":"accepted"}` with identical
+	// bytes. This is the entire account-enumeration defence on this route, and it
+	// is why `acceptedResponse` in the handler is a constant rather than a template
+	// with a field that happens to render the same either way: a field is a field,
+	// and the next person to add an `expires_at` to it reinstates the oracle
+	// without touching a test.
+	//
+	// The status is 202, not 200 and not 204. The request *was* accepted for
+	// processing; whether the message is delivered is not something the caller is
+	// entitled to learn before they have proved which account they are asking
+	// about.
+	//
+	// **A second request inside the cooldown sends nothing at all**, and answers
+	// identically. It does not supersede the first link: a request route that
+	// invalidated a live token would let anybody invalidate a victim's pending
+	// reset, which is a denial of recovery dressed up as a convenience.
+	//
+	// A cooldown is not a rate limiter, and this service does not have one here.
+	// It bounds mail to one message per address per minute, which stops the
+	// obvious abuse of an anonymous endpoint pointed at one victim. It does
+	// nothing about a flood spread across a thousand addresses and is not
+	// per-client. Per-source throttling belongs to courier, which is in the path
+	// of every message this service sends.
+	//
+	// Resetting revokes **sessions and OIDC access tokens** when the link is
+	// redeemed, and **not** scoped API keys — the same rule the second-factor
+	// removal already follows, and the reason is the same.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/password-resets (the `RequestPasswordReset` operationId).
+	RequestPasswordReset(ctx context.Context, body RequestPasswordResetJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ConfirmPasswordResetWithBody Spend a reset link and set a new password
+	//
+	// Changes the password and revokes every session and every live OIDC access
+	// token the account holds, in one transaction.
+	//
+	// The revocation is why this is 204 and not a 200 with a session in it: the
+	// caller's own session is revoked by the same write that changes the
+	// password, so a caller that was signed in when it started is signed out when
+	// it finishes and cannot use this route to keep itself signed in. **No session
+	// is minted** — that would be a second way to turn a mailbox into a
+	// credential without answering a second factor. Sign in again with the new
+	// password.
+	//
+	// The session cookie is cleared on the response as well as the row revoked, so
+	// a browser is not left holding a credential this request just killed.
+	//
+	// **404 for everything that is not a live token**: one that never existed, one
+	// that expired, one already spent, and one minted for a different flow. It is
+	// 404 and not 401 because the caller is not asking who they are — they are
+	// following a link, and "there is no such link" is also what they learn about
+	// every link they did not receive.
+	//
+	// Scoped API keys survive. This is the same rule `DELETE /v1/mfa` already
+	// follows and the same reason: a key is a credential somebody deliberately
+	// created and handed to a script, and a person who forgot their password is
+	// not necessarily the person who owns it.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/password-resets/confirm (the `ConfirmPasswordReset` operationId).
+	ConfirmPasswordResetWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ConfirmPasswordReset Spend a reset link and set a new password
+	//
+	// Changes the password and revokes every session and every live OIDC access
+	// token the account holds, in one transaction.
+	//
+	// The revocation is why this is 204 and not a 200 with a session in it: the
+	// caller's own session is revoked by the same write that changes the
+	// password, so a caller that was signed in when it started is signed out when
+	// it finishes and cannot use this route to keep itself signed in. **No session
+	// is minted** — that would be a second way to turn a mailbox into a
+	// credential without answering a second factor. Sign in again with the new
+	// password.
+	//
+	// The session cookie is cleared on the response as well as the row revoked, so
+	// a browser is not left holding a credential this request just killed.
+	//
+	// **404 for everything that is not a live token**: one that never existed, one
+	// that expired, one already spent, and one minted for a different flow. It is
+	// 404 and not 401 because the caller is not asking who they are — they are
+	// following a link, and "there is no such link" is also what they learn about
+	// every link they did not receive.
+	//
+	// Scoped API keys survive. This is the same rule `DELETE /v1/mfa` already
+	// follows and the same reason: a key is a credential somebody deliberately
+	// created and handed to a script, and a person who forgot their password is
+	// not necessarily the person who owns it.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/password-resets/confirm (the `ConfirmPasswordReset` operationId).
+	ConfirmPasswordReset(ctx context.Context, body ConfirmPasswordResetJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// DeleteSession Log out
 	//
@@ -3024,6 +3610,406 @@ func (c *Client) GetOIDCClient(ctx context.Context, accountID AccountID, clientI
 	return c.Client.Do(req)
 }
 
+// RequestEmailChangeWithBody Start a move to a new address
+//
+// Records the intent and mails a link to the address the account has **now**.
+// Nothing moves yet: this creates the first of two tokens, and the second
+// does not exist until the first is redeemed.
+//
+// That ordering is the whole of the hijack property. A stolen session can
+// reach this route, and what it produces is a link in the victim's inbox and
+// nowhere else — the attacker cannot advance the change, and the victim gets a
+// message saying their address is being changed, which is the only warning
+// they would otherwise get. A single-token design, where the link goes to the
+// NEW address and completing it moves the account, is a takeover on anybody
+// who can read the new inbox and nothing else.
+//
+// **Session only.** There is no scope in the machine vocabulary for "may move
+// an account's recovery path", and there is not going to be one. A scoped API
+// token is refused on all eight routes of this surface.
+//
+// Two refusals are worth reading, because both are the alternative being
+// rejected:
+//
+//   - **409** when the new address already has an account. This is the one
+//     disclosure this surface makes and it is safe here — the caller is
+//     authenticated as the person asking, and the alternative is a change that
+//     fails at the last step after two emails and two clicks. It is the same
+//     answer `POST /v1/users` gives.
+//   - **422 `already_current`** when the new address is the one already on the
+//     row. Refused rather than treated as a no-op, because a 202 here would
+//     leave the caller believing a change had been requested and confirmed.
+//
+// 201 rather than 202: this is not a message being sent in the background, it
+// is a change that has been recorded and has a deadline.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/email-changes (the `RequestEmailChange` operationId).
+func (c *Client) RequestEmailChangeWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRequestEmailChangeRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RequestEmailChange Start a move to a new address
+//
+// Records the intent and mails a link to the address the account has **now**.
+// Nothing moves yet: this creates the first of two tokens, and the second
+// does not exist until the first is redeemed.
+//
+// That ordering is the whole of the hijack property. A stolen session can
+// reach this route, and what it produces is a link in the victim's inbox and
+// nowhere else — the attacker cannot advance the change, and the victim gets a
+// message saying their address is being changed, which is the only warning
+// they would otherwise get. A single-token design, where the link goes to the
+// NEW address and completing it moves the account, is a takeover on anybody
+// who can read the new inbox and nothing else.
+//
+// **Session only.** There is no scope in the machine vocabulary for "may move
+// an account's recovery path", and there is not going to be one. A scoped API
+// token is refused on all eight routes of this surface.
+//
+// Two refusals are worth reading, because both are the alternative being
+// rejected:
+//
+//   - **409** when the new address already has an account. This is the one
+//     disclosure this surface makes and it is safe here — the caller is
+//     authenticated as the person asking, and the alternative is a change that
+//     fails at the last step after two emails and two clicks. It is the same
+//     answer `POST /v1/users` gives.
+//   - **422 `already_current`** when the new address is the one already on the
+//     row. Refused rather than treated as a no-op, because a 202 here would
+//     leave the caller believing a change had been requested and confirmed.
+//
+// 201 rather than 202: this is not a message being sent in the background, it
+// is a change that has been recorded and has a deadline.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/email-changes (the `RequestEmailChange` operationId).
+func (c *Client) RequestEmailChange(ctx context.Context, body RequestEmailChangeJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRequestEmailChangeRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ConfirmEmailChangeCurrentAddressWithBody Prove control of the address the account has now
+//
+// Spends the first token and mails the second one to the **new** address.
+// Answers 202 with the same constant body every other accepted route gives.
+//
+// **The 202 body says nothing about the second link**, and that is the point.
+// The caller has just proved they can read the current inbox, so they know
+// they asked for this and know the next message goes to the address they
+// typed. Naming the destination here would tell a hijacked session — which can
+// reach this route with a token it does not have — nothing at all, while
+// telling a legitimate user nothing they need.
+//
+// Presenting the second token here is a 404, not a partial success: the two
+// tokens are for different inboxes and a token that worked on the wrong side
+// would mean the wrong inbox proved something.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/email-changes/current-address (the `ConfirmEmailChangeCurrentAddress` operationId).
+func (c *Client) ConfirmEmailChangeCurrentAddressWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewConfirmEmailChangeCurrentAddressRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ConfirmEmailChangeCurrentAddress Prove control of the address the account has now
+//
+// Spends the first token and mails the second one to the **new** address.
+// Answers 202 with the same constant body every other accepted route gives.
+//
+// **The 202 body says nothing about the second link**, and that is the point.
+// The caller has just proved they can read the current inbox, so they know
+// they asked for this and know the next message goes to the address they
+// typed. Naming the destination here would tell a hijacked session — which can
+// reach this route with a token it does not have — nothing at all, while
+// telling a legitimate user nothing they need.
+//
+// Presenting the second token here is a 404, not a partial success: the two
+// tokens are for different inboxes and a token that worked on the wrong side
+// would mean the wrong inbox proved something.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/email-changes/current-address (the `ConfirmEmailChangeCurrentAddress` operationId).
+func (c *Client) ConfirmEmailChangeCurrentAddress(ctx context.Context, body ConfirmEmailChangeCurrentAddressJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewConfirmEmailChangeCurrentAddressRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ConfirmEmailChangeNewAddressWithBody Complete a move to a new address
+//
+// Spends the second token: the account's address moves, the verification is
+// cleared, and every session and every live OIDC access token is revoked — in
+// one transaction, with the session cookie cleared on the response.
+//
+// **It is a 200 with a body rather than a 204**, because this route does
+// change three things the caller needs to know. A 204 would leave a client to
+// rediscover all three by making three other requests.
+//
+// `email_verified` is **false**, and that is not a bug. Clicking a link proves
+// you can read an inbox, not that the new address belongs to this account,
+// and the write that moves the address clears `email_verified_at` in the same
+// statement. A client rendering "your address is updated" from this body is
+// correct; a client rendering "your address is verified" is not — prompt for
+// `POST /v1/email-verifications` instead, which now targets the new address.
+//
+// Scoped API keys survive, for the reasons on `confirmPasswordReset`.
+//
+// Presenting the first token here is a 404, for the same reason the other way
+// round is.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/email-changes/new-address (the `ConfirmEmailChangeNewAddress` operationId).
+func (c *Client) ConfirmEmailChangeNewAddressWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewConfirmEmailChangeNewAddressRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ConfirmEmailChangeNewAddress Complete a move to a new address
+//
+// Spends the second token: the account's address moves, the verification is
+// cleared, and every session and every live OIDC access token is revoked — in
+// one transaction, with the session cookie cleared on the response.
+//
+// **It is a 200 with a body rather than a 204**, because this route does
+// change three things the caller needs to know. A 204 would leave a client to
+// rediscover all three by making three other requests.
+//
+// `email_verified` is **false**, and that is not a bug. Clicking a link proves
+// you can read an inbox, not that the new address belongs to this account,
+// and the write that moves the address clears `email_verified_at` in the same
+// statement. A client rendering "your address is updated" from this body is
+// correct; a client rendering "your address is verified" is not — prompt for
+// `POST /v1/email-verifications` instead, which now targets the new address.
+//
+// Scoped API keys survive, for the reasons on `confirmPasswordReset`.
+//
+// Presenting the first token here is a 404, for the same reason the other way
+// round is.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/email-changes/new-address (the `ConfirmEmailChangeNewAddress` operationId).
+func (c *Client) ConfirmEmailChangeNewAddress(ctx context.Context, body ConfirmEmailChangeNewAddressJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewConfirmEmailChangeNewAddressRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetEmailVerificationStatus Whether the caller's own address is proved
+//
+// The caller's verification state, and nothing else.
+//
+// **It is a separate route rather than a field on `GET /v1/me`**, and the
+// reason is a test: `/v1/me`'s projection is asserted field-by-field to be
+// exactly `id` and `email`, so adding `email_verified` there would either
+// break that invariant or weaken it. And "is this address proved" is not the
+// question "who am I" — a settings page asks the first, an app asks the
+// second.
+//
+// `email_verified_at` is **absent** when the address has never been verified,
+// which is different from an epoch timestamp, and different again from
+// `email_verified: false` on an address that was proved and then changed:
+// changing an address clears the verification, so the two unverified states
+// are genuinely different and a client may want to tell them apart.
+//
+// A `200` for every signed-in account, never a 404 for an unverified one: the
+// question has an answer for everybody, and a 404 would be indistinguishable
+// from "this is not your account".
+//
+// Corresponds with GET /v1/email-verification (the `GetEmailVerificationStatus` operationId).
+func (c *Client) GetEmailVerificationStatus(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetEmailVerificationStatusRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RequestEmailVerificationWithBody Ask for a link that proves the account's address
+//
+// Mails a link to the account's registered address, valid for 24 hours.
+//
+// **The address is the one on the account, never one the request supplies.**
+// There is no `email` in the body that means "verify this address" — the body
+// carries the address to look the account up by, and what gets proved is the
+// address already stored on the row. A token that verified whatever address the
+// request carried would be a registration of somebody else's inbox.
+//
+// Verification is not automatic at registration. `POST /v1/users` does not
+// send anything, and a client that wants an address proved calls this route
+// afterwards. That is one extra call in exchange for a registration that
+// cannot fail because a mail provider is down.
+//
+// Same answer for every address, same constant body, same 202, and the same
+// one-minute cooldown that sends nothing rather than superseding a live link —
+// for the reasons on `requestPasswordReset`, which this route mirrors.
+//
+// 409 if the account's address is **already** verified. It is a 409 rather
+// than a silent 202 because a client rendering "check your inbox" on the
+// strength of a 202 it should never have been given tells a user to watch an
+// inbox nothing is going to arrive in.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/email-verifications (the `RequestEmailVerification` operationId).
+func (c *Client) RequestEmailVerificationWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRequestEmailVerificationRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RequestEmailVerification Ask for a link that proves the account's address
+//
+// Mails a link to the account's registered address, valid for 24 hours.
+//
+// **The address is the one on the account, never one the request supplies.**
+// There is no `email` in the body that means "verify this address" — the body
+// carries the address to look the account up by, and what gets proved is the
+// address already stored on the row. A token that verified whatever address the
+// request carried would be a registration of somebody else's inbox.
+//
+// Verification is not automatic at registration. `POST /v1/users` does not
+// send anything, and a client that wants an address proved calls this route
+// afterwards. That is one extra call in exchange for a registration that
+// cannot fail because a mail provider is down.
+//
+// Same answer for every address, same constant body, same 202, and the same
+// one-minute cooldown that sends nothing rather than superseding a live link —
+// for the reasons on `requestPasswordReset`, which this route mirrors.
+//
+// 409 if the account's address is **already** verified. It is a 409 rather
+// than a silent 202 because a client rendering "check your inbox" on the
+// strength of a 202 it should never have been given tells a user to watch an
+// inbox nothing is going to arrive in.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/email-verifications (the `RequestEmailVerification` operationId).
+func (c *Client) RequestEmailVerification(ctx context.Context, body RequestEmailVerificationJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRequestEmailVerificationRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ConfirmEmailVerificationWithBody Spend a verification link
+//
+// Sets `email_verified_at` on the account and returns 204.
+//
+// **It revokes nothing and mints nothing.** A verification is not a credential
+// — it is a fact about an address, and a link that sets a boolean changes no
+// secret. Ending every session over it would punish somebody for clicking a
+// link that proved who they already were, and minting a session here would be
+// a second way to turn a mailbox into a credential.
+//
+// 404 for every token that is not live, for the reasons on
+// `confirmPasswordReset`.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/email-verifications/confirm (the `ConfirmEmailVerification` operationId).
+func (c *Client) ConfirmEmailVerificationWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewConfirmEmailVerificationRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ConfirmEmailVerification Spend a verification link
+//
+// Sets `email_verified_at` on the account and returns 204.
+//
+// **It revokes nothing and mints nothing.** A verification is not a credential
+// — it is a fact about an address, and a link that sets a boolean changes no
+// secret. Ending every session over it would punish somebody for clicking a
+// link that proved who they already were, and minting a session here would be
+// a second way to turn a mailbox into a credential.
+//
+// 404 for every token that is not live, for the reasons on
+// `confirmPasswordReset`.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/email-verifications/confirm (the `ConfirmEmailVerification` operationId).
+func (c *Client) ConfirmEmailVerification(ctx context.Context, body ConfirmEmailVerificationJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewConfirmEmailVerificationRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 // IntrospectAPIKeyWithBody Resolve a presented API token to its claims
 //
 // Asks "what may this token do, and for which account". It exists because the
@@ -3442,6 +4428,190 @@ func (c *Client) RegenerateMFARecoveryCodesWithBody(ctx context.Context, content
 // Corresponds with POST /v1/mfa/recovery-codes (the `RegenerateMFARecoveryCodes` operationId).
 func (c *Client) RegenerateMFARecoveryCodes(ctx context.Context, body RegenerateMFARecoveryCodesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewRegenerateMFARecoveryCodesRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RequestPasswordResetWithBody Ask for a password-reset link
+//
+// Mails a single-use link to the account's registered address, valid for 30
+// minutes.
+//
+// **The response is the same for every address, and the body is a constant.**
+// A registered address, an unregistered one and an address inside the
+// one-minute cooldown all get `202 {"status":"accepted"}` with identical
+// bytes. This is the entire account-enumeration defence on this route, and it
+// is why `acceptedResponse` in the handler is a constant rather than a template
+// with a field that happens to render the same either way: a field is a field,
+// and the next person to add an `expires_at` to it reinstates the oracle
+// without touching a test.
+//
+// The status is 202, not 200 and not 204. The request *was* accepted for
+// processing; whether the message is delivered is not something the caller is
+// entitled to learn before they have proved which account they are asking
+// about.
+//
+// **A second request inside the cooldown sends nothing at all**, and answers
+// identically. It does not supersede the first link: a request route that
+// invalidated a live token would let anybody invalidate a victim's pending
+// reset, which is a denial of recovery dressed up as a convenience.
+//
+// A cooldown is not a rate limiter, and this service does not have one here.
+// It bounds mail to one message per address per minute, which stops the
+// obvious abuse of an anonymous endpoint pointed at one victim. It does
+// nothing about a flood spread across a thousand addresses and is not
+// per-client. Per-source throttling belongs to courier, which is in the path
+// of every message this service sends.
+//
+// Resetting revokes **sessions and OIDC access tokens** when the link is
+// redeemed, and **not** scoped API keys — the same rule the second-factor
+// removal already follows, and the reason is the same.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/password-resets (the `RequestPasswordReset` operationId).
+func (c *Client) RequestPasswordResetWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRequestPasswordResetRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RequestPasswordReset Ask for a password-reset link
+//
+// Mails a single-use link to the account's registered address, valid for 30
+// minutes.
+//
+// **The response is the same for every address, and the body is a constant.**
+// A registered address, an unregistered one and an address inside the
+// one-minute cooldown all get `202 {"status":"accepted"}` with identical
+// bytes. This is the entire account-enumeration defence on this route, and it
+// is why `acceptedResponse` in the handler is a constant rather than a template
+// with a field that happens to render the same either way: a field is a field,
+// and the next person to add an `expires_at` to it reinstates the oracle
+// without touching a test.
+//
+// The status is 202, not 200 and not 204. The request *was* accepted for
+// processing; whether the message is delivered is not something the caller is
+// entitled to learn before they have proved which account they are asking
+// about.
+//
+// **A second request inside the cooldown sends nothing at all**, and answers
+// identically. It does not supersede the first link: a request route that
+// invalidated a live token would let anybody invalidate a victim's pending
+// reset, which is a denial of recovery dressed up as a convenience.
+//
+// A cooldown is not a rate limiter, and this service does not have one here.
+// It bounds mail to one message per address per minute, which stops the
+// obvious abuse of an anonymous endpoint pointed at one victim. It does
+// nothing about a flood spread across a thousand addresses and is not
+// per-client. Per-source throttling belongs to courier, which is in the path
+// of every message this service sends.
+//
+// Resetting revokes **sessions and OIDC access tokens** when the link is
+// redeemed, and **not** scoped API keys — the same rule the second-factor
+// removal already follows, and the reason is the same.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/password-resets (the `RequestPasswordReset` operationId).
+func (c *Client) RequestPasswordReset(ctx context.Context, body RequestPasswordResetJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRequestPasswordResetRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ConfirmPasswordResetWithBody Spend a reset link and set a new password
+//
+// Changes the password and revokes every session and every live OIDC access
+// token the account holds, in one transaction.
+//
+// The revocation is why this is 204 and not a 200 with a session in it: the
+// caller's own session is revoked by the same write that changes the
+// password, so a caller that was signed in when it started is signed out when
+// it finishes and cannot use this route to keep itself signed in. **No session
+// is minted** — that would be a second way to turn a mailbox into a
+// credential without answering a second factor. Sign in again with the new
+// password.
+//
+// The session cookie is cleared on the response as well as the row revoked, so
+// a browser is not left holding a credential this request just killed.
+//
+// **404 for everything that is not a live token**: one that never existed, one
+// that expired, one already spent, and one minted for a different flow. It is
+// 404 and not 401 because the caller is not asking who they are — they are
+// following a link, and "there is no such link" is also what they learn about
+// every link they did not receive.
+//
+// Scoped API keys survive. This is the same rule `DELETE /v1/mfa` already
+// follows and the same reason: a key is a credential somebody deliberately
+// created and handed to a script, and a person who forgot their password is
+// not necessarily the person who owns it.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/password-resets/confirm (the `ConfirmPasswordReset` operationId).
+func (c *Client) ConfirmPasswordResetWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewConfirmPasswordResetRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ConfirmPasswordReset Spend a reset link and set a new password
+//
+// Changes the password and revokes every session and every live OIDC access
+// token the account holds, in one transaction.
+//
+// The revocation is why this is 204 and not a 200 with a session in it: the
+// caller's own session is revoked by the same write that changes the
+// password, so a caller that was signed in when it started is signed out when
+// it finishes and cannot use this route to keep itself signed in. **No session
+// is minted** — that would be a second way to turn a mailbox into a
+// credential without answering a second factor. Sign in again with the new
+// password.
+//
+// The session cookie is cleared on the response as well as the row revoked, so
+// a browser is not left holding a credential this request just killed.
+//
+// **404 for everything that is not a live token**: one that never existed, one
+// that expired, one already spent, and one minted for a different flow. It is
+// 404 and not 401 because the caller is not asking who they are — they are
+// following a link, and "there is no such link" is also what they learn about
+// every link they did not receive.
+//
+// Scoped API keys survive. This is the same rule `DELETE /v1/mfa` already
+// follows and the same reason: a key is a credential somebody deliberately
+// created and handed to a script, and a person who forgot their password is
+// not necessarily the person who owns it.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/password-resets/confirm (the `ConfirmPasswordReset` operationId).
+func (c *Client) ConfirmPasswordReset(ctx context.Context, body ConfirmPasswordResetJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewConfirmPasswordResetRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
@@ -4235,6 +5405,233 @@ func NewGetOIDCClientRequest(server string, accountID AccountID, clientID openap
 	return req, nil
 }
 
+// NewRequestEmailChangeRequest calls the generic RequestEmailChange builder with application/json body
+func NewRequestEmailChangeRequest(server string, body RequestEmailChangeJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRequestEmailChangeRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewRequestEmailChangeRequestWithBody constructs an http.Request for the RequestEmailChange method, with any body, and a specified content type
+func NewRequestEmailChangeRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/email-changes")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewConfirmEmailChangeCurrentAddressRequest calls the generic ConfirmEmailChangeCurrentAddress builder with application/json body
+func NewConfirmEmailChangeCurrentAddressRequest(server string, body ConfirmEmailChangeCurrentAddressJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewConfirmEmailChangeCurrentAddressRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewConfirmEmailChangeCurrentAddressRequestWithBody constructs an http.Request for the ConfirmEmailChangeCurrentAddress method, with any body, and a specified content type
+func NewConfirmEmailChangeCurrentAddressRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/email-changes/current-address")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewConfirmEmailChangeNewAddressRequest calls the generic ConfirmEmailChangeNewAddress builder with application/json body
+func NewConfirmEmailChangeNewAddressRequest(server string, body ConfirmEmailChangeNewAddressJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewConfirmEmailChangeNewAddressRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewConfirmEmailChangeNewAddressRequestWithBody constructs an http.Request for the ConfirmEmailChangeNewAddress method, with any body, and a specified content type
+func NewConfirmEmailChangeNewAddressRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/email-changes/new-address")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewGetEmailVerificationStatusRequest constructs an http.Request for the GetEmailVerificationStatus method
+func NewGetEmailVerificationStatusRequest(server string) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/email-verification")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewRequestEmailVerificationRequest calls the generic RequestEmailVerification builder with application/json body
+func NewRequestEmailVerificationRequest(server string, body RequestEmailVerificationJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRequestEmailVerificationRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewRequestEmailVerificationRequestWithBody constructs an http.Request for the RequestEmailVerification method, with any body, and a specified content type
+func NewRequestEmailVerificationRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/email-verifications")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewConfirmEmailVerificationRequest calls the generic ConfirmEmailVerification builder with application/json body
+func NewConfirmEmailVerificationRequest(server string, body ConfirmEmailVerificationJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewConfirmEmailVerificationRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewConfirmEmailVerificationRequestWithBody constructs an http.Request for the ConfirmEmailVerification method, with any body, and a specified content type
+func NewConfirmEmailVerificationRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/email-verifications/confirm")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewIntrospectAPIKeyRequest calls the generic IntrospectAPIKey builder with application/json body
 func NewIntrospectAPIKeyRequest(server string, body IntrospectAPIKeyJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -4477,6 +5874,86 @@ func NewRegenerateMFARecoveryCodesRequestWithBody(server string, contentType str
 	}
 
 	operationPath := fmt.Sprintf("/v1/mfa/recovery-codes")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewRequestPasswordResetRequest calls the generic RequestPasswordReset builder with application/json body
+func NewRequestPasswordResetRequest(server string, body RequestPasswordResetJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRequestPasswordResetRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewRequestPasswordResetRequestWithBody constructs an http.Request for the RequestPasswordReset method, with any body, and a specified content type
+func NewRequestPasswordResetRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/password-resets")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewConfirmPasswordResetRequest calls the generic ConfirmPasswordReset builder with application/json body
+func NewConfirmPasswordResetRequest(server string, body ConfirmPasswordResetJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewConfirmPasswordResetRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewConfirmPasswordResetRequestWithBody constructs an http.Request for the ConfirmPasswordReset method, with any body, and a specified content type
+func NewConfirmPasswordResetRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/password-resets/confirm")
 	if operationPath[0] == '/' {
 		operationPath = "." + operationPath
 	}
@@ -5207,6 +6684,298 @@ type ClientWithResponsesInterface interface {
 	// Corresponds with GET /v1/accounts/{account_id}/oidc-clients/{client_id} (the `GetOIDCClient` operationId).
 	GetOIDCClientWithResponse(ctx context.Context, accountID AccountID, clientID openapi_types.UUID, reqEditors ...RequestEditorFn) (*GetOIDCClientResponse, error)
 
+	// RequestEmailChangeWithBodyWithResponse Start a move to a new address
+	//
+	// Records the intent and mails a link to the address the account has **now**.
+	// Nothing moves yet: this creates the first of two tokens, and the second
+	// does not exist until the first is redeemed.
+	//
+	// That ordering is the whole of the hijack property. A stolen session can
+	// reach this route, and what it produces is a link in the victim's inbox and
+	// nowhere else — the attacker cannot advance the change, and the victim gets a
+	// message saying their address is being changed, which is the only warning
+	// they would otherwise get. A single-token design, where the link goes to the
+	// NEW address and completing it moves the account, is a takeover on anybody
+	// who can read the new inbox and nothing else.
+	//
+	// **Session only.** There is no scope in the machine vocabulary for "may move
+	// an account's recovery path", and there is not going to be one. A scoped API
+	// token is refused on all eight routes of this surface.
+	//
+	// Two refusals are worth reading, because both are the alternative being
+	// rejected:
+	//
+	// * **409** when the new address already has an account. This is the one
+	//   disclosure this surface makes and it is safe here — the caller is
+	//   authenticated as the person asking, and the alternative is a change that
+	//   fails at the last step after two emails and two clicks. It is the same
+	//   answer `POST /v1/users` gives.
+	// * **422 `already_current`** when the new address is the one already on the
+	//   row. Refused rather than treated as a no-op, because a 202 here would
+	//   leave the caller believing a change had been requested and confirmed.
+	//
+	// 201 rather than 202: this is not a message being sent in the background, it
+	// is a change that has been recorded and has a deadline.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/email-changes (the `RequestEmailChange` operationId).
+	RequestEmailChangeWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RequestEmailChangeResponse, error)
+
+	// RequestEmailChangeWithResponse Start a move to a new address
+	//
+	// Records the intent and mails a link to the address the account has **now**.
+	// Nothing moves yet: this creates the first of two tokens, and the second
+	// does not exist until the first is redeemed.
+	//
+	// That ordering is the whole of the hijack property. A stolen session can
+	// reach this route, and what it produces is a link in the victim's inbox and
+	// nowhere else — the attacker cannot advance the change, and the victim gets a
+	// message saying their address is being changed, which is the only warning
+	// they would otherwise get. A single-token design, where the link goes to the
+	// NEW address and completing it moves the account, is a takeover on anybody
+	// who can read the new inbox and nothing else.
+	//
+	// **Session only.** There is no scope in the machine vocabulary for "may move
+	// an account's recovery path", and there is not going to be one. A scoped API
+	// token is refused on all eight routes of this surface.
+	//
+	// Two refusals are worth reading, because both are the alternative being
+	// rejected:
+	//
+	// * **409** when the new address already has an account. This is the one
+	//   disclosure this surface makes and it is safe here — the caller is
+	//   authenticated as the person asking, and the alternative is a change that
+	//   fails at the last step after two emails and two clicks. It is the same
+	//   answer `POST /v1/users` gives.
+	// * **422 `already_current`** when the new address is the one already on the
+	//   row. Refused rather than treated as a no-op, because a 202 here would
+	//   leave the caller believing a change had been requested and confirmed.
+	//
+	// 201 rather than 202: this is not a message being sent in the background, it
+	// is a change that has been recorded and has a deadline.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/email-changes (the `RequestEmailChange` operationId).
+	RequestEmailChangeWithResponse(ctx context.Context, body RequestEmailChangeJSONRequestBody, reqEditors ...RequestEditorFn) (*RequestEmailChangeResponse, error)
+
+	// ConfirmEmailChangeCurrentAddressWithBodyWithResponse Prove control of the address the account has now
+	//
+	// Spends the first token and mails the second one to the **new** address.
+	// Answers 202 with the same constant body every other accepted route gives.
+	//
+	// **The 202 body says nothing about the second link**, and that is the point.
+	// The caller has just proved they can read the current inbox, so they know
+	// they asked for this and know the next message goes to the address they
+	// typed. Naming the destination here would tell a hijacked session — which can
+	// reach this route with a token it does not have — nothing at all, while
+	// telling a legitimate user nothing they need.
+	//
+	// Presenting the second token here is a 404, not a partial success: the two
+	// tokens are for different inboxes and a token that worked on the wrong side
+	// would mean the wrong inbox proved something.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/email-changes/current-address (the `ConfirmEmailChangeCurrentAddress` operationId).
+	ConfirmEmailChangeCurrentAddressWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ConfirmEmailChangeCurrentAddressResponse, error)
+
+	// ConfirmEmailChangeCurrentAddressWithResponse Prove control of the address the account has now
+	//
+	// Spends the first token and mails the second one to the **new** address.
+	// Answers 202 with the same constant body every other accepted route gives.
+	//
+	// **The 202 body says nothing about the second link**, and that is the point.
+	// The caller has just proved they can read the current inbox, so they know
+	// they asked for this and know the next message goes to the address they
+	// typed. Naming the destination here would tell a hijacked session — which can
+	// reach this route with a token it does not have — nothing at all, while
+	// telling a legitimate user nothing they need.
+	//
+	// Presenting the second token here is a 404, not a partial success: the two
+	// tokens are for different inboxes and a token that worked on the wrong side
+	// would mean the wrong inbox proved something.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/email-changes/current-address (the `ConfirmEmailChangeCurrentAddress` operationId).
+	ConfirmEmailChangeCurrentAddressWithResponse(ctx context.Context, body ConfirmEmailChangeCurrentAddressJSONRequestBody, reqEditors ...RequestEditorFn) (*ConfirmEmailChangeCurrentAddressResponse, error)
+
+	// ConfirmEmailChangeNewAddressWithBodyWithResponse Complete a move to a new address
+	//
+	// Spends the second token: the account's address moves, the verification is
+	// cleared, and every session and every live OIDC access token is revoked — in
+	// one transaction, with the session cookie cleared on the response.
+	//
+	// **It is a 200 with a body rather than a 204**, because this route does
+	// change three things the caller needs to know. A 204 would leave a client to
+	// rediscover all three by making three other requests.
+	//
+	// `email_verified` is **false**, and that is not a bug. Clicking a link proves
+	// you can read an inbox, not that the new address belongs to this account,
+	// and the write that moves the address clears `email_verified_at` in the same
+	// statement. A client rendering "your address is updated" from this body is
+	// correct; a client rendering "your address is verified" is not — prompt for
+	// `POST /v1/email-verifications` instead, which now targets the new address.
+	//
+	// Scoped API keys survive, for the reasons on `confirmPasswordReset`.
+	//
+	// Presenting the first token here is a 404, for the same reason the other way
+	// round is.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/email-changes/new-address (the `ConfirmEmailChangeNewAddress` operationId).
+	ConfirmEmailChangeNewAddressWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ConfirmEmailChangeNewAddressResponse, error)
+
+	// ConfirmEmailChangeNewAddressWithResponse Complete a move to a new address
+	//
+	// Spends the second token: the account's address moves, the verification is
+	// cleared, and every session and every live OIDC access token is revoked — in
+	// one transaction, with the session cookie cleared on the response.
+	//
+	// **It is a 200 with a body rather than a 204**, because this route does
+	// change three things the caller needs to know. A 204 would leave a client to
+	// rediscover all three by making three other requests.
+	//
+	// `email_verified` is **false**, and that is not a bug. Clicking a link proves
+	// you can read an inbox, not that the new address belongs to this account,
+	// and the write that moves the address clears `email_verified_at` in the same
+	// statement. A client rendering "your address is updated" from this body is
+	// correct; a client rendering "your address is verified" is not — prompt for
+	// `POST /v1/email-verifications` instead, which now targets the new address.
+	//
+	// Scoped API keys survive, for the reasons on `confirmPasswordReset`.
+	//
+	// Presenting the first token here is a 404, for the same reason the other way
+	// round is.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/email-changes/new-address (the `ConfirmEmailChangeNewAddress` operationId).
+	ConfirmEmailChangeNewAddressWithResponse(ctx context.Context, body ConfirmEmailChangeNewAddressJSONRequestBody, reqEditors ...RequestEditorFn) (*ConfirmEmailChangeNewAddressResponse, error)
+
+	// GetEmailVerificationStatusWithResponse Whether the caller's own address is proved
+	//
+	// The caller's verification state, and nothing else.
+	//
+	// **It is a separate route rather than a field on `GET /v1/me`**, and the
+	// reason is a test: `/v1/me`'s projection is asserted field-by-field to be
+	// exactly `id` and `email`, so adding `email_verified` there would either
+	// break that invariant or weaken it. And "is this address proved" is not the
+	// question "who am I" — a settings page asks the first, an app asks the
+	// second.
+	//
+	// `email_verified_at` is **absent** when the address has never been verified,
+	// which is different from an epoch timestamp, and different again from
+	// `email_verified: false` on an address that was proved and then changed:
+	// changing an address clears the verification, so the two unverified states
+	// are genuinely different and a client may want to tell them apart.
+	//
+	// A `200` for every signed-in account, never a 404 for an unverified one: the
+	// question has an answer for everybody, and a 404 would be indistinguishable
+	// from "this is not your account".
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /v1/email-verification (the `GetEmailVerificationStatus` operationId).
+	GetEmailVerificationStatusWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetEmailVerificationStatusResponse, error)
+
+	// RequestEmailVerificationWithBodyWithResponse Ask for a link that proves the account's address
+	//
+	// Mails a link to the account's registered address, valid for 24 hours.
+	//
+	// **The address is the one on the account, never one the request supplies.**
+	// There is no `email` in the body that means "verify this address" — the body
+	// carries the address to look the account up by, and what gets proved is the
+	// address already stored on the row. A token that verified whatever address the
+	// request carried would be a registration of somebody else's inbox.
+	//
+	// Verification is not automatic at registration. `POST /v1/users` does not
+	// send anything, and a client that wants an address proved calls this route
+	// afterwards. That is one extra call in exchange for a registration that
+	// cannot fail because a mail provider is down.
+	//
+	// Same answer for every address, same constant body, same 202, and the same
+	// one-minute cooldown that sends nothing rather than superseding a live link —
+	// for the reasons on `requestPasswordReset`, which this route mirrors.
+	//
+	// 409 if the account's address is **already** verified. It is a 409 rather
+	// than a silent 202 because a client rendering "check your inbox" on the
+	// strength of a 202 it should never have been given tells a user to watch an
+	// inbox nothing is going to arrive in.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/email-verifications (the `RequestEmailVerification` operationId).
+	RequestEmailVerificationWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RequestEmailVerificationResponse, error)
+
+	// RequestEmailVerificationWithResponse Ask for a link that proves the account's address
+	//
+	// Mails a link to the account's registered address, valid for 24 hours.
+	//
+	// **The address is the one on the account, never one the request supplies.**
+	// There is no `email` in the body that means "verify this address" — the body
+	// carries the address to look the account up by, and what gets proved is the
+	// address already stored on the row. A token that verified whatever address the
+	// request carried would be a registration of somebody else's inbox.
+	//
+	// Verification is not automatic at registration. `POST /v1/users` does not
+	// send anything, and a client that wants an address proved calls this route
+	// afterwards. That is one extra call in exchange for a registration that
+	// cannot fail because a mail provider is down.
+	//
+	// Same answer for every address, same constant body, same 202, and the same
+	// one-minute cooldown that sends nothing rather than superseding a live link —
+	// for the reasons on `requestPasswordReset`, which this route mirrors.
+	//
+	// 409 if the account's address is **already** verified. It is a 409 rather
+	// than a silent 202 because a client rendering "check your inbox" on the
+	// strength of a 202 it should never have been given tells a user to watch an
+	// inbox nothing is going to arrive in.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/email-verifications (the `RequestEmailVerification` operationId).
+	RequestEmailVerificationWithResponse(ctx context.Context, body RequestEmailVerificationJSONRequestBody, reqEditors ...RequestEditorFn) (*RequestEmailVerificationResponse, error)
+
+	// ConfirmEmailVerificationWithBodyWithResponse Spend a verification link
+	//
+	// Sets `email_verified_at` on the account and returns 204.
+	//
+	// **It revokes nothing and mints nothing.** A verification is not a credential
+	// — it is a fact about an address, and a link that sets a boolean changes no
+	// secret. Ending every session over it would punish somebody for clicking a
+	// link that proved who they already were, and minting a session here would be
+	// a second way to turn a mailbox into a credential.
+	//
+	// 404 for every token that is not live, for the reasons on
+	// `confirmPasswordReset`.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/email-verifications/confirm (the `ConfirmEmailVerification` operationId).
+	ConfirmEmailVerificationWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ConfirmEmailVerificationResponse, error)
+
+	// ConfirmEmailVerificationWithResponse Spend a verification link
+	//
+	// Sets `email_verified_at` on the account and returns 204.
+	//
+	// **It revokes nothing and mints nothing.** A verification is not a credential
+	// — it is a fact about an address, and a link that sets a boolean changes no
+	// secret. Ending every session over it would punish somebody for clicking a
+	// link that proved who they already were, and minting a session here would be
+	// a second way to turn a mailbox into a credential.
+	//
+	// 404 for every token that is not live, for the reasons on
+	// `confirmPasswordReset`.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/email-verifications/confirm (the `ConfirmEmailVerification` operationId).
+	ConfirmEmailVerificationWithResponse(ctx context.Context, body ConfirmEmailVerificationJSONRequestBody, reqEditors ...RequestEditorFn) (*ConfirmEmailVerificationResponse, error)
+
 	// IntrospectAPIKeyWithBodyWithResponse Resolve a presented API token to its claims
 	//
 	// Asks "what may this token do, and for which account". It exists because the
@@ -5518,6 +7287,150 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with POST /v1/mfa/recovery-codes (the `RegenerateMFARecoveryCodes` operationId).
 	RegenerateMFARecoveryCodesWithResponse(ctx context.Context, body RegenerateMFARecoveryCodesJSONRequestBody, reqEditors ...RequestEditorFn) (*RegenerateMFARecoveryCodesResponse, error)
+
+	// RequestPasswordResetWithBodyWithResponse Ask for a password-reset link
+	//
+	// Mails a single-use link to the account's registered address, valid for 30
+	// minutes.
+	//
+	// **The response is the same for every address, and the body is a constant.**
+	// A registered address, an unregistered one and an address inside the
+	// one-minute cooldown all get `202 {"status":"accepted"}` with identical
+	// bytes. This is the entire account-enumeration defence on this route, and it
+	// is why `acceptedResponse` in the handler is a constant rather than a template
+	// with a field that happens to render the same either way: a field is a field,
+	// and the next person to add an `expires_at` to it reinstates the oracle
+	// without touching a test.
+	//
+	// The status is 202, not 200 and not 204. The request *was* accepted for
+	// processing; whether the message is delivered is not something the caller is
+	// entitled to learn before they have proved which account they are asking
+	// about.
+	//
+	// **A second request inside the cooldown sends nothing at all**, and answers
+	// identically. It does not supersede the first link: a request route that
+	// invalidated a live token would let anybody invalidate a victim's pending
+	// reset, which is a denial of recovery dressed up as a convenience.
+	//
+	// A cooldown is not a rate limiter, and this service does not have one here.
+	// It bounds mail to one message per address per minute, which stops the
+	// obvious abuse of an anonymous endpoint pointed at one victim. It does
+	// nothing about a flood spread across a thousand addresses and is not
+	// per-client. Per-source throttling belongs to courier, which is in the path
+	// of every message this service sends.
+	//
+	// Resetting revokes **sessions and OIDC access tokens** when the link is
+	// redeemed, and **not** scoped API keys — the same rule the second-factor
+	// removal already follows, and the reason is the same.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/password-resets (the `RequestPasswordReset` operationId).
+	RequestPasswordResetWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RequestPasswordResetResponse, error)
+
+	// RequestPasswordResetWithResponse Ask for a password-reset link
+	//
+	// Mails a single-use link to the account's registered address, valid for 30
+	// minutes.
+	//
+	// **The response is the same for every address, and the body is a constant.**
+	// A registered address, an unregistered one and an address inside the
+	// one-minute cooldown all get `202 {"status":"accepted"}` with identical
+	// bytes. This is the entire account-enumeration defence on this route, and it
+	// is why `acceptedResponse` in the handler is a constant rather than a template
+	// with a field that happens to render the same either way: a field is a field,
+	// and the next person to add an `expires_at` to it reinstates the oracle
+	// without touching a test.
+	//
+	// The status is 202, not 200 and not 204. The request *was* accepted for
+	// processing; whether the message is delivered is not something the caller is
+	// entitled to learn before they have proved which account they are asking
+	// about.
+	//
+	// **A second request inside the cooldown sends nothing at all**, and answers
+	// identically. It does not supersede the first link: a request route that
+	// invalidated a live token would let anybody invalidate a victim's pending
+	// reset, which is a denial of recovery dressed up as a convenience.
+	//
+	// A cooldown is not a rate limiter, and this service does not have one here.
+	// It bounds mail to one message per address per minute, which stops the
+	// obvious abuse of an anonymous endpoint pointed at one victim. It does
+	// nothing about a flood spread across a thousand addresses and is not
+	// per-client. Per-source throttling belongs to courier, which is in the path
+	// of every message this service sends.
+	//
+	// Resetting revokes **sessions and OIDC access tokens** when the link is
+	// redeemed, and **not** scoped API keys — the same rule the second-factor
+	// removal already follows, and the reason is the same.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/password-resets (the `RequestPasswordReset` operationId).
+	RequestPasswordResetWithResponse(ctx context.Context, body RequestPasswordResetJSONRequestBody, reqEditors ...RequestEditorFn) (*RequestPasswordResetResponse, error)
+
+	// ConfirmPasswordResetWithBodyWithResponse Spend a reset link and set a new password
+	//
+	// Changes the password and revokes every session and every live OIDC access
+	// token the account holds, in one transaction.
+	//
+	// The revocation is why this is 204 and not a 200 with a session in it: the
+	// caller's own session is revoked by the same write that changes the
+	// password, so a caller that was signed in when it started is signed out when
+	// it finishes and cannot use this route to keep itself signed in. **No session
+	// is minted** — that would be a second way to turn a mailbox into a
+	// credential without answering a second factor. Sign in again with the new
+	// password.
+	//
+	// The session cookie is cleared on the response as well as the row revoked, so
+	// a browser is not left holding a credential this request just killed.
+	//
+	// **404 for everything that is not a live token**: one that never existed, one
+	// that expired, one already spent, and one minted for a different flow. It is
+	// 404 and not 401 because the caller is not asking who they are — they are
+	// following a link, and "there is no such link" is also what they learn about
+	// every link they did not receive.
+	//
+	// Scoped API keys survive. This is the same rule `DELETE /v1/mfa` already
+	// follows and the same reason: a key is a credential somebody deliberately
+	// created and handed to a script, and a person who forgot their password is
+	// not necessarily the person who owns it.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/password-resets/confirm (the `ConfirmPasswordReset` operationId).
+	ConfirmPasswordResetWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ConfirmPasswordResetResponse, error)
+
+	// ConfirmPasswordResetWithResponse Spend a reset link and set a new password
+	//
+	// Changes the password and revokes every session and every live OIDC access
+	// token the account holds, in one transaction.
+	//
+	// The revocation is why this is 204 and not a 200 with a session in it: the
+	// caller's own session is revoked by the same write that changes the
+	// password, so a caller that was signed in when it started is signed out when
+	// it finishes and cannot use this route to keep itself signed in. **No session
+	// is minted** — that would be a second way to turn a mailbox into a
+	// credential without answering a second factor. Sign in again with the new
+	// password.
+	//
+	// The session cookie is cleared on the response as well as the row revoked, so
+	// a browser is not left holding a credential this request just killed.
+	//
+	// **404 for everything that is not a live token**: one that never existed, one
+	// that expired, one already spent, and one minted for a different flow. It is
+	// 404 and not 401 because the caller is not asking who they are — they are
+	// following a link, and "there is no such link" is also what they learn about
+	// every link they did not receive.
+	//
+	// Scoped API keys survive. This is the same rule `DELETE /v1/mfa` already
+	// follows and the same reason: a key is a credential somebody deliberately
+	// created and handed to a script, and a person who forgot their password is
+	// not necessarily the person who owns it.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/password-resets/confirm (the `ConfirmPasswordReset` operationId).
+	ConfirmPasswordResetWithResponse(ctx context.Context, body ConfirmPasswordResetJSONRequestBody, reqEditors ...RequestEditorFn) (*ConfirmPasswordResetResponse, error)
 
 	// DeleteSessionWithResponse Log out
 	//
@@ -6963,6 +8876,722 @@ func (r GetOIDCClientResponse) ContentType() string {
 	return ""
 }
 
+// RequestEmailChangeResponse201Headers the declared response headers of an HTTP 201 response for RequestEmailChange
+type RequestEmailChangeResponse201Headers struct {
+	XTraceID string
+}
+
+// RequestEmailChangeResponse400Headers the declared response headers of an HTTP 400 response for RequestEmailChange
+type RequestEmailChangeResponse400Headers struct {
+	XTraceID string
+}
+
+// RequestEmailChangeResponse401Headers the declared response headers of an HTTP 401 response for RequestEmailChange
+type RequestEmailChangeResponse401Headers struct {
+	XTraceID string
+}
+
+// RequestEmailChangeResponse409Headers the declared response headers of an HTTP 409 response for RequestEmailChange
+type RequestEmailChangeResponse409Headers struct {
+	XTraceID string
+}
+
+// RequestEmailChangeResponse413Headers the declared response headers of an HTTP 413 response for RequestEmailChange
+type RequestEmailChangeResponse413Headers struct {
+	XTraceID string
+}
+
+// RequestEmailChangeResponse422Headers the declared response headers of an HTTP 422 response for RequestEmailChange
+type RequestEmailChangeResponse422Headers struct {
+	XTraceID string
+}
+
+// RequestEmailChangeResponse500Headers the declared response headers of an HTTP 500 response for RequestEmailChange
+type RequestEmailChangeResponse500Headers struct {
+	XTraceID string
+}
+
+// RequestEmailChangeResponse503Headers the declared response headers of an HTTP 503 response for RequestEmailChange
+type RequestEmailChangeResponse503Headers struct {
+	XTraceID string
+}
+
+type RequestEmailChangeResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *EmailChange
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON409 the response for an HTTP 409 `application/problem+json` response
+	ApplicationProblemJSON409 *Problem
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// ApplicationProblemJSON503 the response for an HTTP 503 `application/problem+json` response
+	ApplicationProblemJSON503 *MailUnavailable
+	// Headers201 the parsed response headers for an HTTP 201 response
+	Headers201 *RequestEmailChangeResponse201Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *RequestEmailChangeResponse400Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *RequestEmailChangeResponse401Headers
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *RequestEmailChangeResponse409Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *RequestEmailChangeResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *RequestEmailChangeResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *RequestEmailChangeResponse500Headers
+	// Headers503 the parsed response headers for an HTTP 503 response
+	Headers503 *RequestEmailChangeResponse503Headers
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r RequestEmailChangeResponse) GetJSON201() *EmailChange {
+	return r.JSON201
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r RequestEmailChangeResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r RequestEmailChangeResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON409 returns the response for an HTTP 409 `application/problem+json` response
+func (r RequestEmailChangeResponse) GetApplicationProblemJSON409() *Problem {
+	return r.ApplicationProblemJSON409
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r RequestEmailChangeResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r RequestEmailChangeResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r RequestEmailChangeResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetApplicationProblemJSON503 returns the response for an HTTP 503 `application/problem+json` response
+func (r RequestEmailChangeResponse) GetApplicationProblemJSON503() *MailUnavailable {
+	return r.ApplicationProblemJSON503
+}
+
+// GetBody returns the raw response body bytes
+func (r RequestEmailChangeResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RequestEmailChangeResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RequestEmailChangeResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RequestEmailChangeResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// ConfirmEmailChangeCurrentAddressResponse202Headers the declared response headers of an HTTP 202 response for ConfirmEmailChangeCurrentAddress
+type ConfirmEmailChangeCurrentAddressResponse202Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailChangeCurrentAddressResponse400Headers the declared response headers of an HTTP 400 response for ConfirmEmailChangeCurrentAddress
+type ConfirmEmailChangeCurrentAddressResponse400Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailChangeCurrentAddressResponse404Headers the declared response headers of an HTTP 404 response for ConfirmEmailChangeCurrentAddress
+type ConfirmEmailChangeCurrentAddressResponse404Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailChangeCurrentAddressResponse413Headers the declared response headers of an HTTP 413 response for ConfirmEmailChangeCurrentAddress
+type ConfirmEmailChangeCurrentAddressResponse413Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailChangeCurrentAddressResponse422Headers the declared response headers of an HTTP 422 response for ConfirmEmailChangeCurrentAddress
+type ConfirmEmailChangeCurrentAddressResponse422Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailChangeCurrentAddressResponse500Headers the declared response headers of an HTTP 500 response for ConfirmEmailChangeCurrentAddress
+type ConfirmEmailChangeCurrentAddressResponse500Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailChangeCurrentAddressResponse503Headers the declared response headers of an HTTP 503 response for ConfirmEmailChangeCurrentAddress
+type ConfirmEmailChangeCurrentAddressResponse503Headers struct {
+	XTraceID string
+}
+
+type ConfirmEmailChangeCurrentAddressResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *Accepted
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *Problem
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// ApplicationProblemJSON503 the response for an HTTP 503 `application/problem+json` response
+	ApplicationProblemJSON503 *MailUnavailable
+	// Headers202 the parsed response headers for an HTTP 202 response
+	Headers202 *ConfirmEmailChangeCurrentAddressResponse202Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *ConfirmEmailChangeCurrentAddressResponse400Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *ConfirmEmailChangeCurrentAddressResponse404Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *ConfirmEmailChangeCurrentAddressResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *ConfirmEmailChangeCurrentAddressResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *ConfirmEmailChangeCurrentAddressResponse500Headers
+	// Headers503 the parsed response headers for an HTTP 503 response
+	Headers503 *ConfirmEmailChangeCurrentAddressResponse503Headers
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r ConfirmEmailChangeCurrentAddressResponse) GetJSON202() *Accepted {
+	return r.JSON202
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r ConfirmEmailChangeCurrentAddressResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r ConfirmEmailChangeCurrentAddressResponse) GetApplicationProblemJSON404() *Problem {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r ConfirmEmailChangeCurrentAddressResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r ConfirmEmailChangeCurrentAddressResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r ConfirmEmailChangeCurrentAddressResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetApplicationProblemJSON503 returns the response for an HTTP 503 `application/problem+json` response
+func (r ConfirmEmailChangeCurrentAddressResponse) GetApplicationProblemJSON503() *MailUnavailable {
+	return r.ApplicationProblemJSON503
+}
+
+// GetBody returns the raw response body bytes
+func (r ConfirmEmailChangeCurrentAddressResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ConfirmEmailChangeCurrentAddressResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ConfirmEmailChangeCurrentAddressResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ConfirmEmailChangeCurrentAddressResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// ConfirmEmailChangeNewAddressResponse200Headers the declared response headers of an HTTP 200 response for ConfirmEmailChangeNewAddress
+type ConfirmEmailChangeNewAddressResponse200Headers struct {
+	SetCookie *string
+	XTraceID  string
+}
+
+// ConfirmEmailChangeNewAddressResponse400Headers the declared response headers of an HTTP 400 response for ConfirmEmailChangeNewAddress
+type ConfirmEmailChangeNewAddressResponse400Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailChangeNewAddressResponse404Headers the declared response headers of an HTTP 404 response for ConfirmEmailChangeNewAddress
+type ConfirmEmailChangeNewAddressResponse404Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailChangeNewAddressResponse413Headers the declared response headers of an HTTP 413 response for ConfirmEmailChangeNewAddress
+type ConfirmEmailChangeNewAddressResponse413Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailChangeNewAddressResponse422Headers the declared response headers of an HTTP 422 response for ConfirmEmailChangeNewAddress
+type ConfirmEmailChangeNewAddressResponse422Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailChangeNewAddressResponse500Headers the declared response headers of an HTTP 500 response for ConfirmEmailChangeNewAddress
+type ConfirmEmailChangeNewAddressResponse500Headers struct {
+	XTraceID string
+}
+
+type ConfirmEmailChangeNewAddressResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *EmailChange
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *Problem
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *ConfirmEmailChangeNewAddressResponse200Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *ConfirmEmailChangeNewAddressResponse400Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *ConfirmEmailChangeNewAddressResponse404Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *ConfirmEmailChangeNewAddressResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *ConfirmEmailChangeNewAddressResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *ConfirmEmailChangeNewAddressResponse500Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ConfirmEmailChangeNewAddressResponse) GetJSON200() *EmailChange {
+	return r.JSON200
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r ConfirmEmailChangeNewAddressResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r ConfirmEmailChangeNewAddressResponse) GetApplicationProblemJSON404() *Problem {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r ConfirmEmailChangeNewAddressResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r ConfirmEmailChangeNewAddressResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r ConfirmEmailChangeNewAddressResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r ConfirmEmailChangeNewAddressResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ConfirmEmailChangeNewAddressResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ConfirmEmailChangeNewAddressResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ConfirmEmailChangeNewAddressResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// GetEmailVerificationStatusResponse200Headers the declared response headers of an HTTP 200 response for GetEmailVerificationStatus
+type GetEmailVerificationStatusResponse200Headers struct {
+	XTraceID string
+}
+
+// GetEmailVerificationStatusResponse401Headers the declared response headers of an HTTP 401 response for GetEmailVerificationStatus
+type GetEmailVerificationStatusResponse401Headers struct {
+	XTraceID string
+}
+
+// GetEmailVerificationStatusResponse500Headers the declared response headers of an HTTP 500 response for GetEmailVerificationStatus
+type GetEmailVerificationStatusResponse500Headers struct {
+	XTraceID string
+}
+
+type GetEmailVerificationStatusResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *VerificationStatus
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *GetEmailVerificationStatusResponse200Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *GetEmailVerificationStatusResponse401Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *GetEmailVerificationStatusResponse500Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetEmailVerificationStatusResponse) GetJSON200() *VerificationStatus {
+	return r.JSON200
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r GetEmailVerificationStatusResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r GetEmailVerificationStatusResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r GetEmailVerificationStatusResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetEmailVerificationStatusResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetEmailVerificationStatusResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetEmailVerificationStatusResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// RequestEmailVerificationResponse202Headers the declared response headers of an HTTP 202 response for RequestEmailVerification
+type RequestEmailVerificationResponse202Headers struct {
+	XTraceID string
+}
+
+// RequestEmailVerificationResponse400Headers the declared response headers of an HTTP 400 response for RequestEmailVerification
+type RequestEmailVerificationResponse400Headers struct {
+	XTraceID string
+}
+
+// RequestEmailVerificationResponse409Headers the declared response headers of an HTTP 409 response for RequestEmailVerification
+type RequestEmailVerificationResponse409Headers struct {
+	XTraceID string
+}
+
+// RequestEmailVerificationResponse413Headers the declared response headers of an HTTP 413 response for RequestEmailVerification
+type RequestEmailVerificationResponse413Headers struct {
+	XTraceID string
+}
+
+// RequestEmailVerificationResponse422Headers the declared response headers of an HTTP 422 response for RequestEmailVerification
+type RequestEmailVerificationResponse422Headers struct {
+	XTraceID string
+}
+
+// RequestEmailVerificationResponse500Headers the declared response headers of an HTTP 500 response for RequestEmailVerification
+type RequestEmailVerificationResponse500Headers struct {
+	XTraceID string
+}
+
+// RequestEmailVerificationResponse503Headers the declared response headers of an HTTP 503 response for RequestEmailVerification
+type RequestEmailVerificationResponse503Headers struct {
+	XTraceID string
+}
+
+type RequestEmailVerificationResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *Accepted
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON409 the response for an HTTP 409 `application/problem+json` response
+	ApplicationProblemJSON409 *Problem
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// ApplicationProblemJSON503 the response for an HTTP 503 `application/problem+json` response
+	ApplicationProblemJSON503 *MailUnavailable
+	// Headers202 the parsed response headers for an HTTP 202 response
+	Headers202 *RequestEmailVerificationResponse202Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *RequestEmailVerificationResponse400Headers
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *RequestEmailVerificationResponse409Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *RequestEmailVerificationResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *RequestEmailVerificationResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *RequestEmailVerificationResponse500Headers
+	// Headers503 the parsed response headers for an HTTP 503 response
+	Headers503 *RequestEmailVerificationResponse503Headers
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r RequestEmailVerificationResponse) GetJSON202() *Accepted {
+	return r.JSON202
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r RequestEmailVerificationResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON409 returns the response for an HTTP 409 `application/problem+json` response
+func (r RequestEmailVerificationResponse) GetApplicationProblemJSON409() *Problem {
+	return r.ApplicationProblemJSON409
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r RequestEmailVerificationResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r RequestEmailVerificationResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r RequestEmailVerificationResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetApplicationProblemJSON503 returns the response for an HTTP 503 `application/problem+json` response
+func (r RequestEmailVerificationResponse) GetApplicationProblemJSON503() *MailUnavailable {
+	return r.ApplicationProblemJSON503
+}
+
+// GetBody returns the raw response body bytes
+func (r RequestEmailVerificationResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RequestEmailVerificationResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RequestEmailVerificationResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RequestEmailVerificationResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// ConfirmEmailVerificationResponse204Headers the declared response headers of an HTTP 204 response for ConfirmEmailVerification
+type ConfirmEmailVerificationResponse204Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailVerificationResponse400Headers the declared response headers of an HTTP 400 response for ConfirmEmailVerification
+type ConfirmEmailVerificationResponse400Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailVerificationResponse404Headers the declared response headers of an HTTP 404 response for ConfirmEmailVerification
+type ConfirmEmailVerificationResponse404Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailVerificationResponse413Headers the declared response headers of an HTTP 413 response for ConfirmEmailVerification
+type ConfirmEmailVerificationResponse413Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailVerificationResponse422Headers the declared response headers of an HTTP 422 response for ConfirmEmailVerification
+type ConfirmEmailVerificationResponse422Headers struct {
+	XTraceID string
+}
+
+// ConfirmEmailVerificationResponse500Headers the declared response headers of an HTTP 500 response for ConfirmEmailVerification
+type ConfirmEmailVerificationResponse500Headers struct {
+	XTraceID string
+}
+
+type ConfirmEmailVerificationResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *Problem
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers204 the parsed response headers for an HTTP 204 response
+	Headers204 *ConfirmEmailVerificationResponse204Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *ConfirmEmailVerificationResponse400Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *ConfirmEmailVerificationResponse404Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *ConfirmEmailVerificationResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *ConfirmEmailVerificationResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *ConfirmEmailVerificationResponse500Headers
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r ConfirmEmailVerificationResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r ConfirmEmailVerificationResponse) GetApplicationProblemJSON404() *Problem {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r ConfirmEmailVerificationResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r ConfirmEmailVerificationResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r ConfirmEmailVerificationResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r ConfirmEmailVerificationResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ConfirmEmailVerificationResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ConfirmEmailVerificationResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ConfirmEmailVerificationResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
 // IntrospectAPIKeyResponse200Headers the declared response headers of an HTTP 200 response for IntrospectAPIKey
 type IntrospectAPIKeyResponse200Headers struct {
 	XTraceID string
@@ -7780,6 +10409,236 @@ func (r RegenerateMFARecoveryCodesResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r RegenerateMFARecoveryCodesResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// RequestPasswordResetResponse202Headers the declared response headers of an HTTP 202 response for RequestPasswordReset
+type RequestPasswordResetResponse202Headers struct {
+	XTraceID string
+}
+
+// RequestPasswordResetResponse400Headers the declared response headers of an HTTP 400 response for RequestPasswordReset
+type RequestPasswordResetResponse400Headers struct {
+	XTraceID string
+}
+
+// RequestPasswordResetResponse413Headers the declared response headers of an HTTP 413 response for RequestPasswordReset
+type RequestPasswordResetResponse413Headers struct {
+	XTraceID string
+}
+
+// RequestPasswordResetResponse422Headers the declared response headers of an HTTP 422 response for RequestPasswordReset
+type RequestPasswordResetResponse422Headers struct {
+	XTraceID string
+}
+
+// RequestPasswordResetResponse500Headers the declared response headers of an HTTP 500 response for RequestPasswordReset
+type RequestPasswordResetResponse500Headers struct {
+	XTraceID string
+}
+
+// RequestPasswordResetResponse503Headers the declared response headers of an HTTP 503 response for RequestPasswordReset
+type RequestPasswordResetResponse503Headers struct {
+	XTraceID string
+}
+
+type RequestPasswordResetResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *Accepted
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// ApplicationProblemJSON503 the response for an HTTP 503 `application/problem+json` response
+	ApplicationProblemJSON503 *MailUnavailable
+	// Headers202 the parsed response headers for an HTTP 202 response
+	Headers202 *RequestPasswordResetResponse202Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *RequestPasswordResetResponse400Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *RequestPasswordResetResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *RequestPasswordResetResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *RequestPasswordResetResponse500Headers
+	// Headers503 the parsed response headers for an HTTP 503 response
+	Headers503 *RequestPasswordResetResponse503Headers
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r RequestPasswordResetResponse) GetJSON202() *Accepted {
+	return r.JSON202
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r RequestPasswordResetResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r RequestPasswordResetResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r RequestPasswordResetResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r RequestPasswordResetResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetApplicationProblemJSON503 returns the response for an HTTP 503 `application/problem+json` response
+func (r RequestPasswordResetResponse) GetApplicationProblemJSON503() *MailUnavailable {
+	return r.ApplicationProblemJSON503
+}
+
+// GetBody returns the raw response body bytes
+func (r RequestPasswordResetResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RequestPasswordResetResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RequestPasswordResetResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RequestPasswordResetResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// ConfirmPasswordResetResponse204Headers the declared response headers of an HTTP 204 response for ConfirmPasswordReset
+type ConfirmPasswordResetResponse204Headers struct {
+	SetCookie *string
+	XTraceID  string
+}
+
+// ConfirmPasswordResetResponse400Headers the declared response headers of an HTTP 400 response for ConfirmPasswordReset
+type ConfirmPasswordResetResponse400Headers struct {
+	XTraceID string
+}
+
+// ConfirmPasswordResetResponse404Headers the declared response headers of an HTTP 404 response for ConfirmPasswordReset
+type ConfirmPasswordResetResponse404Headers struct {
+	XTraceID string
+}
+
+// ConfirmPasswordResetResponse413Headers the declared response headers of an HTTP 413 response for ConfirmPasswordReset
+type ConfirmPasswordResetResponse413Headers struct {
+	XTraceID string
+}
+
+// ConfirmPasswordResetResponse422Headers the declared response headers of an HTTP 422 response for ConfirmPasswordReset
+type ConfirmPasswordResetResponse422Headers struct {
+	XTraceID string
+}
+
+// ConfirmPasswordResetResponse500Headers the declared response headers of an HTTP 500 response for ConfirmPasswordReset
+type ConfirmPasswordResetResponse500Headers struct {
+	XTraceID string
+}
+
+type ConfirmPasswordResetResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *Problem
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers204 the parsed response headers for an HTTP 204 response
+	Headers204 *ConfirmPasswordResetResponse204Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *ConfirmPasswordResetResponse400Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *ConfirmPasswordResetResponse404Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *ConfirmPasswordResetResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *ConfirmPasswordResetResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *ConfirmPasswordResetResponse500Headers
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r ConfirmPasswordResetResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r ConfirmPasswordResetResponse) GetApplicationProblemJSON404() *Problem {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r ConfirmPasswordResetResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r ConfirmPasswordResetResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r ConfirmPasswordResetResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r ConfirmPasswordResetResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ConfirmPasswordResetResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ConfirmPasswordResetResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ConfirmPasswordResetResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -8902,6 +11761,364 @@ func (c *ClientWithResponses) GetOIDCClientWithResponse(ctx context.Context, acc
 	return ParseGetOIDCClientResponse(rsp)
 }
 
+// RequestEmailChangeWithBodyWithResponse Start a move to a new address
+//
+// Records the intent and mails a link to the address the account has **now**.
+// Nothing moves yet: this creates the first of two tokens, and the second
+// does not exist until the first is redeemed.
+//
+// That ordering is the whole of the hijack property. A stolen session can
+// reach this route, and what it produces is a link in the victim's inbox and
+// nowhere else — the attacker cannot advance the change, and the victim gets a
+// message saying their address is being changed, which is the only warning
+// they would otherwise get. A single-token design, where the link goes to the
+// NEW address and completing it moves the account, is a takeover on anybody
+// who can read the new inbox and nothing else.
+//
+// **Session only.** There is no scope in the machine vocabulary for "may move
+// an account's recovery path", and there is not going to be one. A scoped API
+// token is refused on all eight routes of this surface.
+//
+// Two refusals are worth reading, because both are the alternative being
+// rejected:
+//
+//   - **409** when the new address already has an account. This is the one
+//     disclosure this surface makes and it is safe here — the caller is
+//     authenticated as the person asking, and the alternative is a change that
+//     fails at the last step after two emails and two clicks. It is the same
+//     answer `POST /v1/users` gives.
+//   - **422 `already_current`** when the new address is the one already on the
+//     row. Refused rather than treated as a no-op, because a 202 here would
+//     leave the caller believing a change had been requested and confirmed.
+//
+// 201 rather than 202: this is not a message being sent in the background, it
+// is a change that has been recorded and has a deadline.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/email-changes (the `RequestEmailChange` operationId).
+func (c *ClientWithResponses) RequestEmailChangeWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RequestEmailChangeResponse, error) {
+	rsp, err := c.RequestEmailChangeWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRequestEmailChangeResponse(rsp)
+}
+
+// RequestEmailChangeWithResponse Start a move to a new address
+//
+// Records the intent and mails a link to the address the account has **now**.
+// Nothing moves yet: this creates the first of two tokens, and the second
+// does not exist until the first is redeemed.
+//
+// That ordering is the whole of the hijack property. A stolen session can
+// reach this route, and what it produces is a link in the victim's inbox and
+// nowhere else — the attacker cannot advance the change, and the victim gets a
+// message saying their address is being changed, which is the only warning
+// they would otherwise get. A single-token design, where the link goes to the
+// NEW address and completing it moves the account, is a takeover on anybody
+// who can read the new inbox and nothing else.
+//
+// **Session only.** There is no scope in the machine vocabulary for "may move
+// an account's recovery path", and there is not going to be one. A scoped API
+// token is refused on all eight routes of this surface.
+//
+// Two refusals are worth reading, because both are the alternative being
+// rejected:
+//
+//   - **409** when the new address already has an account. This is the one
+//     disclosure this surface makes and it is safe here — the caller is
+//     authenticated as the person asking, and the alternative is a change that
+//     fails at the last step after two emails and two clicks. It is the same
+//     answer `POST /v1/users` gives.
+//   - **422 `already_current`** when the new address is the one already on the
+//     row. Refused rather than treated as a no-op, because a 202 here would
+//     leave the caller believing a change had been requested and confirmed.
+//
+// 201 rather than 202: this is not a message being sent in the background, it
+// is a change that has been recorded and has a deadline.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/email-changes (the `RequestEmailChange` operationId).
+func (c *ClientWithResponses) RequestEmailChangeWithResponse(ctx context.Context, body RequestEmailChangeJSONRequestBody, reqEditors ...RequestEditorFn) (*RequestEmailChangeResponse, error) {
+	rsp, err := c.RequestEmailChange(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRequestEmailChangeResponse(rsp)
+}
+
+// ConfirmEmailChangeCurrentAddressWithBodyWithResponse Prove control of the address the account has now
+//
+// Spends the first token and mails the second one to the **new** address.
+// Answers 202 with the same constant body every other accepted route gives.
+//
+// **The 202 body says nothing about the second link**, and that is the point.
+// The caller has just proved they can read the current inbox, so they know
+// they asked for this and know the next message goes to the address they
+// typed. Naming the destination here would tell a hijacked session — which can
+// reach this route with a token it does not have — nothing at all, while
+// telling a legitimate user nothing they need.
+//
+// Presenting the second token here is a 404, not a partial success: the two
+// tokens are for different inboxes and a token that worked on the wrong side
+// would mean the wrong inbox proved something.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/email-changes/current-address (the `ConfirmEmailChangeCurrentAddress` operationId).
+func (c *ClientWithResponses) ConfirmEmailChangeCurrentAddressWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ConfirmEmailChangeCurrentAddressResponse, error) {
+	rsp, err := c.ConfirmEmailChangeCurrentAddressWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConfirmEmailChangeCurrentAddressResponse(rsp)
+}
+
+// ConfirmEmailChangeCurrentAddressWithResponse Prove control of the address the account has now
+//
+// Spends the first token and mails the second one to the **new** address.
+// Answers 202 with the same constant body every other accepted route gives.
+//
+// **The 202 body says nothing about the second link**, and that is the point.
+// The caller has just proved they can read the current inbox, so they know
+// they asked for this and know the next message goes to the address they
+// typed. Naming the destination here would tell a hijacked session — which can
+// reach this route with a token it does not have — nothing at all, while
+// telling a legitimate user nothing they need.
+//
+// Presenting the second token here is a 404, not a partial success: the two
+// tokens are for different inboxes and a token that worked on the wrong side
+// would mean the wrong inbox proved something.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/email-changes/current-address (the `ConfirmEmailChangeCurrentAddress` operationId).
+func (c *ClientWithResponses) ConfirmEmailChangeCurrentAddressWithResponse(ctx context.Context, body ConfirmEmailChangeCurrentAddressJSONRequestBody, reqEditors ...RequestEditorFn) (*ConfirmEmailChangeCurrentAddressResponse, error) {
+	rsp, err := c.ConfirmEmailChangeCurrentAddress(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConfirmEmailChangeCurrentAddressResponse(rsp)
+}
+
+// ConfirmEmailChangeNewAddressWithBodyWithResponse Complete a move to a new address
+//
+// Spends the second token: the account's address moves, the verification is
+// cleared, and every session and every live OIDC access token is revoked — in
+// one transaction, with the session cookie cleared on the response.
+//
+// **It is a 200 with a body rather than a 204**, because this route does
+// change three things the caller needs to know. A 204 would leave a client to
+// rediscover all three by making three other requests.
+//
+// `email_verified` is **false**, and that is not a bug. Clicking a link proves
+// you can read an inbox, not that the new address belongs to this account,
+// and the write that moves the address clears `email_verified_at` in the same
+// statement. A client rendering "your address is updated" from this body is
+// correct; a client rendering "your address is verified" is not — prompt for
+// `POST /v1/email-verifications` instead, which now targets the new address.
+//
+// Scoped API keys survive, for the reasons on `confirmPasswordReset`.
+//
+// Presenting the first token here is a 404, for the same reason the other way
+// round is.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/email-changes/new-address (the `ConfirmEmailChangeNewAddress` operationId).
+func (c *ClientWithResponses) ConfirmEmailChangeNewAddressWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ConfirmEmailChangeNewAddressResponse, error) {
+	rsp, err := c.ConfirmEmailChangeNewAddressWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConfirmEmailChangeNewAddressResponse(rsp)
+}
+
+// ConfirmEmailChangeNewAddressWithResponse Complete a move to a new address
+//
+// Spends the second token: the account's address moves, the verification is
+// cleared, and every session and every live OIDC access token is revoked — in
+// one transaction, with the session cookie cleared on the response.
+//
+// **It is a 200 with a body rather than a 204**, because this route does
+// change three things the caller needs to know. A 204 would leave a client to
+// rediscover all three by making three other requests.
+//
+// `email_verified` is **false**, and that is not a bug. Clicking a link proves
+// you can read an inbox, not that the new address belongs to this account,
+// and the write that moves the address clears `email_verified_at` in the same
+// statement. A client rendering "your address is updated" from this body is
+// correct; a client rendering "your address is verified" is not — prompt for
+// `POST /v1/email-verifications` instead, which now targets the new address.
+//
+// Scoped API keys survive, for the reasons on `confirmPasswordReset`.
+//
+// Presenting the first token here is a 404, for the same reason the other way
+// round is.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/email-changes/new-address (the `ConfirmEmailChangeNewAddress` operationId).
+func (c *ClientWithResponses) ConfirmEmailChangeNewAddressWithResponse(ctx context.Context, body ConfirmEmailChangeNewAddressJSONRequestBody, reqEditors ...RequestEditorFn) (*ConfirmEmailChangeNewAddressResponse, error) {
+	rsp, err := c.ConfirmEmailChangeNewAddress(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConfirmEmailChangeNewAddressResponse(rsp)
+}
+
+// GetEmailVerificationStatusWithResponse Whether the caller's own address is proved
+//
+// The caller's verification state, and nothing else.
+//
+// **It is a separate route rather than a field on `GET /v1/me`**, and the
+// reason is a test: `/v1/me`'s projection is asserted field-by-field to be
+// exactly `id` and `email`, so adding `email_verified` there would either
+// break that invariant or weaken it. And "is this address proved" is not the
+// question "who am I" — a settings page asks the first, an app asks the
+// second.
+//
+// `email_verified_at` is **absent** when the address has never been verified,
+// which is different from an epoch timestamp, and different again from
+// `email_verified: false` on an address that was proved and then changed:
+// changing an address clears the verification, so the two unverified states
+// are genuinely different and a client may want to tell them apart.
+//
+// A `200` for every signed-in account, never a 404 for an unverified one: the
+// question has an answer for everybody, and a 404 would be indistinguishable
+// from "this is not your account".
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /v1/email-verification (the `GetEmailVerificationStatus` operationId).
+func (c *ClientWithResponses) GetEmailVerificationStatusWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetEmailVerificationStatusResponse, error) {
+	rsp, err := c.GetEmailVerificationStatus(ctx, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetEmailVerificationStatusResponse(rsp)
+}
+
+// RequestEmailVerificationWithBodyWithResponse Ask for a link that proves the account's address
+//
+// Mails a link to the account's registered address, valid for 24 hours.
+//
+// **The address is the one on the account, never one the request supplies.**
+// There is no `email` in the body that means "verify this address" — the body
+// carries the address to look the account up by, and what gets proved is the
+// address already stored on the row. A token that verified whatever address the
+// request carried would be a registration of somebody else's inbox.
+//
+// Verification is not automatic at registration. `POST /v1/users` does not
+// send anything, and a client that wants an address proved calls this route
+// afterwards. That is one extra call in exchange for a registration that
+// cannot fail because a mail provider is down.
+//
+// Same answer for every address, same constant body, same 202, and the same
+// one-minute cooldown that sends nothing rather than superseding a live link —
+// for the reasons on `requestPasswordReset`, which this route mirrors.
+//
+// 409 if the account's address is **already** verified. It is a 409 rather
+// than a silent 202 because a client rendering "check your inbox" on the
+// strength of a 202 it should never have been given tells a user to watch an
+// inbox nothing is going to arrive in.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/email-verifications (the `RequestEmailVerification` operationId).
+func (c *ClientWithResponses) RequestEmailVerificationWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RequestEmailVerificationResponse, error) {
+	rsp, err := c.RequestEmailVerificationWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRequestEmailVerificationResponse(rsp)
+}
+
+// RequestEmailVerificationWithResponse Ask for a link that proves the account's address
+//
+// Mails a link to the account's registered address, valid for 24 hours.
+//
+// **The address is the one on the account, never one the request supplies.**
+// There is no `email` in the body that means "verify this address" — the body
+// carries the address to look the account up by, and what gets proved is the
+// address already stored on the row. A token that verified whatever address the
+// request carried would be a registration of somebody else's inbox.
+//
+// Verification is not automatic at registration. `POST /v1/users` does not
+// send anything, and a client that wants an address proved calls this route
+// afterwards. That is one extra call in exchange for a registration that
+// cannot fail because a mail provider is down.
+//
+// Same answer for every address, same constant body, same 202, and the same
+// one-minute cooldown that sends nothing rather than superseding a live link —
+// for the reasons on `requestPasswordReset`, which this route mirrors.
+//
+// 409 if the account's address is **already** verified. It is a 409 rather
+// than a silent 202 because a client rendering "check your inbox" on the
+// strength of a 202 it should never have been given tells a user to watch an
+// inbox nothing is going to arrive in.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/email-verifications (the `RequestEmailVerification` operationId).
+func (c *ClientWithResponses) RequestEmailVerificationWithResponse(ctx context.Context, body RequestEmailVerificationJSONRequestBody, reqEditors ...RequestEditorFn) (*RequestEmailVerificationResponse, error) {
+	rsp, err := c.RequestEmailVerification(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRequestEmailVerificationResponse(rsp)
+}
+
+// ConfirmEmailVerificationWithBodyWithResponse Spend a verification link
+//
+// Sets `email_verified_at` on the account and returns 204.
+//
+// **It revokes nothing and mints nothing.** A verification is not a credential
+// — it is a fact about an address, and a link that sets a boolean changes no
+// secret. Ending every session over it would punish somebody for clicking a
+// link that proved who they already were, and minting a session here would be
+// a second way to turn a mailbox into a credential.
+//
+// 404 for every token that is not live, for the reasons on
+// `confirmPasswordReset`.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/email-verifications/confirm (the `ConfirmEmailVerification` operationId).
+func (c *ClientWithResponses) ConfirmEmailVerificationWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ConfirmEmailVerificationResponse, error) {
+	rsp, err := c.ConfirmEmailVerificationWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConfirmEmailVerificationResponse(rsp)
+}
+
+// ConfirmEmailVerificationWithResponse Spend a verification link
+//
+// Sets `email_verified_at` on the account and returns 204.
+//
+// **It revokes nothing and mints nothing.** A verification is not a credential
+// — it is a fact about an address, and a link that sets a boolean changes no
+// secret. Ending every session over it would punish somebody for clicking a
+// link that proved who they already were, and minting a session here would be
+// a second way to turn a mailbox into a credential.
+//
+// 404 for every token that is not live, for the reasons on
+// `confirmPasswordReset`.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/email-verifications/confirm (the `ConfirmEmailVerification` operationId).
+func (c *ClientWithResponses) ConfirmEmailVerificationWithResponse(ctx context.Context, body ConfirmEmailVerificationJSONRequestBody, reqEditors ...RequestEditorFn) (*ConfirmEmailVerificationResponse, error) {
+	rsp, err := c.ConfirmEmailVerification(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConfirmEmailVerificationResponse(rsp)
+}
+
 // IntrospectAPIKeyWithBodyWithResponse Resolve a presented API token to its claims
 //
 // Asks "what may this token do, and for which account". It exists because the
@@ -9284,6 +12501,174 @@ func (c *ClientWithResponses) RegenerateMFARecoveryCodesWithResponse(ctx context
 		return nil, err
 	}
 	return ParseRegenerateMFARecoveryCodesResponse(rsp)
+}
+
+// RequestPasswordResetWithBodyWithResponse Ask for a password-reset link
+//
+// Mails a single-use link to the account's registered address, valid for 30
+// minutes.
+//
+// **The response is the same for every address, and the body is a constant.**
+// A registered address, an unregistered one and an address inside the
+// one-minute cooldown all get `202 {"status":"accepted"}` with identical
+// bytes. This is the entire account-enumeration defence on this route, and it
+// is why `acceptedResponse` in the handler is a constant rather than a template
+// with a field that happens to render the same either way: a field is a field,
+// and the next person to add an `expires_at` to it reinstates the oracle
+// without touching a test.
+//
+// The status is 202, not 200 and not 204. The request *was* accepted for
+// processing; whether the message is delivered is not something the caller is
+// entitled to learn before they have proved which account they are asking
+// about.
+//
+// **A second request inside the cooldown sends nothing at all**, and answers
+// identically. It does not supersede the first link: a request route that
+// invalidated a live token would let anybody invalidate a victim's pending
+// reset, which is a denial of recovery dressed up as a convenience.
+//
+// A cooldown is not a rate limiter, and this service does not have one here.
+// It bounds mail to one message per address per minute, which stops the
+// obvious abuse of an anonymous endpoint pointed at one victim. It does
+// nothing about a flood spread across a thousand addresses and is not
+// per-client. Per-source throttling belongs to courier, which is in the path
+// of every message this service sends.
+//
+// Resetting revokes **sessions and OIDC access tokens** when the link is
+// redeemed, and **not** scoped API keys — the same rule the second-factor
+// removal already follows, and the reason is the same.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/password-resets (the `RequestPasswordReset` operationId).
+func (c *ClientWithResponses) RequestPasswordResetWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RequestPasswordResetResponse, error) {
+	rsp, err := c.RequestPasswordResetWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRequestPasswordResetResponse(rsp)
+}
+
+// RequestPasswordResetWithResponse Ask for a password-reset link
+//
+// Mails a single-use link to the account's registered address, valid for 30
+// minutes.
+//
+// **The response is the same for every address, and the body is a constant.**
+// A registered address, an unregistered one and an address inside the
+// one-minute cooldown all get `202 {"status":"accepted"}` with identical
+// bytes. This is the entire account-enumeration defence on this route, and it
+// is why `acceptedResponse` in the handler is a constant rather than a template
+// with a field that happens to render the same either way: a field is a field,
+// and the next person to add an `expires_at` to it reinstates the oracle
+// without touching a test.
+//
+// The status is 202, not 200 and not 204. The request *was* accepted for
+// processing; whether the message is delivered is not something the caller is
+// entitled to learn before they have proved which account they are asking
+// about.
+//
+// **A second request inside the cooldown sends nothing at all**, and answers
+// identically. It does not supersede the first link: a request route that
+// invalidated a live token would let anybody invalidate a victim's pending
+// reset, which is a denial of recovery dressed up as a convenience.
+//
+// A cooldown is not a rate limiter, and this service does not have one here.
+// It bounds mail to one message per address per minute, which stops the
+// obvious abuse of an anonymous endpoint pointed at one victim. It does
+// nothing about a flood spread across a thousand addresses and is not
+// per-client. Per-source throttling belongs to courier, which is in the path
+// of every message this service sends.
+//
+// Resetting revokes **sessions and OIDC access tokens** when the link is
+// redeemed, and **not** scoped API keys — the same rule the second-factor
+// removal already follows, and the reason is the same.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/password-resets (the `RequestPasswordReset` operationId).
+func (c *ClientWithResponses) RequestPasswordResetWithResponse(ctx context.Context, body RequestPasswordResetJSONRequestBody, reqEditors ...RequestEditorFn) (*RequestPasswordResetResponse, error) {
+	rsp, err := c.RequestPasswordReset(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRequestPasswordResetResponse(rsp)
+}
+
+// ConfirmPasswordResetWithBodyWithResponse Spend a reset link and set a new password
+//
+// Changes the password and revokes every session and every live OIDC access
+// token the account holds, in one transaction.
+//
+// The revocation is why this is 204 and not a 200 with a session in it: the
+// caller's own session is revoked by the same write that changes the
+// password, so a caller that was signed in when it started is signed out when
+// it finishes and cannot use this route to keep itself signed in. **No session
+// is minted** — that would be a second way to turn a mailbox into a
+// credential without answering a second factor. Sign in again with the new
+// password.
+//
+// The session cookie is cleared on the response as well as the row revoked, so
+// a browser is not left holding a credential this request just killed.
+//
+// **404 for everything that is not a live token**: one that never existed, one
+// that expired, one already spent, and one minted for a different flow. It is
+// 404 and not 401 because the caller is not asking who they are — they are
+// following a link, and "there is no such link" is also what they learn about
+// every link they did not receive.
+//
+// Scoped API keys survive. This is the same rule `DELETE /v1/mfa` already
+// follows and the same reason: a key is a credential somebody deliberately
+// created and handed to a script, and a person who forgot their password is
+// not necessarily the person who owns it.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/password-resets/confirm (the `ConfirmPasswordReset` operationId).
+func (c *ClientWithResponses) ConfirmPasswordResetWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ConfirmPasswordResetResponse, error) {
+	rsp, err := c.ConfirmPasswordResetWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConfirmPasswordResetResponse(rsp)
+}
+
+// ConfirmPasswordResetWithResponse Spend a reset link and set a new password
+//
+// Changes the password and revokes every session and every live OIDC access
+// token the account holds, in one transaction.
+//
+// The revocation is why this is 204 and not a 200 with a session in it: the
+// caller's own session is revoked by the same write that changes the
+// password, so a caller that was signed in when it started is signed out when
+// it finishes and cannot use this route to keep itself signed in. **No session
+// is minted** — that would be a second way to turn a mailbox into a
+// credential without answering a second factor. Sign in again with the new
+// password.
+//
+// The session cookie is cleared on the response as well as the row revoked, so
+// a browser is not left holding a credential this request just killed.
+//
+// **404 for everything that is not a live token**: one that never existed, one
+// that expired, one already spent, and one minted for a different flow. It is
+// 404 and not 401 because the caller is not asking who they are — they are
+// following a link, and "there is no such link" is also what they learn about
+// every link they did not receive.
+//
+// Scoped API keys survive. This is the same rule `DELETE /v1/mfa` already
+// follows and the same reason: a key is a credential somebody deliberately
+// created and handed to a script, and a person who forgot their password is
+// not necessarily the person who owns it.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/password-resets/confirm (the `ConfirmPasswordReset` operationId).
+func (c *ClientWithResponses) ConfirmPasswordResetWithResponse(ctx context.Context, body ConfirmPasswordResetJSONRequestBody, reqEditors ...RequestEditorFn) (*ConfirmPasswordResetResponse, error) {
+	rsp, err := c.ConfirmPasswordReset(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConfirmPasswordResetResponse(rsp)
 }
 
 // DeleteSessionWithResponse Log out
@@ -10816,6 +14201,770 @@ func ParseGetOIDCClientResponse(rsp *http.Response) (*GetOIDCClientResponse, err
 	return response, nil
 }
 
+// ParseRequestEmailChangeResponse parses an HTTP response from a RequestEmailChangeWithResponse call
+func ParseRequestEmailChangeResponse(rsp *http.Response) (*RequestEmailChangeResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RequestEmailChangeResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest EmailChange
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest MailUnavailable
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON503 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 201:
+		var headers RequestEmailChangeResponse201Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers201 = &headers
+	case rsp.StatusCode == 400:
+		var headers RequestEmailChangeResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 401:
+		var headers RequestEmailChangeResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 409:
+		var headers RequestEmailChangeResponse409Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers409 = &headers
+	case rsp.StatusCode == 413:
+		var headers RequestEmailChangeResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers RequestEmailChangeResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers RequestEmailChangeResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	case rsp.StatusCode == 503:
+		var headers RequestEmailChangeResponse503Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers503 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseConfirmEmailChangeCurrentAddressResponse parses an HTTP response from a ConfirmEmailChangeCurrentAddressWithResponse call
+func ParseConfirmEmailChangeCurrentAddressResponse(rsp *http.Response) (*ConfirmEmailChangeCurrentAddressResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ConfirmEmailChangeCurrentAddressResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest Accepted
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest MailUnavailable
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON503 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 202:
+		var headers ConfirmEmailChangeCurrentAddressResponse202Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers202 = &headers
+	case rsp.StatusCode == 400:
+		var headers ConfirmEmailChangeCurrentAddressResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 404:
+		var headers ConfirmEmailChangeCurrentAddressResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 413:
+		var headers ConfirmEmailChangeCurrentAddressResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers ConfirmEmailChangeCurrentAddressResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers ConfirmEmailChangeCurrentAddressResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	case rsp.StatusCode == 503:
+		var headers ConfirmEmailChangeCurrentAddressResponse503Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers503 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseConfirmEmailChangeNewAddressResponse parses an HTTP response from a ConfirmEmailChangeNewAddressWithResponse call
+func ParseConfirmEmailChangeNewAddressResponse(rsp *http.Response) (*ConfirmEmailChangeNewAddressResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ConfirmEmailChangeNewAddressResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest EmailChange
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers ConfirmEmailChangeNewAddressResponse200Headers
+		if values := rsp.Header.Values("Set-Cookie"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Set-Cookie", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.SetCookie = &value
+		}
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 400:
+		var headers ConfirmEmailChangeNewAddressResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 404:
+		var headers ConfirmEmailChangeNewAddressResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 413:
+		var headers ConfirmEmailChangeNewAddressResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers ConfirmEmailChangeNewAddressResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers ConfirmEmailChangeNewAddressResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseGetEmailVerificationStatusResponse parses an HTTP response from a GetEmailVerificationStatusWithResponse call
+func ParseGetEmailVerificationStatusResponse(rsp *http.Response) (*GetEmailVerificationStatusResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetEmailVerificationStatusResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest VerificationStatus
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers GetEmailVerificationStatusResponse200Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 401:
+		var headers GetEmailVerificationStatusResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 500:
+		var headers GetEmailVerificationStatusResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseRequestEmailVerificationResponse parses an HTTP response from a RequestEmailVerificationWithResponse call
+func ParseRequestEmailVerificationResponse(rsp *http.Response) (*RequestEmailVerificationResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RequestEmailVerificationResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest Accepted
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest MailUnavailable
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON503 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 202:
+		var headers RequestEmailVerificationResponse202Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers202 = &headers
+	case rsp.StatusCode == 400:
+		var headers RequestEmailVerificationResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 409:
+		var headers RequestEmailVerificationResponse409Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers409 = &headers
+	case rsp.StatusCode == 413:
+		var headers RequestEmailVerificationResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers RequestEmailVerificationResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers RequestEmailVerificationResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	case rsp.StatusCode == 503:
+		var headers RequestEmailVerificationResponse503Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers503 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseConfirmEmailVerificationResponse parses an HTTP response from a ConfirmEmailVerificationWithResponse call
+func ParseConfirmEmailVerificationResponse(rsp *http.Response) (*ConfirmEmailVerificationResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ConfirmEmailVerificationResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		var headers ConfirmEmailVerificationResponse204Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers204 = &headers
+	case rsp.StatusCode == 400:
+		var headers ConfirmEmailVerificationResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 404:
+		var headers ConfirmEmailVerificationResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 413:
+		var headers ConfirmEmailVerificationResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers ConfirmEmailVerificationResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers ConfirmEmailVerificationResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
 // ParseIntrospectAPIKeyResponse parses an HTTP response from a IntrospectAPIKeyWithResponse call
 func ParseIntrospectAPIKeyResponse(rsp *http.Response) (*IntrospectAPIKeyResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -11695,6 +15844,257 @@ func ParseRegenerateMFARecoveryCodesResponse(rsp *http.Response) (*RegenerateMFA
 		response.Headers423 = &headers
 	case rsp.StatusCode == 500:
 		var headers RegenerateMFARecoveryCodesResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseRequestPasswordResetResponse parses an HTTP response from a RequestPasswordResetWithResponse call
+func ParseRequestPasswordResetResponse(rsp *http.Response) (*RequestPasswordResetResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RequestPasswordResetResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest Accepted
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest MailUnavailable
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON503 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 202:
+		var headers RequestPasswordResetResponse202Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers202 = &headers
+	case rsp.StatusCode == 400:
+		var headers RequestPasswordResetResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 413:
+		var headers RequestPasswordResetResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers RequestPasswordResetResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers RequestPasswordResetResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	case rsp.StatusCode == 503:
+		var headers RequestPasswordResetResponse503Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers503 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseConfirmPasswordResetResponse parses an HTTP response from a ConfirmPasswordResetWithResponse call
+func ParseConfirmPasswordResetResponse(rsp *http.Response) (*ConfirmPasswordResetResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ConfirmPasswordResetResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		var headers ConfirmPasswordResetResponse204Headers
+		if values := rsp.Header.Values("Set-Cookie"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Set-Cookie", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.SetCookie = &value
+		}
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers204 = &headers
+	case rsp.StatusCode == 400:
+		var headers ConfirmPasswordResetResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 404:
+		var headers ConfirmPasswordResetResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 413:
+		var headers ConfirmPasswordResetResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers ConfirmPasswordResetResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers ConfirmPasswordResetResponse500Headers
 		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
 			var value string
 			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {

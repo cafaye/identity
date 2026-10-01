@@ -192,6 +192,41 @@ func (s *Store) ClientsForAccount(ctx context.Context, q db.Querier, accountID i
 // comes back ErrAlreadyRevoked rather than moving revoked_at and overwriting who
 // did it. Two operators clicking the same button at the same moment produce one
 // revocation event, not two.
+// RevokeAccessTokensForUser stops every access token this service issued to a
+// subject, across every registration they hold one for.
+//
+// IT LIVES ON THE STORE AND NOT ON THE STORAGE ADAPTER, and that placement is the
+// point rather than an accident of where it was written: this is one UPDATE over
+// `oidc_access_tokens`, it needs no signing key and no issuer, and the caller is
+// `internal/recovery` — a package that must be able to revoke a user's tokens on a
+// deployment where the OIDC provider is not mounted at all. Had it gone on Storage
+// it would have been unreachable exactly when a password reset needed it.
+//
+// WHY IT EXISTS: a recovery flow says "every credential this account had is gone",
+// and a JWT is the credential this service cannot take back by deleting a row — it
+// is verifiable by anybody holding the published JWKS from the moment it is minted
+// until its `exp`. Fifteen minutes is a real window in which a token from before
+// somebody's password was reset still works, and the row behind it is what closes
+// it.
+//
+// It is a bulk UPDATE and it is idempotent, for the reason
+// Storage.RevokeAccessTokensForClient is: a second call changes no rows and is not
+// an error, because a retry after a timeout must not be told it failed. Revoking
+// zero tokens is a success — a user who has never signed in through a product is
+// already in the state this is called for.
+func (s *Store) RevokeAccessTokensForUser(ctx context.Context, q db.Querier, subject id.UUID, at time.Time) error {
+	if subject.IsZero() {
+		return nil
+	}
+
+	const query = `UPDATE oidc_access_tokens SET revoked_at = $2 WHERE subject = $1 AND revoked_at IS NULL`
+
+	if _, err := q.Exec(ctx, query, subject, at); err != nil {
+		return fmt.Errorf("oidc: revoking a user's access tokens: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) RevokeClient(ctx context.Context, q db.Querier, rowID, accountID, by id.UUID, at time.Time, reason string) (Client, error) {
 	const query = `
 		UPDATE oidc_clients

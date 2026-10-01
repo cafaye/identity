@@ -108,14 +108,14 @@ gate:
     # read out of a `-v` run. See the note on those numbers below — they are
     # the finding, not the fix.
     #
-    #     whole suite      1789 PASS, 0 SKIP, 0 FAIL
-    #     database tier    1590 PASS, 0 SKIP, across 13 packages
+    #     whole suite      1939 PASS, 0 SKIP, 0 FAIL
+    #     database tier    1715 PASS, 0 SKIP, across 14 packages
     #
     # measured with `go test -v -count=1 ./...` against the pinned
     # postgres:17.11-alpine, and cross-checked with ci.yml's own awk, which
-    # reports the same two totals. The 1789 is 809 top-level `--- PASS:` lines
-    # plus 980 indented subtest ones; both counts are in the report. The skip
-    # count is reported separately and on
+    # reports the same two totals. Remeasured by the recovery packet, which is
+    # where SUITE_FLOOR and DATABASE_TIER_FLOOR in ci.yml were raised to match
+    # in the same commit. The skip count is reported separately and on
     # purpose: it is zero, and a zero written next to the pass count is the only
     # way a reader learns the number was looked for.
     #
@@ -186,9 +186,14 @@ gate:
     - id: cmd-identity-ran
       match: '^ok\s+github\.com/cafaye/identity/cmd/identity\t'
     # 8. NOT a success line, and that is why it is here. `client/generated` is
-    # 12,284 lines of committed oapi-codegen output with 3,001 statements and no
-    # test, excluded from the coverage floor by the DECLARED path
-    # `client/generated` in coverage-exclusions.
+    # 16,684 lines of committed oapi-codegen output and no test, excluded from the
+    # coverage floor by the DECLARED path `client/generated` in
+    # coverage-exclusions. Both numbers were restated by the recovery packet in the
+    # same commit as the regeneration that changed them, which is what
+    # `TestTheCoverageExclusionIsOnlyGeneratedCode` demands of the `lines=` field.
+    # The statement count is deliberately not quoted here: it moves with the
+    # generator's output shape and quoting it would be a second copy of a
+    # measurement, which is the hazard `coverage-exclusions` argues about at length.
     #
     # This proof asserts the exclusion is still real: the package has no test
     # files. AGENTS.md and `TestTheCoverageExclusionIsOnlyGeneratedCode` both
@@ -289,7 +294,7 @@ gate:
 external:
   # NOT self-contained, and saying so is the point. `bin/prime` needs a Go
   # toolchain this repository pins rather than ships, a module proxy on a cold
-  # checkout, and a PostgreSQL server with this repository's 13 migrations
+  # checkout, and a PostgreSQL server with this repository's 15 migrations
   # applied. A declaration that called this self-contained would be describing a
   # gate nobody has ever run on a clean machine — which is the same defect as
   # identity's suite being green against an unmigrated database, told the other
@@ -340,7 +345,7 @@ external:
     # three mistakes core/docs/gate.md records for this repository, and it is the
     # one that cost a 604-second recovery.
     - kind: database
-      name: the 13 migrations in migrations/ applied, as a deploy step ABOVE the suite — never inside it
+      name: the 15 migrations in migrations/ applied, as a deploy step ABOVE the suite — never inside it
       satisfy:
         # A repository-relative path, so the checker verifies the file is there:
         # a requirement satisfied by something that does not exist is a pointer

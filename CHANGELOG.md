@@ -6,6 +6,107 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added (packet identity-17-mailer)
+
+- **Password reset, email verification, and email change.** Three flows that can
+  only be finished by proving you can read an inbox, on eight new routes and one
+  package: `POST /v1/password-resets`, `POST /v1/password-resets/confirm`,
+  `POST /v1/email-verifications`, `POST /v1/email-verifications/confirm`,
+  `GET /v1/email-verification`, `POST /v1/email-changes`,
+  `POST /v1/email-changes/current-address`, `POST /v1/email-changes/new-address`.
+  `openapi/v1.yaml` is at **1.5.0** with a new `recovery` tag; the generated Go
+  client and its wrapper were regenerated in the same commit.
+
+  They are one package (`internal/recovery`) and one table (`recovery_tokens`,
+  migration 00015, with a `purpose` CHECK) rather than three, because the token
+  lifecycle is identical in all three: mint 256 bits, store only the SHA-256, mail
+  it, expire it, spend it with a conditional write that makes a second presentation
+  a refusal. Splitting them would have produced three token formats, three expiry
+  rules and three answers to "is this still live". A `password_reset` token
+  presented to the verification route is a **404**, not a different error.
+
+- **The email change has two confirmed sides, and the second token does not exist
+  until the first is redeemed.** A stolen session can start a change, and what it
+  produces is a link in the victim's inbox and nowhere else: the attacker cannot
+  advance it, and the victim gets the one warning they would otherwise never get.
+  The schema enforces this rather than the code — `recovery_tokens` carries a
+  `target_token_digest`, and a CHECK refuses a row with a target whose first side
+  is not confirmed. Presenting either token to the other route is a 404, and so is
+  presenting either one alone.
+
+- **A password reset and an email change end every session and every live OIDC
+  access token, in the same transaction that makes the change**, and mint nothing.
+  Scoped API keys deliberately survive, which is the same rule and the same reason
+  as MFA: a key is a credential somebody created for a script, and silently
+  revoking one breaks a CI job with nothing in the response saying why. Address
+  verification revokes nothing either — a verification is a fact about an address,
+  not a credential.
+
+- **The request routes cannot be told apart.** `POST /v1/password-resets` and
+  `POST /v1/email-verifications` answer a registered address, an unregistered one
+  and an address inside the cooldown with `202 {"status":"accepted"}` — identical
+  bytes, asserted by byte comparison over HTTP. The body is a **constant** in the
+  handler rather than a template with a field that happens to render the same
+  either way, because a field is a field and the next person to add an `expires_at`
+  reinstates the oracle without touching a test.
+
+- **The delivery path is one seam, and this repository wires the implementation
+  that fails.** `recovery.Mailer` is `Send` and `Ready`; the second exists so a
+  request flow can ask whether a message can be delivered *before* it mints a
+  token or looks the address up, which is what stops a deployment with no mail
+  turning "503 against 202" into an account-existence oracle. `main` wires
+  `recovery.Unavailable{}`, and every route that needs to send answers `503
+  service_unavailable` with a sentence naming the deployment problem. **No message
+  is ever logged**, and `TestNoRecoveryTokenReachesTheLogs` drives all three flows
+  through a logger that keeps everything to prove it.
+
+  **The honest limit: a user who forgets their password cannot recover today.**
+  The flows are complete and tested over a recording double; courier's delivery
+  path is unfinished, so there is nowhere for the link to go. Wiring it is three
+  lines in `buildRecovery` (DECISIONS.md D7). The alternative considered and
+  rejected was a mailer that logs, so an operator could see it "worked" — a live
+  single-use credential in a searchable log aggregator is a credential anybody who
+  can read the logs can redeem.
+
+- **`users.email_verified_at` (migration 00014), and `GET /v1/me` did not grow a
+  field for it.** `GET /v1/email-verification` is a separate route because
+  `/v1/me`'s projection is asserted field-by-field to be exactly `id` and `email`.
+  An email change **clears** the verification in the same statement that moves the
+  address, so the `200` from the new-address confirmation says
+  `email_verified: false` — clicking a link proves you can read an inbox, not that
+  the address is yours. `identity.user.email_verified` is emitted for a real
+  verification only.
+
+- **Two events, declared in `cafaye.yml`:** `identity.user.email_verified` and
+  `identity.session.revoked` (with a closed two-value `reason`). The second is
+  emitted **only** where every credential the account holds is gone — never for a
+  single `DELETE /v1/session`, which is a different fact with a different
+  consequence for a consumer. That gap is recorded in README.md rather than
+  papered over by emitting the wrong type.
+
+- **Every route on the surface refuses a scoped API token with 403**, and two
+  require a session. A credential that could start an email change could move an
+  account's recovery path, and a credential that could mint a password reset is a
+  takeover with a delay rather than a break-in — so there is no scope for any of it
+  and there is not going to be one. The four redemption routes are anonymous
+  because the token in the body **is** the credential, and
+  `TestNoRecoveryRouteAcceptsASessionInPlaceOfItsToken` holds that they do not
+  quietly require one.
+
+- **A cooldown, not a rate limiter.** One minute per address per purpose; a request
+  inside it mints nothing, sends nothing, and answers identically. It does **not**
+  supersede a live link — a request route that invalidated one would let anybody
+  invalidate a victim's pending reset. It is not per-client and does nothing about a
+  flood spread across a thousand addresses; per-source throttling belongs to
+  courier, which is in the path of every message this service sends. Declared as a
+  gap rather than invented here.
+
+- **`oidc.Store.RevokeAccessTokensForUser`** — the JWT half of "a reset ends the
+  credentials issued before it", on the `Store` rather than on `Storage` so it
+  works without a signing key. `Profile.EmailVerified` now reads
+  `email_verified_at`, so `email_verified` in a `userinfo` response stops being a
+  guess.
+
 ### Fixed (one postgres image fleet-wide)
 
 - **CI runs the same postgres the dev stack does.** This workflow pinned

@@ -589,3 +589,80 @@ lowering the input to 45 is option 2, and 0 would be weakening a gate to make a 
 green. The threshold is stated in both files, and
 `TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor` fails if they stop being the
 same number.
+
+## D7: the mail seam has two methods, and this repository wires the one that fails
+
+**Raised** 2026-10-01 by the recovery packet, which added password reset, address
+verification and address change — three flows that can only be finished by proving
+you can read an inbox, and therefore three flows that need to send mail.
+
+**The problem.** courier is the platform's mail service and its delivery path is not
+finished. So identity has to send mail it cannot yet send, and there are three
+shapes this could take.
+
+1. **Talk to courier's HTTP API anyway, and let it 503 in development.** Rejected: it
+   invents a contract against a service whose real one is in flight, so the adapter
+   would be written against a guess and thrown away.
+2. **Implement sending inside identity** — an SMTP client, a provider SDK, a queue.
+   Rejected, and this is the one worth being explicit about: it would be
+   *reimplementing courier inside the security boundary*. Two delivery paths means
+   two sets of retry semantics, two places a message can be lost, and two answers to
+   "is this deployment actually configured to send". The brief for this packet said
+   not to build courier's adapter, and the architecture says the same thing
+   independently.
+3. **One substitutable seam, wired to a mailer that fails loudly. CHOSEN.**
+
+**The seam, and why `Ready` is not padding.** `recovery.Mailer` is two methods:
+
+```go
+type Mailer interface {
+    Send(ctx context.Context, m Message) error
+    Ready(ctx context.Context) error
+}
+```
+
+`Ready` exists because every request flow must know whether a message *can* be
+delivered **before** it decides whether to mint a token — and it must know before it
+looks the address up. Without that ordering, a deployment with no mail answers `503`
+for a registered address and `202` for an unregistered one, and "503 against 202" is
+an account-existence oracle. The cheapest version of that bug is the kind that only
+shows up in the one deployment where nobody is testing. So the flow asks the seam
+first, and both answers come from the same place.
+
+`Ready` must not send anything and must be cheap: it is on an anonymous request path,
+so an implementation that performed a real delivery there would mail an empty message
+on every password-reset request anybody ever asked for.
+
+**Why the message is a rendered value, not a template name.** `Send` takes a
+`Message` whose `Subject` and `Body` are already strings. There is no `Template`
+field, and there is deliberately no code path where a delivery adapter chooses what
+the mail says. The moment `Message` grows a `Template`, identity has taken courier's
+rendering decisions and the two will disagree. Four templates live in
+`internal/recovery/message.go` as `strings.Replacer`s, so there is no inline body
+literal anywhere in a handler — which is a brief requirement and also the only way
+"the mail says X" is reviewable in one file.
+
+**Why `main` wires `Unavailable{}` and not a logger.** `Unavailable` is a struct (not
+a nil `Mailer`, so no caller has to decide whether nil is a supported configuration)
+whose `Send` and `Ready` both return `ErrNoMailer`. Every route that needs to send
+answers `503 service_unavailable` with a sentence naming the deployment problem.
+
+The tempting alternative is a mailer that logs the message so an operator can see it
+"worked". That is exactly the wrong shape for this particular message: **the body
+contains a live single-use credential**. A reset token in a log aggregator — which is
+searchable, retained, and usually readable by everyone who can read a deployment's
+metrics — is a reset token anybody who can read the logs can redeem. So the mailer
+fails loudly instead, and `TestNoRecoveryTokenReachesTheLogs` is the executable form
+of that decision.
+
+**Wiring courier is three lines** in `buildRecovery`, and that is the test of whether
+this was the right shape: the seam has exactly one production implementation and it
+is the one that refuses. Nothing in `internal/recovery` mentions courier, SMTP, or
+any provider, so the future adapter lands in one function in `cmd/identity` and the
+use cases do not change.
+
+**THE COST, STATED PLAINLY.** As wired, **a user who forgets their password cannot
+recover.** The flows are complete and tested; there is nowhere for the link to go.
+That is recorded in README.md's "Not built yet" with the reason, because the honest
+state for "we depend on a service that is not ready" is a paragraph and not a
+stub that returns 202 and drops the mail.

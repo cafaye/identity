@@ -170,7 +170,68 @@ service quietly listening on the wrong port.
 | `GET /v1/accounts/:id/admin/audit-log` | `200 {entries, next?}` | The account's admin audit trail, newest first, **append-only**. Bounded: `limit` defaults to 25 and is refused above 100; `before` is an opaque cursor. **Admin, `audit_log:read`, scoped api key only.** |
 | `DELETE /v1/accounts/:id/admin/invitations/:invitationId` | `204` | Revoke one pending invitation. The row is kept with `revoked_at`, and the address is freed to be invited again. `409 conflict` if already accepted or revoked, `404` for an id not in this account. **Admin, `account_invitations:write`, scoped api key only.** |
 | `POST /v1/accounts/:id/admin/invitation-revocations` | `200 {requested, revoked}` | Revoke up to 50 pending invitations in one transaction, **one** audit record for the lot. `confirm: true` and a non-empty array are both required. **Owner, `account_invitations:write`, scoped api key only.** |
+| `POST /v1/password-resets` | `202 {"status":"accepted"}` | Mail a single-use link, valid 30 minutes. **The same body for every address** — registered, unregistered, or inside the one-minute cooldown — so it cannot be used to discover who has an account. `503` when the deployment cannot send mail. |
+| `POST /v1/password-resets/confirm` | `204` | Set the new password and **revoke every session and every live access token**, in one transaction. Mints no session; sign in again. `404` for anything that is not a live token — never existed, expired, spent, or another flow's. |
+| `POST /v1/email-verifications` | `202 {"status":"accepted"}` | Mail a link proving the address **already on the account**. Registration does not send one. `409 conflict` once the address is already verified. |
+| `POST /v1/email-verifications/confirm` | `204` | Mark the address proved. **Revokes nothing and mints nothing** — a verification is a fact about an address, not a credential. |
+| `GET /v1/email-verification` | `200 {email, email_verified, email_verified_at?}` | Whether the caller's own address is proved. `email_verified_at` is **absent** when it was never proved, which is a different state from a proved address that has since been changed. |
+| `POST /v1/email-changes` | `201 {current_email, new_email, expires_at}` | Start a move. A link goes to the address the account has **now**; nothing moves until two addresses have each confirmed. `409 conflict` if the new address is taken, `422 already_current` if it is the one already there. |
+| `POST /v1/email-changes/current-address` | `202 {"status":"accepted"}` | Prove the current address; a second link is then minted for the **new** one. The body deliberately does not say where it went. |
+| `POST /v1/email-changes/new-address` | `200 {…, email_verified:false}` | Complete the move: the address changes, the verification is **cleared**, and every session and access token is revoked. `email_verified` is false on purpose — reading an inbox is not proof the address is yours. |
 | anything else on `/v1` | `404 not_found` | A problem document, not chi's default plain text. |
+
+**Every route in that block refuses a scoped API token with 403**, and two of them
+require a session. A credential that could start an email change could move an
+account's recovery path, and a credential that could mint a password reset is a
+takeover with a delay rather than a break-in — so there is no scope in the machine
+vocabulary for any of it, and there is not going to be one. The four redemption
+routes are anonymous, because the token in the body **is** the credential.
+
+### Recovery: one token machine, three flows
+
+Password reset, address verification and address change are three features and one
+lifecycle: mint 256 bits, store only their SHA-256, mail them, expire them, and
+spend them with a conditional write that makes a second presentation a refusal. So
+they are one package (`internal/recovery`) and one table with a `purpose` CHECK,
+rather than three packages with three token formats and three answers to "is this
+still live". A `password_reset` token presented to the verification route is a 404,
+not a different error.
+
+**The email change has two sides and the second token does not exist until the first
+is redeemed.** A stolen session can start one, and what it produces is a link in the
+victim's inbox and nowhere else — the attacker cannot advance it, and the victim gets
+the one warning they would otherwise never get.
+
+**Delivery goes through one seam with two methods, and this repository does not
+implement the delivery.** `recovery.Mailer` is `Send` and `Ready`; the second exists
+so a request flow can ask whether a message *can* be delivered before it mints
+anything, which is what keeps a deployment without mail from turning "503" into an
+account-existence oracle. `main` wires `recovery.Unavailable{}`, which **fails** —
+every path that needs to send answers `503` with a sentence saying why. That is
+deliberately not a mailer that logs: a reset token in a log aggregator is a reset
+token anybody who can read the logs can redeem. courier is the platform's mail
+service and its delivery path is unfinished; wiring it is three lines in
+`buildRecovery` (see DECISIONS.md D7).
+
+**Email bodies carry no URL.** identity does not know the product's route shapes, so
+the body carries the token, the address and the deadline, and the product builds the
+link. The token is never in a subject line.
+
+**A cooldown is not a rate limiter.** `RequestWindow` is one minute per address per
+purpose, and a request inside it mints nothing, sends nothing, and answers
+identically. It does not supersede a live link: a request route that invalidated one
+would let anybody invalidate a victim's pending reset. It does nothing about a flood
+spread across a thousand addresses and is not per-client. Per-source throttling
+belongs to courier, which is in the path of every message this service sends — this
+is a declared gap, not an oversight.
+
+**A reset and an email change end sessions and OIDC access tokens, and not scoped
+API keys.** Same rule and same reasoning as MFA: a key is a credential somebody
+deliberately created for a script, and silently revoking one breaks a CI job with
+nothing in the response saying why. Verification revokes nothing.
+
+**No message is ever logged**, and `TestNoRecoveryTokenReachesTheLogs` drives all
+three flows through a logger that keeps everything to prove it.
 
 ### The admin surface, and why it is a separate thing
 
@@ -1097,10 +1158,34 @@ docker run --rm -p 8080:8080 identity
 
 ## Not built yet
 
-Everything below is a later packet, and none of it is stubbed to look finished:
-email verification, password reset, the admin API, and key rotation. No
-self-service password recovery — a user who forgets a password today has no path
-back in.
+Everything below is a later packet, and none of it is stubbed to look finished: the
+admin API, and key rotation.
+
+Three things on the recovery surface are **not** here, and each is a decision rather
+than an oversight:
+
+- **No mail delivery.** The `Mailer` seam is one interface with two methods and
+  `main` wires `Unavailable{}`, so every route that needs to send a message answers
+  `503 service_unavailable` with a sentence naming the deployment problem. The flows
+  are complete and tested over a recording double; the delivery path is courier's,
+  and courier has not finished it. **A user who forgets a password today cannot
+  recover**, because there is nowhere for the link to go — which is the honest state,
+  and the alternative (a mailer that logs, so an operator can see it "worked") would
+  put a live credential in a searchable log.
+- **No registration-time verification mail.** `POST /v1/users` sends nothing and a
+  client that wants an address proved calls `POST /v1/email-verifications`
+  afterwards. Registration is the one request that must not start failing because a
+  mail provider is unavailable, and the cost is one extra call in a product.
+- **No sweeper for expired recovery tokens.** `recovery_tokens_expires_at_idx` is in
+  the migration so the job is one statement when somebody wants it; in the meantime
+  the read query filters on `expires_at`, so an unswept row is harmless.
+
+**A single logout emits no event.** `identity.session.revoked` is declared and
+emitted only where *every* credential the account holds is gone — a password reset
+or an email change. `DELETE /v1/session` ends one session and announces nothing, so a
+subscriber cannot tell "this person signed out" from "this person's credentials are
+all gone". That gap is named rather than papered over by emitting the wrong type for
+a single revocation.
 
 Three things in the scoped-api-token area are specifically **not** here, and each
 is a decision rather than an oversight:
@@ -1146,7 +1231,8 @@ express would be a rule with a bypass in it.
 - [x] Password auth, sessions, lockout
 - [x] Error envelope, trace ids, panic recovery
 - [x] Outbox: transactional events, SKIP LOCKED claim, publisher loop
-- [ ] Email verification, password reset
+- [x] Email verification, password reset, email change (flows complete; the mail
+      delivery path is courier's and is not wired)
 - [x] OAuth (social login) via goth
 - [x] Accounts, memberships, roles, invitations
 - [x] OIDC provider (zitadel/oidc)

@@ -33,20 +33,24 @@ type Profile struct {
 	// account screen, and a product that needs a real name needs the profile
 	// packet this service does not have yet.
 	Name string
-	// EmailVerified is ALWAYS false, and that is a fact rather than an omission.
+	// EmailVerified says whether somebody has proved they can read this address.
 	//
-	// identity has no email-verification column: the verification link, the
-	// signed token and the resend endpoint are a later packet. There is therefore
-	// nothing here that could prove an address, and `false` is the only claim that
-	// is safe to make — a relying party that reads `true` from this would skip
-	// sending a verification email to an address nobody has proved they own, and
-	// an account takeover becomes a matter of registering somebody else's address.
+	// IT IS A READ OF users.email_verified_at AND NOTHING ELSE, which is what the
+	// comment this replaces promised when the column did not exist: the
+	// verification flow added a column, a request, a redemption, and a rule that
+	// clears the column whenever the address moves — and this claim needed no change
+	// beyond reading it.
 	//
-	// When the verification packet lands this becomes a read of
-	// users.email_verified_at and nothing else changes. The claim is emitted
-	// explicitly even though it is false, because oidc.UserInfo.EmailVerified
-	// carries `omitempty` and a false bool would otherwise vanish from the token
-	// and leave a relying party guessing whether the provider supports it.
+	// `false` here is still the answer for every account that has not followed a
+	// verification link, and it is the answer a relying party should act on
+	// hardest: `true` tells a product it may skip sending its own verification
+	// mail, so a claim of `true` on an address nobody has proved is how an account
+	// takeover becomes a matter of registering somebody else's inbox.
+	//
+	// It is emitted EXPLICITLY rather than through oidc.UserInfo.EmailVerified,
+	// because that field carries `omitempty` and a false bool would otherwise
+	// vanish from the token and leave a relying party unable to tell "not
+	// verified" from "this provider does not have the concept".
 	EmailVerified bool
 	// Accounts is every membership the user holds, each with the role they hold
 	// it under.
@@ -95,8 +99,17 @@ func NewProfileReader() ProfileReader { return pgProfileReader{} }
 func (pgProfileReader) Profile(ctx context.Context, q db.Querier, userID id.UUID) (Profile, error) {
 	p := Profile{UserID: userID, Accounts: []Membership{}}
 
-	const userQuery = `SELECT email FROM users WHERE id = $1`
-	if err := q.QueryRow(ctx, userQuery, userID).Scan(&p.Email); err != nil {
+	// One statement for the address and its verification together, rather than two:
+	// a profile is assembled inside the transaction that records the access token,
+	// and two statements would open a window in which the address is read and the
+	// verification is read from a different version of the row. A claim pair that
+	// disagrees about which address is verified is a claim about nobody's account.
+	//
+	// `email_verified_at IS NOT NULL` in the SELECT list rather than a nullable
+	// timestamp on the struct: this type carries the ANSWER, and a nullable instant
+	// would invite a caller to decide for itself what NULL means.
+	const userQuery = `SELECT email, email_verified_at IS NOT NULL FROM users WHERE id = $1`
+	if err := q.QueryRow(ctx, userQuery, userID).Scan(&p.Email, &p.EmailVerified); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Profile{}, fmt.Errorf("%w: %s", ErrNoProfile, userID)
 		}

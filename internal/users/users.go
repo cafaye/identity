@@ -82,9 +82,26 @@ type User struct {
 	// time, because "never locked" and "locked until 1970" are different answers
 	// and only one of them is true.
 	LockedUntil *time.Time
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// EmailVerifiedAt is when somebody proved they can read the address on this
+	// row, by following a link delivered to it. nil means nobody has.
+	//
+	// A POINTER WITH NO `false`, and the absence is the whole of the design: there
+	// is no state in which an address is "known to be bad", because the only thing
+	// a verification proves is that somebody read a message at this address at this
+	// instant. The way to stop trusting it is to change the address, and
+	// Store.SetEmail clears this in the same transaction that moves it.
+	EmailVerifiedAt *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
+
+// IsVerified reports whether the address on this row has been proved.
+//
+// It is a method rather than a comparison against nil at every call site because
+// the two answers callers want from it are "may I say verified" and "may I say
+// NOT verified", and a caller that forgets the second has made a claim about an
+// address nobody checked.
+func (u User) IsVerified() bool { return u.EmailVerifiedAt != nil }
 
 // IsLocked reports whether the account is locked as of now. A lock whose instant
 // has arrived is not a lock: expiry is checked on read rather than by a sweeper,
