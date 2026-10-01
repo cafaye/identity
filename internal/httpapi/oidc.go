@@ -215,7 +215,47 @@ func (o options) handleOIDCAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// THE FLOW MARKER, set here because this is the only place the start of a
+	// flow is observable. The browser is about to be redirected to a login URL
+	// carrying a request id that is a bearer capability for that authorization
+	// request, and handleOIDCLogin refuses to complete it unless this cookie is
+	// present — so a browser that arrived at a login URL some other way cannot
+	// spend a session it happens to hold.
+	//
+	// It is set AFTER the pre-check and not before it, so a request this service
+	// refuses outright does not leave a marker behind. It is set on BOTH the
+	// success and the library's own refusal, which is correct: the library's
+	// refusals redirect back to the client rather than to the login page, so the
+	// marker is spent either way and cannot accumulate meaning.
+	if state, err := oauth.NewState(OIDCStateProvider); err != nil {
+		unexpected(w, r, o.logger, err)
+		return
+	} else {
+		http.SetCookie(w, oidcFlowCookie(state))
+	}
+
 	o.delegateOIDC(w, r)
+}
+
+// oidcFlowCookie writes the flow marker.
+//
+// Its lifetime is the login form's, because it exists to carry a browser from
+// `/oidc/authorize` to `/oidc/login/{id}` and for no longer. A user who walks
+// away mid-sign-in does not come back tomorrow with a marker that still works.
+func oidcFlowCookie(state string) *http.Cookie {
+	return &http.Cookie{
+		Name:     OIDCFlowCookieName,
+		Value:    state,
+		Path:     "/", // required by the __Host- prefix
+		Secure:   true,
+		HttpOnly: true,
+		// Lax, like every other cookie this service sets. The flow marker rides a
+		// top-level redirect from /oidc/authorize to the login page, which is
+		// exactly what Lax permits and Strict would break.
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(OIDCStateTTL / time.Second),
+		Expires:  time.Now().Add(OIDCStateTTL),
+	}
 }
 
 // checkAuthorizeParams is the pre-check, as one function returning a reason.
@@ -298,6 +338,27 @@ const OIDCStateCookiePrefix = "__Host-oidc-state-"
 // while they were away would be a form that cannot be submitted.
 const OIDCStateTTL = 10 * time.Minute
 
+// OIDCFlowCookieName marks a browser that has been handed an authorization
+// request by THIS service.
+//
+// It is the proof that the browser holding it began the flow rather than arriving
+// at a login URL somebody else chose, and it is set at handleOIDCAuthorize —
+// which is the only point where the start of a flow is observable. The login page
+// cannot set it, because by the time the login page runs the two cases are
+// indistinguishable: a browser that legitimately followed the redirect from
+// `/oidc/authorize` and a browser that followed a link to `/oidc/login/{id}` are
+// the same GET with the same ambient session cookie.
+//
+// `__Host-`, so no other origin can write it. The property is entirely that the
+// cookie could only have been set by this service on this deployment.
+//
+// It is deliberately NOT keyed by request id. The id does not exist until the
+// library has created the row, which is after this cookie must already have been
+// written, and binding it later would mean the cookie is set by the very page the
+// attack aims at. One cookie for the service answers "did a flow start here",
+// which is a question about the browser and not about one request.
+const OIDCFlowCookieName = "__Host-oidc-flow"
+
 // handleOIDCLogin is the page the protocol hands control to.
 //
 // GET renders the form, or completes the flow immediately for a user who already
@@ -305,6 +366,30 @@ const OIDCStateTTL = 10 * time.Minute
 // `id_token_hint` and what makes signing in to a second product not require
 // typing the same password twice. POST checks the password, sets the session
 // cookie and completes.
+//
+// THE SILENT PATH IS GATED ON OIDCFlowCookieName, and that gate is the whole of
+// this handler's authorization. finishOIDCLogin completes an authorization
+// request for whoever asks, so the question is not "is this user authenticated"
+// — it is "did THIS BROWSER start THIS flow". A live session answers the first
+// and says nothing about the second: a session is per-user, while the request
+// belongs to one client, one redirect_uri and one PKCE verifier, all of which
+// belong to whoever began the flow.
+//
+// WITHOUT THE GATE this page is a login-CSRF oracle. The request id is a uuid in
+// a URL, so it is not secret in any way a user-agent boundary respects: it is in
+// the address bar, in history, and in whatever link somebody sent them. Anyone
+// who can get a signed-in user's browser to make a top-level GET to
+// `/oidc/login/{id}` — a link, an <img>, a redirect — has that browser complete
+// the authorization request with no interaction at all, and the code is
+// redirected to the redirect_uri of the client that chose it. The attacker holds
+// that client's secret and its PKCE verifier, so they exchange the code and hold
+// an id_token whose subject is the victim.
+//
+// `state` does not help, and the reason is worth stating precisely: state is the
+// CLIENT's defence against CSRF against the client's own callback, and the
+// attacker here IS the client, so they know their own state. `prompt=login` and
+// `max_age` — the two levers a client has for demanding interaction — are both
+// refused by checkAuthorizeParams, so there is nothing else to fall back on.
 func (o options) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 	requestID := chi.URLParam(r, oidcRequestParam)
 
@@ -319,9 +404,20 @@ func (o options) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A user who is already signed in skips the form entirely. The state cookie
-	// is not set on this path because nothing is going to be submitted.
+	// A user who is already signed in skips the form entirely — but only in a
+	// browser this service handed a flow to.
 	if user, ok := o.signedInUser(r); ok {
+		if !o.browserStartedThisFlow(r) {
+			// No flow cookie: this browser arrived at a login URL carrying nothing
+			// but an ambient session. Answering 403 rather than falling through to
+			// the form is deliberate — the form is a page the user reads, and this
+			// flow never asked to show them one. The honest answer is "this
+			// sign-in was not started here", and the product restarts the flow from
+			// its own redirect, which sets the cookie on the way past.
+			problemFor(w, r, http.StatusForbidden, CodeForbidden,
+				"this sign-in was not started in this browser; start again from the application")
+			return
+		}
 		o.finishOIDCLogin(w, r, banner.RequestID, user.ID)
 		return
 	}
@@ -334,6 +430,27 @@ func (o options) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, oidcStateCookie(banner.RequestID, state))
 
 	writeHTML(w, http.StatusOK, oidcLoginPage(banner, state))
+}
+
+// browserStartedThisFlow reports whether this browser was handed an
+// authorization request by handleOIDCAuthorize.
+//
+// The check is on the SHAPE of the cookie rather than on a compared secret: its
+// value is random and only its presence is load-bearing, so there is nothing here
+// for a constant-time comparison to protect. What the `__Host-` prefix buys is
+// that no other origin could have written the cookie at all, and that is the
+// property being spent — so a cookie this service did not write is refused, and
+// so is one written with a value this service never mints.
+func (o options) browserStartedThisFlow(r *http.Request) bool {
+	cookie, err := r.Cookie(OIDCFlowCookieName)
+	if err != nil {
+		return false
+	}
+	// VerifyState with the value as both arguments is a shape test that reuses
+	// the one parser in the service: it requires the provider prefix and a
+	// non-empty token and rejects a second separator, which is exactly what
+	// "a value this service minted" means.
+	return oauth.VerifyState(OIDCStateProvider, cookie.Value, cookie.Value)
 }
 
 // completeOIDCLogin is the POST: verify the state, check the password, set the

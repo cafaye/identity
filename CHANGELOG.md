@@ -6,6 +6,40 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security (packet identity-16-d5)
+
+- **`/oidc/login/{requestID}` no longer completes an authorization request for a
+  browser that did not start it.** The silent sign-in path answered any request
+  that carried a live session cookie, so the only thing standing between "the
+  browser this flow was handed to" and "any browser signed in as the same user"
+  was the request id being unguessable — and a uuid in a URL is not a secret in
+  any way a user-agent boundary respects. Anyone who could get a signed-in
+  user's browser to make a top-level `GET` of a login URL they chose (a link, an
+  `<img>`, a redirect) had that browser complete the request with no interaction
+  at all, and the code was redirected to the `redirect_uri` of the client that
+  chose it. The attacker holds that client's secret and its PKCE verifier, so
+  they exchange it and hold an `id_token` whose subject is the victim.
+  `state` does not help here: state is the *client's* CSRF defence against the
+  client's own callback, and in this attack the attacker is the client.
+  `prompt=login` and `max_age` — the two levers a client has for demanding
+  interaction — were both refused by `checkAuthorizeParams`, so there was
+  nothing else to fall back on.
+
+  The fix is a `__Host-oidc-flow` cookie set at `handleOIDCAuthorize`, which is
+  the only point where the start of a flow is observable; the login page requires
+  it before completing anything. `__Host-` is what makes it unforgeable from
+  another origin. Two red proofs in
+  `internal/httpapi/oidc_browser_binding_test.go`, one asserting the request is
+  not completed without the cookie and one driving the whole attack end to end
+  with two different users in it.
+
+  The honest limit: the request id is still a bearer capability for *rendering a
+  form* — an attacker can still show a victim a login page for the attacker's own
+  client. What they cannot do is have the victim's existing session sign it
+  without the victim seeing anything, which is the part that was silently
+  crossing an account boundary. Consent remains absent by design
+  (`openid/openid.yaml`, `README.md`); this closes the session-riding half.
+
 ### Fixed (packet identity-14-rename)
 
 - **`core: ^0.1.0` → `^0.2.0`, and it is the whole of what the contract checker
