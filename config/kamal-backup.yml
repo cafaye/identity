@@ -1,0 +1,192 @@
+---
+# config/kamal-backup.yml — identity's backup configuration.
+#
+# Copied from `templates/kamal/kamal-backup.yml.erb` in cafaye/kit at the ref in
+# `kit.ref` (a0959929), which is this repository's pinned kit commit. The only
+# value the template needed was KIT_SERVICE, and identity's is `identity` — the
+# same name as `cafaye.yml`'s `name:`, the module path, the compose service and
+# the outbox envelope's `source`. Re-copy on a kit bump and re-check that one
+# value, because a mismatch writes the snapshot under one name and looks for it
+# under another, which reads as "the backup is missing".
+#
+# WHAT THIS FILE IS, AND WHAT IT IS NOT. It is the only place the fleet says what
+# identity backs up, and it is **not** a claim that a backup has ever run.** The
+# thing that runs this file is the `backup` accessory in `config/deploy.yml`,
+# which mounts it at /app/config/kamal-backup.yml; the scheduler is a foreground
+# loop inside that container. Until the accessory is booted, the R2 bucket
+# exists, the six secrets in `.kamal/secrets` are set and somebody takes a dump
+# by hand, this is a specification. README.md § "Backups" says the same thing in
+# the place an operator reads, and the runbook in cafaye/docs is the procedure.
+#
+# WHAT DOES NOT APPEAR IN THIS FILE, AND THAT IS THE POINT.
+#
+#   1. No database name. The connection is `{ secret: DATABASE_URL }` — the same
+#      DSN the service itself opens, resolved from the same accessory
+#      environment. There is no spelling of the database anywhere in this file,
+#      so there is no way for the dump and the service to point at different
+#      ones. identity's development DSN is
+#      postgres://identity:identity@postgres:5432/identity?sslmode=disable, but
+#      that is docker-compose.yml's provisioning and it does NOT carry over: the
+#      postgres accessory in config/deploy.yml sets only POSTGRES_PASSWORD, so the
+#      image's own defaults decide the role and database name, and the operator's
+#      DATABASE_URL has to name whatever those are. This file does not spell a
+#      database name to agree with, and that is deliberate — a name written here
+#      is a second fact to keep correct and a config that can be right about the
+#      dump and wrong about the service.
+#   2. No `paths:`. See the block at the end of this file.
+#   3. No credentials. Every secret below is a NAME. The values live in
+#      `.kamal/secrets` on the operator's machine, which is git-ignored, and in
+#      no file in this repository.
+
+# The application name, and therefore the accessory that runs this config and
+# the path every snapshot is written under. Changing it orphans every existing
+# snapshot, because restic tracks by path.
+app: identity
+
+# Which accessory in `config/deploy.yml` this config belongs to. It must be a
+# name declared under `accessories:` there; the name is how kamal-backup finds
+# the container to run in, and how it finds that container's secrets.
+accessory: backup
+
+# ONE DATABASE, NAMED, WITH A REASON.
+#
+# `name:` is a LABEL, not a database name: it is the path component under
+# databases/identity/<name>/ and the restic tag. Renaming it orphans every
+# existing snapshot, so it is set once and it is `primary`.
+#
+# Why one database and not four: identity has exactly one, and `pg_dump` of a
+# database is a dump of every table in it — users, sessions, api_keys, the OIDC
+# and MFA tables, the tenancy tables, the admin audit log, the outbox. A backup
+# of a subset of a database is a restore path nobody drills, and drilling two is
+# twice the work and the second one is the one that breaks.
+databases:
+  - name: primary
+    adapter: postgres
+    url:
+      # The name of a Kamal secret, resolved from the backup accessory's
+      # environment, which `config/deploy.yml` builds from its `env.secret`
+      # list. That cross-file contract is real and enforced by
+      # `kamal-backup validate`, which builds the environment from
+      # `config/deploy.yml` and nothing else — a secret named here and missing
+      # there is a valid YAML file that fails validation with
+      # "RESTIC_REPOSITORY or RESTIC_REPOSITORY_FILE is required".
+      secret: DATABASE_URL
+    password:
+      # Passed to pg_dump as PGPASSWORD, and kept out of the URL argument so
+      # `ps` never shows it to another user on the machine.
+      #
+      # **This value must equal the password inside DATABASE_URL, and identity
+      # itself never reads it.** `DATABASE_PASSWORD` appears nowhere in this
+      # repository — not in `internal/config`, not in the compose file, not in
+      # any test. It exists solely so pg_dump gets a credential in its
+      # environment rather than in its argv, which means it is a Kamal secret an
+      # operator has to set by hand and a second place to get right.
+      secret: DATABASE_PASSWORD
+
+restic:
+  # R2 is S3-compatible, so the repository is an S3 endpoint. The whole URL is a
+  # secret rather than assembled from an account id here: the bucket name is an
+  # operator's choice, and a config that guesses it is a config that writes a
+  # full database dump — every password digest, every TOTP secret, every session
+  # token hash — somewhere the operator did not choose. Format:
+  #   s3:https://ACCOUNT_ID.r2.cloudflarestorage.com/identity-db-backups
+  repository:
+    secret: RESTIC_REPOSITORY
+  # restic's own encryption password. It is the ONLY thing standing between a
+  # leaked bucket and a readable database dump, and it is not the same value as
+  # any credential identity uses. Lose it and every snapshot in the repository
+  # is permanently unreadable, including the ones you have not lost yet — so it
+  # is the one secret from this file worth writing down in two places.
+  password:
+    secret: RESTIC_PASSWORD
+  # Create the repository if it is absent. This initialises the *repository*
+  # inside a bucket you have already created; it does not create the bucket.
+  init_if_missing: true
+  # RETENTION, WRITTEN OUT RATHER THAN INHERITED.
+  #
+  # kamal-backup 0.5.2's defaults happen to be exactly these five numbers, so
+  # leaving the block out would work today. It is written out anyway, because a
+  # retention policy that lives in a dependency's default is a retention policy
+  # that changes when their gem releases — and the diff at that moment is about
+  # the gem rather than about the thing deciding how far back a restore reaches.
+  #
+  # In plain terms: every snapshot from the last week, one a day back a month,
+  # one a week back two months, one a month back a year, and two a year
+  # indefinitely. Roughly 26 snapshots. The oldest thing restoreable is about a
+  # year old; the newest is up to a day old.
+  retention:
+    keep_last: 7
+    keep_daily: 7
+    keep_weekly: 4
+    keep_monthly: 6
+    keep_yearly: 2
+  # Verify the repository's structure after each backup. Costs time
+  # proportional to the metadata, not the data, and a repository that has been
+  # silently losing blocks is the failure this catches — detectable only while
+  # there is still something to find. It is the cheap check: it does not read
+  # back every byte of every pack, so it will not find a single subtly corrupt
+  # pack.
+  check_after_backup: true
+
+backup:
+  # At most one backup per day.
+  #
+  # THIS REPLACES A CRONTAB, which is the part worth understanding: the
+  # scheduler is a foreground loop inside the backup container, and the "last
+  # backup finished at" timestamp lives in the accessory's state volume
+  # (identity_backup_state in config/deploy.yml). A cron entry has neither — it
+  # fires on wall-clock time whether or not the last run finished, so a dump
+  # that took six hours would start again the moment it ended on a host already
+  # struggling.
+  #
+  # THE DATA-LOSS WINDOW THIS IMPLIES, because it is the number to put next to a
+  # promise made to a customer:
+  #
+  #   **Up to 24 hours of committed transactions are lost if the primary
+  #   database is destroyed. This is a scheduled dump, not point-in-time
+  #   recovery — there is no WAL shipping and no base backup.**
+  #
+  # And the window is not exactly 24 hours, in three ways that all push it wider:
+  #
+  #   - it is measured from when the previous backup *finished*, not from a
+  #     wall-clock deadline. The loop is "run a backup, then sleep the
+  #     interval", so one cycle is the interval PLUS the previous run's duration.
+  #   - `pg_dump` opens a single repeatable-read transaction, so the snapshot is
+  #     taken at the START of the dump. The gap between two snapshot points is
+  #     the whole cycle.
+  #   - a failed backup is NOT retried until the next interval. The loop catches
+  #     the failure, logs it, and then sleeps. A dump that has been failing for
+  #     six hours has not been retried six times. The operator-facing half: a
+  #     failed backup does not update the state file, so the next one is already
+  #     due and `kamal-backup backup` by hand retries immediately.
+  schedule: 1d
+
+# WHY THERE IS NO `paths:` KEY HERE, AND FOR IDENTITY THAT IS A VERIFIED FACT
+# RATHER THAN A GENERAL RULE.
+#
+# A backup of a database is not a backup of a service. Anything on local disk
+# that matters belongs in object storage, where it is already replicated and
+# already off the host, and snapshotting it a second time into a restic
+# repository on the same account buys a second copy of bytes that were never at
+# risk, at the cost of a second thing to restore.
+#
+# For identity the decision costs nothing, because identity HAS NO SUCH STATE:
+#
+#   - Nothing is written to disk. The image is
+#     `gcr.io/distroless/static-debian12:nonroot` with no shell, and there is no
+#     `os.Create`, `os.WriteFile` or `os.MkdirAll` anywhere in `cmd/`,
+#     `internal/` or `client/`. The Dockerfile says it: the pool is opened
+#     lazily and closed on SIGTERM, so there is nothing to flush.
+#   - There is NO object storage and no file upload surface. No bucket, no
+#     `storage_key`, no multipart upload, no attachment. Unlike darkroom —
+#     whose `assets` rows point at bytes in a bucket that a `pg_dump` cannot
+#     reach — a restored identity database has nothing pointing at anything
+#     outside Postgres. **If a future packet adds an upload or a bucket, this
+#     comment and the runbook's "the object bucket is the second thing to back
+#     up" both become wrong, and the bucket becomes the first thing to lose.**
+#
+# Also absent from the dump, and not fixable here: Postgres ROLES and
+# TABLESPACES. The dump is a single database with `--no-owner --no-privileges`,
+# so it carries no CREATE ROLE and no ownership; the role comes from how the
+# Postgres accessory was provisioned, and restoring into a differently-named role
+# means that role has to exist first.
