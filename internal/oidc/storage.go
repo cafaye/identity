@@ -609,7 +609,11 @@ func (s *Storage) setUserinfo(ctx context.Context, userinfo *oidc.UserInfo, subj
 		// a false one would otherwise be missing from the token. A relying party
 		// that cannot see the claim has to decide whether the provider supports it,
 		// and "the field is absent" is the one answer that means "assume verified".
-		userinfo.AppendClaims(ClaimEmailVerified, false)
+		//
+		// The value is the read of users.email_verified_at rather than a constant
+		// false, which is what internal/recovery made true. See Profile.EmailVerified
+		// for what a `true` here now claims, and what it does not.
+		userinfo.AppendClaims(ClaimEmailVerified, profile.EmailVerified)
 	}
 	if slices.Contains(granted, ScopeProfile) {
 		userinfo.Name = profile.Name

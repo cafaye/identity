@@ -37,7 +37,8 @@ func NewStore(pool db.Pool) *Store { return &Store{pool: pool} }
 
 // userColumns is the select list, in the order scan expects. One constant, so a
 // column added here cannot be forgotten in one query and present in another.
-const userColumns = `id, email, password_digest, failed_login_attempts, locked_until, created_at, updated_at`
+const userColumns = `id, email, password_digest, failed_login_attempts, locked_until, ` +
+	`email_verified_at, created_at, updated_at`
 
 // Create inserts a user and returns the stored row.
 //
@@ -52,7 +53,8 @@ func (s *Store) Create(ctx context.Context, q db.Querier, p CreateParams) (User,
 
 	var u User
 	err := q.QueryRow(ctx, query, p.Email, p.PasswordDigest).Scan(
-		&u.ID, &u.Email, &u.PasswordDigest, &u.FailedLoginAttempts, &u.LockedUntil, &u.CreatedAt, &u.UpdatedAt,
+		&u.ID, &u.Email, &u.PasswordDigest, &u.FailedLoginAttempts, &u.LockedUntil,
+		&u.EmailVerifiedAt, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if err != nil {
 		if isEmailTaken(err) {
@@ -126,12 +128,101 @@ func (s *Store) ClearFailures(ctx context.Context, q db.Querier, userID id.UUID)
 	return nil
 }
 
+// SetPassword replaces the credential and clears the lockout, in one statement.
+//
+// THE LOCKOUT GOES WITH IT, and that is the decision rather than an oversight. A
+// password reset is proved by a link delivered to the account's mailbox, which is
+// strictly stronger evidence than the password that a run of failures was guessing
+// at — so leaving a user who has just recovered their account locked out for the
+// remainder of the window would punish them for somebody else's attempts, and the
+// account would be unreachable for up to LockoutDuration after the very request
+// that was supposed to get them back in.
+//
+// It takes the digest and never the password, for the reason NewSession does: the
+// store has no way to hash and therefore no way to be handed the plaintext.
+func (s *Store) SetPassword(ctx context.Context, q db.Querier, userID id.UUID, digest string) error {
+	const query = `
+		UPDATE users
+		SET password_digest = $2, failed_login_attempts = 0, locked_until = NULL, updated_at = now()
+		WHERE id = $1`
+
+	tag, err := q.Exec(ctx, query, userID, digest)
+	if err != nil {
+		return fmt.Errorf("setting a new password: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetEmail moves the address and CLEARS THE VERIFICATION, in one statement.
+//
+// The clearing is the half that matters and it is why this is a method rather than
+// a raw UPDATE the caller writes. `email_verified_at` is a claim about the address
+// on THIS row; a row whose address has just changed while still carrying a
+// verification timestamp would be asserting that somebody proved they can read an
+// address they have never been sent anything at — which is precisely the claim the
+// column exists to make impossible, and precisely how an account takeover becomes a
+// matter of pointing your email at somebody else's inbox.
+//
+// A unique violation is ErrEmailTaken, for the same reason and the same index
+// Create's is: 23505 on this table can only mean the address is registered.
+func (s *Store) SetEmail(ctx context.Context, q db.Querier, userID id.UUID, email string) error {
+	const query = `
+		UPDATE users
+		SET email = $2, email_verified_at = NULL, updated_at = now()
+		WHERE id = $1`
+
+	tag, err := q.Exec(ctx, query, userID, email)
+	if err != nil {
+		if isEmailTaken(err) {
+			return ErrEmailTaken
+		}
+		return fmt.Errorf("setting a new email: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkEmailVerified records that somebody proved they can read the address on
+// this row.
+//
+// IT IS CONDITIONAL ON THE COLUMN STILL BEING NULL, so it is idempotent by
+// construction rather than by a caller remembering to check: redeeming two live
+// verification links for the same address updates one row and leaves the other
+// token to expire unused, and the instant recorded is the FIRST proof rather than
+// the most recent one. Overwriting it would make "when did this address get
+// verified" answer a question that moves every time somebody clicks a second
+// link. Zero rows updated is therefore a SUCCESS, not an error.
+//
+// The user id is deliberately NOT the only thing in the WHERE clause, and the
+// caller is deliberately not in it at all: proving you can read an inbox is not a
+// thing a session authorizes. The verification token names the row, and a WHERE
+// that also had to match a presented user would turn a correct token presented by
+// the wrong party into a silent no-op rather than a refusal.
+func (s *Store) MarkEmailVerified(ctx context.Context, q db.Querier, userID id.UUID, at time.Time) (bool, error) {
+	const query = `
+		UPDATE users
+		SET email_verified_at = $2, updated_at = now()
+		WHERE id = $1 AND email_verified_at IS NULL`
+
+	tag, err := q.Exec(ctx, query, userID, at)
+	if err != nil {
+		return false, fmt.Errorf("marking an email verified: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // scanOne turns "no rows" into ErrNotFound. pgx reports it as pgx.ErrNoRows, and
 // a caller that has to know that is a caller that will get it wrong.
 func scanOne(row interface{ Scan(...any) error }) (User, error) {
 	var u User
 
-	err := row.Scan(&u.ID, &u.Email, &u.PasswordDigest, &u.FailedLoginAttempts, &u.LockedUntil, &u.CreatedAt, &u.UpdatedAt)
+	err := row.Scan(&u.ID, &u.Email, &u.PasswordDigest, &u.FailedLoginAttempts, &u.LockedUntil,
+		&u.EmailVerifiedAt, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrNotFound
 	}

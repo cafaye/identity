@@ -37,8 +37,22 @@ info:
   # a new kind of route in this document rather than a new route, and a client
   # generating from it will get three methods that take no session where every
   # other account route takes either.
-  version: 1.4.0
-  summary: Authentication, sessions, multi-factor authentication, accounts, tenancy, scoped API tokens, the admin surface and OIDC registrations.
+  #
+  # 1.5.0 is the recovery surface: eight new operations under a new `recovery`
+  # tag, and — unlike every bump before it — **one behaviour change on an existing
+  # surface**, which is stated here rather than left to be discovered:
+  # `DELETE /v1/session` and the other session-scoped operations are unaffected,
+  # but a client that renders "sign out" after a password change or an email change
+  # has to clear its own local state, because this service revokes every session
+  # the account held and mints nothing back. No response shape on an existing
+  # operation changed, and no path moved.
+  #
+  # Two properties of these eight operations are contract, not description, and a
+  # generated client inherits both: the three anonymous confirmation routes take a
+  # token where `security` is `[]` (the token IS the credential), and the two
+  # request routes return a `Accepted` body with exactly one field, ever.
+  version: 1.5.0
+  summary: Authentication, sessions, multi-factor authentication, account recovery, accounts, tenancy, scoped API tokens, the admin surface and OIDC registrations.
   description: |
     `identity` is the cafaye platform's security boundary: it is what every other
     service asks to identify a caller.
@@ -215,6 +229,32 @@ tags:
       A bulk revocation requires a `confirm` field and a named array, and a single
       revocation requires neither. The difference is in the request shape, not in a
       dialog, because a dialog is not something an API client has.
+  - name: recovery
+    description: |
+      The three flows a person can only finish by proving they can read an inbox:
+      resetting a password, verifying the account's address, and moving the account
+      to a new address.
+
+      They are one tag because they are one machine. Each mints a 256-bit random
+      value, stores nothing but its SHA-256, mails it, and spends it with a
+      conditional write that makes a second presentation a refusal — and a client
+      integrating one of them is integrating the other two's token lifecycle.
+
+      **Every route here refuses a scoped API token.** A credential that could
+      start an email change is a credential that can move an account's recovery
+      path, and a credential that could mint a password reset is a takeover with a
+      delay rather than a break-in. There is no scope in the machine vocabulary
+      for either, and there is not going to be one.
+
+      A reset token and a verification token are credentials, and the routes that
+      redeem them are anonymous: the token IS the authentication. They are 404 for
+      everything that is not a live token, including an expired one, a spent one,
+      and one minted for a different flow.
+
+      Absent entirely when `DATABASE_URL` is not configured, like every other
+      surface here. Mounted — and answering 503 on the paths that need to send —
+      when there is no mail delivery path, because a 404 would tell a product this
+      service has never heard of password recovery.
   - name: probes
     description: Liveness and readiness. Consumed by orchestrators, not by clients.
 
@@ -1007,6 +1047,578 @@ paths:
                     email: kaka@example.com
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/password-resets:
+    post:
+      tags: [recovery]
+      operationId: requestPasswordReset
+      summary: Ask for a password-reset link
+      description: |
+        Mails a single-use link to the account's registered address, valid for 30
+        minutes.
+
+        **The response is the same for every address, and the body is a constant.**
+        A registered address, an unregistered one and an address inside the
+        one-minute cooldown all get `202 {"status":"accepted"}` with identical
+        bytes. This is the entire account-enumeration defence on this route, and it
+        is why `acceptedResponse` in the handler is a constant rather than a template
+        with a field that happens to render the same either way: a field is a field,
+        and the next person to add an `expires_at` to it reinstates the oracle
+        without touching a test.
+
+        The status is 202, not 200 and not 204. The request *was* accepted for
+        processing; whether the message is delivered is not something the caller is
+        entitled to learn before they have proved which account they are asking
+        about.
+
+        **A second request inside the cooldown sends nothing at all**, and answers
+        identically. It does not supersede the first link: a request route that
+        invalidated a live token would let anybody invalidate a victim's pending
+        reset, which is a denial of recovery dressed up as a convenience.
+
+        A cooldown is not a rate limiter, and this service does not have one here.
+        It bounds mail to one message per address per minute, which stops the
+        obvious abuse of an anonymous endpoint pointed at one victim. It does
+        nothing about a flood spread across a thousand addresses and is not
+        per-client. Per-source throttling belongs to courier, which is in the path
+        of every message this service sends.
+
+        Resetting revokes **sessions and OIDC access tokens** when the link is
+        redeemed, and **not** scoped API keys — the same rule the second-factor
+        removal already follows, and the reason is the same.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryEmailRequest'
+            examples:
+              default:
+                summary: ask for a link
+                value:
+                  email: kaka@example.com
+      responses:
+        '202':
+          description: Accepted. Identical for every address.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+              example:
+                status: accepted
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/MailUnavailable'
+
+  /v1/password-resets/confirm:
+    post:
+      tags: [recovery]
+      operationId: confirmPasswordReset
+      summary: Spend a reset link and set a new password
+      description: |
+        Changes the password and revokes every session and every live OIDC access
+        token the account holds, in one transaction.
+
+        The revocation is why this is 204 and not a 200 with a session in it: the
+        caller's own session is revoked by the same write that changes the
+        password, so a caller that was signed in when it started is signed out when
+        it finishes and cannot use this route to keep itself signed in. **No session
+        is minted** — that would be a second way to turn a mailbox into a
+        credential without answering a second factor. Sign in again with the new
+        password.
+
+        The session cookie is cleared on the response as well as the row revoked, so
+        a browser is not left holding a credential this request just killed.
+
+        **404 for everything that is not a live token**: one that never existed, one
+        that expired, one already spent, and one minted for a different flow. It is
+        404 and not 401 because the caller is not asking who they are — they are
+        following a link, and "there is no such link" is also what they learn about
+        every link they did not receive.
+
+        Scoped API keys survive. This is the same rule `DELETE /v1/mfa` already
+        follows and the same reason: a key is a credential somebody deliberately
+        created and handed to a script, and a person who forgot their password is
+        not necessarily the person who owns it.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmPasswordResetRequest'
+            examples:
+              default:
+                summary: redeem the link
+                value:
+                  token: 0Kq3Zs1oQw7bXn0K9dLpR2vT4yE6hJ8cF1gM5nA2qU0
+                  password: a completely new password
+      responses:
+        '204':
+          description: |
+            The password changed and every session and access token was revoked.
+            No body.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Set-Cookie:
+              $ref: '#/components/headers/ClearedSessionCookie'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '404':
+          description: No live token matches — it never existed, expired, was spent, or belongs to another flow.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/not_found
+                title: Not found
+                status: 404
+                detail: no such link, or it has already been used
+                instance: /v1/password-resets/confirm
+                code: not_found
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/email-verifications:
+    post:
+      tags: [recovery]
+      operationId: requestEmailVerification
+      summary: Ask for a link that proves the account's address
+      description: |
+        Mails a link to the account's registered address, valid for 24 hours.
+
+        **The address is the one on the account, never one the request supplies.**
+        There is no `email` in the body that means "verify this address" — the body
+        carries the address to look the account up by, and what gets proved is the
+        address already stored on the row. A token that verified whatever address the
+        request carried would be a registration of somebody else's inbox.
+
+        Verification is not automatic at registration. `POST /v1/users` does not
+        send anything, and a client that wants an address proved calls this route
+        afterwards. That is one extra call in exchange for a registration that
+        cannot fail because a mail provider is down.
+
+        Same answer for every address, same constant body, same 202, and the same
+        one-minute cooldown that sends nothing rather than superseding a live link —
+        for the reasons on `requestPasswordReset`, which this route mirrors.
+
+        409 if the account's address is **already** verified. It is a 409 rather
+        than a silent 202 because a client rendering "check your inbox" on the
+        strength of a 202 it should never have been given tells a user to watch an
+        inbox nothing is going to arrive in.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryEmailRequest'
+      responses:
+        '202':
+          description: Accepted. Identical for every address.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+              example:
+                status: accepted
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '409':
+          description: This account's address is already verified, so there is nothing to prove.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/conflict
+                title: Conflict
+                status: 409
+                detail: this account's email address is already verified
+                instance: /v1/email-verifications
+                code: conflict
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/MailUnavailable'
+
+  /v1/email-verifications/confirm:
+    post:
+      tags: [recovery]
+      operationId: confirmEmailVerification
+      summary: Spend a verification link
+      description: |
+        Sets `email_verified_at` on the account and returns 204.
+
+        **It revokes nothing and mints nothing.** A verification is not a credential
+        — it is a fact about an address, and a link that sets a boolean changes no
+        secret. Ending every session over it would punish somebody for clicking a
+        link that proved who they already were, and minting a session here would be
+        a second way to turn a mailbox into a credential.
+
+        404 for every token that is not live, for the reasons on
+        `confirmPasswordReset`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryTokenRequest'
+            examples:
+              default:
+                summary: redeem the link
+                value:
+                  token: 0Kq3Zs1oQw7bXn0K9dLpR2vT4yE6hJ8cF1gM5nA2qU0
+      responses:
+        '204':
+          description: The address is now marked verified. No body.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '404':
+          description: No live token matches — it never existed, expired, was spent, or belongs to another flow.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/not_found
+                title: Not found
+                status: 404
+                detail: no such link, or it has already been used
+                instance: /v1/email-verifications/confirm
+                code: not_found
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/email-verification:
+    get:
+      tags: [recovery]
+      operationId: getEmailVerificationStatus
+      summary: Whether the caller's own address is proved
+      description: |
+        The caller's verification state, and nothing else.
+
+        **It is a separate route rather than a field on `GET /v1/me`**, and the
+        reason is a test: `/v1/me`'s projection is asserted field-by-field to be
+        exactly `id` and `email`, so adding `email_verified` there would either
+        break that invariant or weaken it. And "is this address proved" is not the
+        question "who am I" — a settings page asks the first, an app asks the
+        second.
+
+        `email_verified_at` is **absent** when the address has never been verified,
+        which is different from an epoch timestamp, and different again from
+        `email_verified: false` on an address that was proved and then changed:
+        changing an address clears the verification, so the two unverified states
+        are genuinely different and a client may want to tell them apart.
+
+        A `200` for every signed-in account, never a 404 for an unverified one: the
+        question has an answer for everybody, and a 404 would be indistinguishable
+        from "this is not your account".
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: The caller's verification state.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationStatus'
+              examples:
+                verified:
+                  summary: proved, at an instant
+                  value:
+                    email: kaka@example.com
+                    email_verified: true
+                    email_verified_at: '2026-09-30T12:10:00Z'
+                neverVerified:
+                  summary: never proved — no timestamp at all
+                  value:
+                    email: kaka@example.com
+                    email_verified: false
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/email-changes:
+    post:
+      tags: [recovery]
+      operationId: requestEmailChange
+      summary: Start a move to a new address
+      description: |
+        Records the intent and mails a link to the address the account has **now**.
+        Nothing moves yet: this creates the first of two tokens, and the second
+        does not exist until the first is redeemed.
+
+        That ordering is the whole of the hijack property. A stolen session can
+        reach this route, and what it produces is a link in the victim's inbox and
+        nowhere else — the attacker cannot advance the change, and the victim gets a
+        message saying their address is being changed, which is the only warning
+        they would otherwise get. A single-token design, where the link goes to the
+        NEW address and completing it moves the account, is a takeover on anybody
+        who can read the new inbox and nothing else.
+
+        **Session only.** There is no scope in the machine vocabulary for "may move
+        an account's recovery path", and there is not going to be one. A scoped API
+        token is refused on all eight routes of this surface.
+
+        Two refusals are worth reading, because both are the alternative being
+        rejected:
+
+        * **409** when the new address already has an account. This is the one
+          disclosure this surface makes and it is safe here — the caller is
+          authenticated as the person asking, and the alternative is a change that
+          fails at the last step after two emails and two clicks. It is the same
+          answer `POST /v1/users` gives.
+        * **422 `already_current`** when the new address is the one already on the
+          row. Refused rather than treated as a no-op, because a 202 here would
+          leave the caller believing a change had been requested and confirmed.
+
+        201 rather than 202: this is not a message being sent in the background, it
+        is a change that has been recorded and has a deadline.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryEmailRequest'
+            examples:
+              default:
+                summary: move to a new address
+                value:
+                  email: new-address@example.com
+      responses:
+        '201':
+          description: The change is recorded and the first link is on its way to the current address.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmailChange'
+              example:
+                current_email: kaka@example.com
+                new_email: new-address@example.com
+                expires_at: '2026-10-02T12:00:00Z'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          description: An account already exists for the new address.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/conflict
+                title: Conflict
+                status: 409
+                detail: an account already exists for that email address
+                instance: /v1/email-changes
+                code: conflict
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/MailUnavailable'
+
+  /v1/email-changes/current-address:
+    post:
+      tags: [recovery]
+      operationId: confirmEmailChangeCurrentAddress
+      summary: Prove control of the address the account has now
+      description: |
+        Spends the first token and mails the second one to the **new** address.
+        Answers 202 with the same constant body every other accepted route gives.
+
+        **The 202 body says nothing about the second link**, and that is the point.
+        The caller has just proved they can read the current inbox, so they know
+        they asked for this and know the next message goes to the address they
+        typed. Naming the destination here would tell a hijacked session — which can
+        reach this route with a token it does not have — nothing at all, while
+        telling a legitimate user nothing they need.
+
+        Presenting the second token here is a 404, not a partial success: the two
+        tokens are for different inboxes and a token that worked on the wrong side
+        would mean the wrong inbox proved something.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryTokenRequest'
+      responses:
+        '202':
+          description: The current address is confirmed and the second link is on its way.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+              example:
+                status: accepted
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '404':
+          description: No live first-half token matches.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/not_found
+                title: Not found
+                status: 404
+                detail: no such link, or it has already been used
+                instance: /v1/email-changes/current-address
+                code: not_found
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/MailUnavailable'
+
+  /v1/email-changes/new-address:
+    post:
+      tags: [recovery]
+      operationId: confirmEmailChangeNewAddress
+      summary: Complete a move to a new address
+      description: |
+        Spends the second token: the account's address moves, the verification is
+        cleared, and every session and every live OIDC access token is revoked — in
+        one transaction, with the session cookie cleared on the response.
+
+        **It is a 200 with a body rather than a 204**, because this route does
+        change three things the caller needs to know. A 204 would leave a client to
+        rediscover all three by making three other requests.
+
+        `email_verified` is **false**, and that is not a bug. Clicking a link proves
+        you can read an inbox, not that the new address belongs to this account,
+        and the write that moves the address clears `email_verified_at` in the same
+        statement. A client rendering "your address is updated" from this body is
+        correct; a client rendering "your address is verified" is not — prompt for
+        `POST /v1/email-verifications` instead, which now targets the new address.
+
+        Scoped API keys survive, for the reasons on `confirmPasswordReset`.
+
+        Presenting the first token here is a 404, for the same reason the other way
+        round is.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryTokenRequest'
+      responses:
+        '200':
+          description: The address moved and every session and access token was revoked.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Set-Cookie:
+              $ref: '#/components/headers/ClearedSessionCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmailChange'
+              example:
+                current_email: new-address@example.com
+                new_email: new-address@example.com
+                email_verified: false
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '404':
+          description: No live second-half token matches.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/not_found
+                title: Not found
+                status: 404
+                detail: no such link, or it has already been used
+                instance: /v1/email-changes/new-address
+                code: not_found
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -2046,6 +2658,17 @@ components:
         type: string
         maxLength: 200
       example: 0af7651916cd43dd8448eb211c80319c
+    ClearedSessionCookie:
+      description: |
+        An expired `__Host-session` cookie, with the same attributes that set it.
+
+        Sent by the two routes that revoke the caller's own session as a side
+        effect — `confirmPasswordReset` and `confirmEmailChangeNewAddress` — so a
+        browser is not left holding a credential the request it just made has
+        killed.
+      schema:
+        type: string
+      example: '__Host-session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
 
   schemas:
     APIKey:
@@ -2996,6 +3619,167 @@ components:
             back from storage, because a client rendering "you now have N codes"
             wants N and not a round trip to learn it.
 
+    RecoveryEmailRequest:
+      type: object
+      description: |
+        An address to look an account up by, on the three routes that start a
+        flow.
+
+        **It is never the address that gets proved or moved.** On
+        `requestEmailVerification` it identifies the account whose *stored* address
+        is proved, and on `requestEmailChange` it is the address being moved TO.
+        A token that verified whatever address this field carried would be a
+        registration of somebody else's inbox.
+      additionalProperties: false
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+          description: Normalized to lower case and trimmed before comparison.
+
+    RecoveryTokenRequest:
+      type: object
+      description: |
+        A single-use token from an emailed link. It is one field on purpose, and
+        the three routes that take it do not all accept the same set: a shared type
+        with an optional `password` would invite a client to send a password to a
+        verification endpoint, where it would be ignored — and "ignored" is a worse
+        answer than "refused", because a caller that believed the field was
+        accepted would not know to retry.
+
+        **The token is the credential.** These routes are anonymous, so the only
+        thing being authenticated is the value in this field.
+      additionalProperties: false
+      required: [token]
+      properties:
+        token:
+          type: string
+          minLength: 43
+          maxLength: 43
+          description: |
+            256 bits from crypto/rand, base64url without padding. Only its SHA-256
+            is stored, so a database dump yields no usable credential.
+
+            43 characters, and the length is load-bearing on the client side rather
+            than incidental: it is what tells a caller the value is complete before
+            it is pasted into a URL.
+
+    ConfirmPasswordResetRequest:
+      type: object
+      additionalProperties: false
+      required: [token, password]
+      properties:
+        token:
+          type: string
+          minLength: 43
+          maxLength: 43
+          description: The token from the emailed link. See `RecoveryTokenRequest`.
+        password:
+          type: string
+          minLength: 8
+          maxLength: 1024
+          description: |
+            The same rules and the same argon2id hashing a registration uses, and
+            enforced identically. A new password is not an excuse to accept one
+            that registration would have refused.
+
+            The upper bound is a DoS control on an unauthenticated route: argon2id's
+            cost is fixed in memory but its input is not, so without it a caller
+            with no session chooses the size of the hashing work.
+
+    Accepted:
+      type: object
+      description: |
+        The body of every route that has been asked to send a message.
+
+        **Exactly one field, with one value, ever.** That is the whole of the
+        account-enumeration defence on `requestPasswordReset`,
+        `requestEmailVerification` and `confirmEmailChangeCurrentAddress`: a
+        registered address, an unregistered one and an address inside the cooldown
+        all get these same bytes. Adding an `expires_at`, an `email` or a `sent`
+        boolean here would reinstate an oracle without touching a test, so the
+        handler's type is a constant for the same reason.
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [accepted]
+          example: accepted
+
+    VerificationStatus:
+      type: object
+      description: |
+        Whether one address is proved, as `GET /v1/email-verification` reports it.
+
+        The boolean and the timestamp say the same thing in two shapes and both are
+        present because a client needs one and not the other: a boolean for a
+        conditional render, an instant for "verified on". The timestamp is
+        **absent** rather than null when the address was never verified — "never
+        verified" and "verified at the epoch" are different answers and only the
+        first is true.
+      additionalProperties: false
+      required: [email, email_verified]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+          description: The address on the account. Always lower case.
+        email_verified:
+          type: boolean
+          description: |
+            False both for an address that was never proved AND for one that was
+            proved and then moved — a changed address lands unverified.
+        email_verified_at:
+          type: string
+          format: date-time
+          description: |
+            RFC3339 UTC, absent when `email_verified` is false. Judged against the
+            service's clock, not the database's.
+
+    EmailChange:
+      type: object
+      description: |
+        The state of a two-sided address change.
+
+        **Both addresses are named** and neither is secret: `current_email` is the
+        address the account has now and `new_email` is the one that was typed. What
+        it does not carry is a token, a digest or a row id — this flow is addressed
+        by its tokens, and there is no id in it for a client to hold.
+
+        On the `200` from `confirmEmailChangeNewAddress` the move has completed, so
+        `current_email` and `new_email` are the same value, `expires_at` is absent,
+        and `email_verified` is present and **false**.
+      additionalProperties: false
+      required: [current_email, new_email]
+      properties:
+        current_email:
+          type: string
+          format: email
+          maxLength: 320
+        new_email:
+          type: string
+          format: email
+          maxLength: 320
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            The deadline for the change. 24 hours from the request, and **both
+            halves share it** rather than each getting its own clock — a change
+            cannot be kept alive indefinitely by confirming the first half over and
+            over. Absent once the move has completed.
+        email_verified:
+          type: boolean
+          description: |
+            Present only on the `200` from `confirmEmailChangeNewAddress`, where it
+            is always false. An email change CLEARS the verification, so a client
+            that reads this has to prompt for a fresh one rather than assuming the
+            address it just moved to is proved.
+
     Problem:
       type: object
       description: |
@@ -3081,6 +3865,37 @@ components:
           description: The dependencies probed, comma separated, or `none`. Present on `/readyz` only.
 
   responses:
+    MailUnavailable:
+      description: |
+        This deployment has no mail delivery path, so it cannot send that link.
+
+        A 503 and not a 500, because the caller can act on it: a product that sees
+        this knows not to render "check your inbox", which is the whole reason it
+        is not an opaque server error. And a 503 and not a 404, for the same reason
+        `POST /v1/session/mfa` answers 503 — a 404 would say this service has never
+        heard of password recovery, which is the one answer that is both false and
+        useless.
+
+        **It is checked before the address is looked up**, so a deployment that
+        cannot send refuses a request for a registered address and one for an
+        unregistered one in the same place. Without that ordering "503 against 202"
+        would be an account-existence oracle, and it would be the most expensive one
+        in this service to discover.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/service_unavailable
+            title: Service unavailable
+            status: 503
+            detail: this deployment cannot send email, so it cannot send that link
+            instance: /v1/password-resets
+            code: service_unavailable
+            trace_id: 0af7651916cd43dd8448eb211c80319c
     Unauthenticated:
       description: |
         No usable credential: none was presented, or it is unknown, expired or

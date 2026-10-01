@@ -30,6 +30,7 @@ import (
 	"github.com/cafaye/identity/internal/outbox"
 	"github.com/cafaye/identity/internal/platform/clock"
 	"github.com/cafaye/identity/internal/platform/db"
+	"github.com/cafaye/identity/internal/recovery"
 	"github.com/cafaye/identity/internal/sessions"
 	"github.com/cafaye/identity/internal/users"
 )
@@ -106,7 +107,16 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 	}
 
 	opts := []httpapi.Option{httpapi.WithLogger(logger)}
-	authSvc, tenancy, secondFactor, mfaUsable, err := buildAuth(cfg, pool, logger)
+
+	// ONE HASHER FOR THE WHOLE PROCESS, and it is built here rather than inside
+	// buildAuth because two surfaces need one: a password reset hashes a new
+	// password through the same code a registration does, and the constructor
+	// derives an argon2id digest for the login's timing equaliser — so a second
+	// Hasher would derive a second dummy digest and cost a hundred milliseconds of
+	// memory-hard work at boot for nothing.
+	hasher := users.NewHasher()
+
+	authSvc, tenancy, secondFactor, mfaUsable, err := buildAuth(cfg, pool, hasher, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +139,12 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 		if mfaUsable {
 			opts = append(opts, httpapi.WithMFA(secondFactor))
 		}
+		// The recovery surface. It is mounted unconditionally inside this branch —
+		// not gated on a mailer — because a 404 on /v1/password-resets would tell a
+		// product this service has never heard of password recovery, which is both
+		// false and useless. A deployment that cannot send a message answers 503 on
+		// the routes that need one, with a sentence saying so.
+		opts = append(opts, httpapi.WithRecovery(buildRecovery(cfg, pool, hasher, logger)))
 		if machineCredentials != nil {
 			// Four options from one service, and each is a different capability rather
 			// than a different spelling of the same one: the management surface
@@ -191,7 +207,9 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 // that has a second factor, and the only way to know is to ask.
 // The fourth return is mfaUsable: whether this deployment can encrypt and decrypt a
 // TOTP secret, which is exactly whether the MANAGEMENT routes may be mounted.
-func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*auth.Service, *accounts.Service, *mfa.Service, bool, error) {
+func buildAuth(
+	cfg config.Config, pool *pgxpool.Pool, hasher *users.Hasher, logger *slog.Logger,
+) (*auth.Service, *accounts.Service, *mfa.Service, bool, error) {
 	if pool == nil {
 		return nil, nil, nil, false, nil
 	}
@@ -283,9 +301,10 @@ func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*aut
 		events,
 		tenancy,
 		secondFactor,
-		// Built once and shared: the hasher derives a dummy digest in its
-		// constructor, and a per-request hasher would derive one per request.
-		users.NewHasher(),
+		// Built once by newApp and shared with the recovery surface, because the
+		// constructor derives a dummy digest in the login's timing equaliser and a
+		// second Hasher would derive a second one for the same purpose.
+		hasher,
 		// The real clock. Every window in the service reads time through this, which
 		// is what lets a test move time exactly.
 		clock.System{},
@@ -293,6 +312,64 @@ func buildAuth(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*aut
 	)
 
 	return authSvc, tenancy, secondFactor, mfaUsable, nil
+}
+
+// buildRecovery assembles the account-recovery use cases: password reset, address
+// verification and email change.
+//
+// # THE MAILER IS `Unavailable{}` AND THAT IS THE HONEST STATE, NOT A GAP IN THIS
+// FUNCTION
+//
+// courier is the platform's mail service and its own delivery path is unfinished,
+// so there is no endpoint to call and no provider adapter to write — and writing
+// one is another packet's job, not this one's. What this function therefore wires
+// is a seam with one implementation that REFUSES: every route that needs to send
+// a message answers 503 with a sentence naming the problem, which is the shape
+// `buildMFASecret`'s absent key already produces through `mfa.Unavailable{}`.
+//
+// The alternative was rejected rather than weighed. A logger would be a mailer
+// this service can be configured into, and a reset token in an operator's log
+// aggregator is a reset token anybody who can read the logs can redeem — so the
+// flows would work perfectly in every test and in a staging stack, and the first
+// production deployment would be the first time a real user found out that their
+// password reset had been written to a log file.
+//
+// WHEN THE SEAM LANDS the change is this function's last three lines: construct a
+// courier-backed Mailer and pass it in. Nothing in internal/recovery changes, and
+// nothing in internal/httpapi changes, because neither knows what a courier is.
+func buildRecovery(
+	cfg config.Config, pool *pgxpool.Pool, hasher *users.Hasher, logger *slog.Logger,
+) *recovery.Service {
+	if pool == nil {
+		return nil
+	}
+
+	service := recovery.NewService(
+		// A spent token and the state it changes are one transaction, so every
+		// redemption runs on the runner rather than on a bare querier.
+		db.TxRunner{Pool: pool},
+		// Everything else is a single statement: the lookup that decides whether
+		// the account exists, the cooldown read, and the resolution of a presented
+		// token.
+		db.Direct{Pool: pool},
+		recovery.NewStore(pool),
+		users.NewStore(pool),
+		sessions.NewStore(pool),
+		// oidc.Store rather than the storage adapter, and deliberately: this is one
+		// UPDATE over oidc_access_tokens that needs no signing key, and a password
+		// reset has to be able to end a user's JWTs on a deployment where the OIDC
+		// provider is not mounted at all.
+		oidc.NewStore(pool),
+		outbox.NewStore(pool),
+		recovery.Unavailable{},
+		hasher,
+		clock.System{},
+	)
+
+	logger.Warn("account recovery is mounted, but this deployment cannot send email. " +
+		"POST /v1/password-resets answers 503 until a mailer is wired; see internal/recovery.")
+
+	return service
 }
 
 // buildAPIKeys assembles the scoped-token use cases, or returns nil when this

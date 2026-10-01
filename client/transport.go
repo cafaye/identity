@@ -35,7 +35,7 @@ package client
 // regeneration gate's blast radius visible instead of spread across twenty call
 // sites.
 //
-// The twenty-three methods below are the document's twenty-three `operationId`s, in
+// The thirty-one methods below are the document's thirty-one `operationId`s, in
 // the document's order, with the generated parameter types. The compile-time
 // assertion at the bottom is what proves the generated `*generated.Client` still
 // satisfies it, so a mismatch is a build failure rather than a runtime surprise.
@@ -68,6 +68,14 @@ type Transport interface {
 	ConfirmMFAEnrollment(ctx context.Context, enrollmentId openapiTypes.UUID, body generated.ConfirmMFAEnrollmentJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	RegenerateMFARecoveryCodes(ctx context.Context, body generated.RegenerateMFARecoveryCodesJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	GetCurrentUser(ctx context.Context, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	RequestPasswordReset(ctx context.Context, body generated.RequestPasswordResetJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	ConfirmPasswordReset(ctx context.Context, body generated.ConfirmPasswordResetJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	RequestEmailVerification(ctx context.Context, body generated.RequestEmailVerificationJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	ConfirmEmailVerification(ctx context.Context, body generated.ConfirmEmailVerificationJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	GetEmailVerificationStatus(ctx context.Context, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	RequestEmailChange(ctx context.Context, body generated.RequestEmailChangeJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	ConfirmEmailChangeCurrentAddress(ctx context.Context, body generated.ConfirmEmailChangeCurrentAddressJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	ConfirmEmailChangeNewAddress(ctx context.Context, body generated.ConfirmEmailChangeNewAddressJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	RegisterOIDCClient(ctx context.Context, accountId openapiTypes.UUID, body generated.RegisterOIDCClientJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	ListOIDCClients(ctx context.Context, accountId openapiTypes.UUID, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	GetOIDCClient(ctx context.Context, accountId openapiTypes.UUID, clientId openapiTypes.UUID, reqEditors ...generated.RequestEditorFn) (*http.Response, error)

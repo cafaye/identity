@@ -63,7 +63,7 @@ import (
 var conditionalSurfaces = []string{
 	// The service fields, each of which gates a registrar's early return.
 	"auth", "tenancy", "apiKeyCaller", "introspector", "apiKeys", "oidc",
-	"oidcClients", "mfa", "admin",
+	"oidcClients", "mfa", "admin", "recovery",
 }
 
 // TestEveryConditionalSurfaceIsVisibleToTheWalk is the check.
@@ -119,6 +119,36 @@ func TestTheDriftWalkSeesTheAdminSurface(t *testing.T) {
 				"TestEveryServedRouteIsDocumentedOrNamed depends on this walk seeing every mounted "+
 				"route, and a route missing from the walk is a route whose documentation is never "+
 				"checked in either direction", want)
+		}
+	}
+}
+
+// TestTheDriftWalkSeesTheRecoverySurface is the third instance of the admin-surface
+// bug, for the eight routes the recovery packet added.
+//
+// It is here rather than folded into the general check because the general one is a
+// list membership test and this one is behavioural: it asserts the walk FINDS the
+// routes. A field can be set to a double the registrar does not consider
+// "configured", and only the routes appearing in the walk can tell.
+func TestTheDriftWalkSeesTheRecoverySurface(t *testing.T) {
+	t.Parallel()
+
+	served := servedRoutes(t)
+
+	for _, want := range []operationKey{
+		{Method: "POST", Path: "/v1/password-resets"},
+		{Method: "POST", Path: "/v1/password-resets/confirm"},
+		{Method: "POST", Path: "/v1/email-verifications"},
+		{Method: "POST", Path: "/v1/email-verifications/confirm"},
+		{Method: "GET", Path: "/v1/email-verification"},
+		{Method: "POST", Path: "/v1/email-changes"},
+		{Method: "POST", Path: "/v1/email-changes/current-address"},
+		{Method: "POST", Path: "/v1/email-changes/new-address"},
+	} {
+		if _, seen := served[want]; !seen {
+			t.Errorf("servedRoutes did not report %s as served. TestEveryServedRouteIsDocumentedOrNamed "+
+				"depends on this walk seeing every mounted route, so a route missing from it has its "+
+				"documentation checked in neither direction", want)
 		}
 	}
 }

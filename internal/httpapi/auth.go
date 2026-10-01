@@ -178,6 +178,11 @@ func (o options) registerRoutes(r chiRouter) {
 	// this one. Absent without WithIntrospection, for the reason every other route
 	// is: a misconfiguration is a 404, not a 500.
 	o.registerIntrospectionRoute(r)
+
+	// And the recovery surface, for the same reason: it needs a database and no
+	// key, and it is the last thing in this registrar because it is the only one
+	// whose routes are reachable with no credential at all.
+	o.registerRecoveryRoutes(r)
 }
 
 // chiRouter is the slice of *chi.Mux these routes need. Naming it keeps the

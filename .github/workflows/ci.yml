@@ -217,10 +217,10 @@ jobs:
       # and by `bin/coverage-floor` itself, which takes this value as its third
       # argument and refuses to run if it disagrees with the declaration.
       COVERAGE_FAIL_UNDER: '70'
-      # Decrease detectors, not targets. Measured on 2026-09-30 against
+      # Decrease detectors, not targets. Measured on 2026-10-01 against
       # `go test -v -count=1 -race ./...` with the database tier applied, from a
-      # complete log: 1254 PASS lines across the whole suite, 1166 of them in the
-      # 11 packages that open a pool, zero SKIP anywhere. A lower number is a
+      # complete log: 1939 PASS lines across the whole suite, 1715 of them in the
+      # 14 packages that open a pool, zero SKIP anywhere. A lower number is a
       # deleted test and this goes red; a higher one is a new test, which is a
       # one-line edit here. They are not read out of the run, so a run cannot
       # satisfy itself by having fewer tests.
@@ -235,14 +235,20 @@ jobs:
       # floor by `bin/coverage-floor`, which is the only place a reader has to
       # look and the only place that cannot go stale.
       #
-      # The SUITE_FLOOR was 1237 and is now 1254. 1237 is 1254 minus the 17 tests
-      # in internal/platform/ci: that number had been measured from a log taken
-      # before this package's own tests were in the tree, so the floor had a
-      # 17-test blind spot, and the package that guards this file was the one
-      # number the floor could not see. A floor is only a decrease detector if it
-      # was measured from a complete run.
-      SUITE_FLOOR: '1254'
-      DATABASE_TIER_FLOOR: '1166'
+      # Both floors were remeasured by the recovery packet, which is the rule rather than
+      # a courtesy: the previous pair (1254 / 1166) had been measured from a log
+      # taken before this package's own tests were in the tree, so it carried a
+      # 17-test blind spot in the one package that guards this file. 1254 was 1237
+      # plus those 17, and the recovery packet moved the suite by +685 PASS
+      # (+549 of them in the database tier) — 55 in internal/recovery, the matrix
+      # and wire tests in internal/httpapi, and 14 new database packages touched
+      # by the two migrations.
+      #
+      # A floor is only a decrease detector if it was measured from a complete run,
+      # and a raise has to land in the same commit as the tests that earned it or it
+      # is not a raise at all.
+      SUITE_FLOOR: '1939'
+      DATABASE_TIER_FLOOR: '1715'
       MODULE: github.com/cafaye/identity
 
     steps:
@@ -532,7 +538,36 @@ jobs:
             TestEveryExcludedDirectoryIsNamedInTheDeclaration \
             TestTheCoverageFloorInTheDeclarationIsTheFloorsFloor \
             TestTheCoverageStepRunsTheCheckedInFilter \
-            TestTheCoverageFilterCanFail; do
+            TestTheCoverageFilterCanFail \
+            TestTheTwoRequestRoutesAnswerIdenticallyOverHTTP \
+            TestAResetEndsTheAccessTokensIssuedBeforeIt \
+            TestNoRecoveryTokenReachesTheLogs \
+            TestTheRecoveryAuthorizationMatrix \
+            TestNoRecoveryRouteAcceptsASessionInPlaceOfItsToken \
+            TestEveryRecoveryRouteIsInTheMatrix \
+            TestAnInternalFailureIsRefusedAndTheCauseStaysInTheLog \
+            TestAResetForAnUnknownAddressSendsNothingAndWritesNothing \
+            TestAResetTokenIsStoredAsADigestAndThePlaintextIsNowhere \
+            TestTheStoredDigestIsTheOnlyCredential \
+            TestAnExpiredResetTokenIsRefused \
+            TestAnExpiredVerificationTokenIsRefused \
+            TestAnExpiredEmailChangeTokenIsRefusedOnBothHalves \
+            TestAReusedResetTokenIsRefused \
+            TestAReusedVerificationTokenIsRefused \
+            TestAResetTokenIsNotAVerificationToken \
+            TestAnEmailChangeTokenIsNotAResetOrAVerificationToken \
+            TestATokenMintedForOneAccountDoesNotTouchAnother \
+            TestAnEmailChangeNeedsBothAddressesConfirmed \
+            TestAChangeDoesNotApplyFromTheCurrentAddressTokenAlone \
+            TestAChangeDoesNotApplyFromTheNewAddressTokenAlone \
+            TestTheNewAddressTokenIsMintedOnlyAfterTheCurrentAddressIsConfirmed \
+            TestAResetRevokesEverySessionAndEveryAccessToken \
+            TestAResetDoesNotRevokeAScopedAPIKey \
+            TestAChangeClearsTheVerificationAndEndsEveryCredential \
+            TestADeploymentWithNoMailerRefusesBeforeItLearnsAnything \
+            TestAResetRequestInsideTheWindowSendsNothing \
+            TestOneTokenSpentOnceUnderConcurrency \
+            TestNoSubjectCarriesAToken; do
             # The trailing " (" is what makes this exact: `--- PASS: TestFooBar`
             # must not satisfy a check written for `TestFoo`, and go test always
             # puts the duration after the name.
@@ -743,10 +778,10 @@ jobs:
             echo
             echo "| claim | floor | checked by |"
             echo "|---|---|---|"
-            echo "| \`goose up\` before any test | 10 migrations applied | \`apply the migrations\` |"
+            echo "| \`goose up\` before any test | 15 migrations applied | \`apply the migrations\` |"
             echo "| whole suite (\`bin/prime\`, then \`-v -race\`) | ${SUITE_FLOOR} PASS lines, 0 SKIP | tier step |"
             echo "| database tier, derived from \`dbtest.\` | ${DATABASE_TIER_FLOOR} PASS lines, 0 SKIP | tier step |"
-            echo "| MFA, session, matrix and client-leak tests | 28 named, each PASS | security step |"
+            echo "| MFA, session, recovery, matrix and client-leak tests | 62 named, each PASS | security step |"
             echo "| \`go vet ./...\` | clean | vet |"
             echo "| \`gofmt -l .\` | empty | gofmt |"
             echo "| \`go.mod\`, \`go.sum\` | no diff after the gate | lockfile |"

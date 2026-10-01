@@ -288,6 +288,21 @@ func Schema(t *testing.T) *pgxpool.Pool {
 		`CREATE TRIGGER account_audit_log_append_only
 			BEFORE UPDATE OR DELETE ON ` + schema + `.account_audit_log
 			FOR EACH ROW EXECUTE FUNCTION ` + schema + `.account_audit_log_is_append_only()`,
+		// 00014 and 00015: the verification column and the recovery token table.
+		//
+		// The COLUMN needs nothing here — the LIKE clause above picks it up, which is
+		// what LIKE does — so a test in a private schema reads the same column the
+		// production table has rather than a copy of it.
+		//
+		// recovery_tokens gets its foreign key written out for the reason every other
+		// table's are: LIKE does not copy it and it would otherwise point at
+		// public.users. Its partial unique index on `target_token_digest` and all of
+		// its CHECK constraints DO come across with INCLUDING ALL, which is what makes
+		// "an email change's second token cannot exist before the first is confirmed"
+		// enforceable in a private schema and not only in production.
+		`CREATE TABLE ` + schema + `.recovery_tokens (LIKE public.recovery_tokens INCLUDING ALL)`,
+		`ALTER TABLE ` + schema + `.recovery_tokens ADD CONSTRAINT recovery_tokens_user_id_fkey
+			FOREIGN KEY (user_id) REFERENCES ` + schema + `.users (id) ON DELETE CASCADE`,
 	}
 	for _, stmt := range stmts {
 		if _, err := admin.Exec(ctx, stmt); err != nil {

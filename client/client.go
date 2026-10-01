@@ -570,6 +570,129 @@ func (c *Client) GetCurrentUser(ctx context.Context) (*generated.User, error) {
 	return &out, err
 }
 
+// RequestPasswordReset asks for a reset link. Corresponds to `POST /v1/password-resets`.
+//
+// **The response carries nothing about the address.** A registered address, an
+// unregistered one and one inside the cooldown all return the same body, and the
+// client must not attempt to tell them apart — an argument that this method exists
+// to make, because a caller that branched on the response would be inventing an
+// enumeration oracle in the product. The returned `Accepted` has one field with one
+// value; treat a non-nil result as "asked", never as "sent".
+func (c *Client) RequestPasswordReset(ctx context.Context, body generated.RequestPasswordResetJSONRequestBody) (*generated.Accepted, error) {
+	var out generated.Accepted
+	err := call(c, "requestPasswordReset", func() (*http.Response, error) {
+		return c.transport.RequestPasswordReset(ctx, body)
+	}, &out)
+	return &out, err
+}
+
+// ConfirmPasswordReset spends a reset link. Corresponds to `POST /v1/password-resets/confirm`.
+//
+// **Every session and every live OIDC access token is revoked, and no session is
+// returned.** A caller that was signed in before this call is signed out by it, so a
+// client rendering a "password changed, stay signed in" transition is promising
+// something this service does not do — sign in again with the new password.
+//
+// The token in `body` is a live credential until it is spent. It is passed through
+// and not logged, redacted or retained by this client; the generated
+// `ConfirmPasswordResetRequest` has no redacting `String()`, so a caller printing it
+// whole is printing a credential that was valid a moment ago.
+func (c *Client) ConfirmPasswordReset(ctx context.Context, body generated.ConfirmPasswordResetJSONRequestBody) error {
+	return callVoid(ctx, c, "confirmPasswordReset", func() (*http.Response, error) {
+		return c.transport.ConfirmPasswordReset(ctx, body)
+	})
+}
+
+// RequestEmailVerification asks for a link proving the account's own address.
+// Corresponds to `POST /v1/email-verifications`.
+//
+// Registration does not send one, so a product that wants an address proved calls
+// this after `RegisterUser`. Same constant response as every other request route;
+// same rule — a non-nil result means "asked", not "sent".
+func (c *Client) RequestEmailVerification(ctx context.Context, body generated.RequestEmailVerificationJSONRequestBody) (*generated.Accepted, error) {
+	var out generated.Accepted
+	err := call(c, "requestEmailVerification", func() (*http.Response, error) {
+		return c.transport.RequestEmailVerification(ctx, body)
+	}, &out)
+	return &out, err
+}
+
+// ConfirmEmailVerification spends a verification link. Corresponds to `POST /v1/email-verifications/confirm`.
+//
+// **Nothing is revoked and nothing is minted.** A verification is not a credential,
+// it is a fact about an address — so a caller must not sign anybody out here, and
+// must not expect a session in the response.
+func (c *Client) ConfirmEmailVerification(ctx context.Context, body generated.ConfirmEmailVerificationJSONRequestBody) error {
+	return callVoid(ctx, c, "confirmEmailVerification", func() (*http.Response, error) {
+		return c.transport.ConfirmEmailVerification(ctx, body)
+	})
+}
+
+// GetEmailVerificationStatus reports whether the caller's own address is proved.
+// Corresponds to `GET /v1/email-verification`.
+//
+// A separate method rather than a field on `GetCurrentUser`, because `generated.User`
+// is asserted field-by-field to be exactly an id and an email. `EmailVerifiedAt` is
+// absent when the address was never verified, which is a different state from a
+// verified address that has since been changed — and `EmailVerified` alone cannot
+// tell those two apart.
+func (c *Client) GetEmailVerificationStatus(ctx context.Context) (*generated.VerificationStatus, error) {
+	var out generated.VerificationStatus
+	err := call(c, "getEmailVerificationStatus", func() (*http.Response, error) {
+		return c.transport.GetEmailVerificationStatus(ctx)
+	}, &out)
+	return &out, err
+}
+
+// RequestEmailChange starts a move to a new address. Corresponds to
+// `POST /v1/email-changes`.
+//
+// **Nothing has moved yet, and this is not a three-request transaction the client may
+// abandon halfway without consequence.** The first link goes to the address the
+// account has now; only when it is redeemed is a second one minted for the new
+// address. A caller that starts a change and never finishes it leaves a message in
+// the user's current inbox saying their address is being changed, which is the only
+// warning they get.
+func (c *Client) RequestEmailChange(ctx context.Context, body generated.RequestEmailChangeJSONRequestBody) (*generated.EmailChange, error) {
+	var out generated.EmailChange
+	err := call(c, "requestEmailChange", func() (*http.Response, error) {
+		return c.transport.RequestEmailChange(ctx, body)
+	}, &out)
+	return &out, err
+}
+
+// ConfirmEmailChangeCurrentAddress proves control of the current address. Corresponds
+// to `POST /v1/email-changes/current-address`.
+//
+// **The `Accepted` response says nothing about where the second link went, and this
+// client must not guess.** The caller already knows the address they typed, so naming
+// the destination here would tell a hijacked session — which can reach this route
+// with a token it does not have — something it does not already know.
+func (c *Client) ConfirmEmailChangeCurrentAddress(ctx context.Context, body generated.ConfirmEmailChangeCurrentAddressJSONRequestBody) (*generated.Accepted, error) {
+	var out generated.Accepted
+	err := call(c, "confirmEmailChangeCurrentAddress", func() (*http.Response, error) {
+		return c.transport.ConfirmEmailChangeCurrentAddress(ctx, body)
+	}, &out)
+	return &out, err
+}
+
+// ConfirmEmailChangeNewAddress completes a move to a new address. Corresponds to
+// `POST /v1/email-changes/new-address`.
+//
+// **Every session and every live OIDC access token is revoked, and the address is now
+// unverified.** `out.EmailVerified` is a `*bool` and this call always leaves it
+// present and false: clicking a link proves you can read an inbox, not that the new
+// address belongs to the account. A client that renders "your address is verified"
+// from this response is wrong; it should prompt for
+// `RequestEmailVerification`, which now targets the new address.
+func (c *Client) ConfirmEmailChangeNewAddress(ctx context.Context, body generated.ConfirmEmailChangeNewAddressJSONRequestBody) (*generated.EmailChange, error) {
+	var out generated.EmailChange
+	err := call(c, "confirmEmailChangeNewAddress", func() (*http.Response, error) {
+		return c.transport.ConfirmEmailChangeNewAddress(ctx, body)
+	}, &out)
+	return &out, err
+}
+
 // RegisterOIDCClient registers a relying party. Corresponds to
 // `POST /v1/accounts/{account_id}/oidc-clients`.
 //
