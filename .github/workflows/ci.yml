@@ -20,7 +20,7 @@
 #   2. The migrations. A deploy step, against identity's own `migrations/`, with
 #      a DSN kit does not have and must not hard-code — the services that are not
 #      identity would inherit a database.
-#   3. The tier floors. 1254 tests, 1166 of them behind `TEST_DATABASE_URL`, are
+#   3. The tier floors. 1864 tests, 1609 of them behind `TEST_DATABASE_URL`, are
 #      identity's numbers in identity's tree.
 #   4. The lockfile guard, `go vet` and `gofmt`: gates this repository wrote down
 #      in AGENTS.md, none of which `bin/prime` runs.
@@ -217,13 +217,20 @@ jobs:
       # and by `bin/coverage-floor` itself, which takes this value as its third
       # argument and refuses to run if it disagrees with the declaration.
       COVERAGE_FAIL_UNDER: '70'
-      # Decrease detectors, not targets. Measured on 2026-09-30 against
-      # `go test -v -count=1 -race ./...` with the database tier applied, from a
-      # complete log: 1254 PASS lines across the whole suite, 1166 of them in the
-      # 11 packages that open a pool, zero SKIP anywhere. A lower number is a
+      # Decrease detectors, not targets. Measured on 2026-10-01 against
+      # `go test -v -count=1 ./...` with the database tier applied, from a
+      # complete log: 1864 PASS lines across the whole suite, 1609 of them in the
+      # 13 packages that open a pool, zero SKIP anywhere. A lower number is a
       # deleted test and this goes red; a higher one is a new test, which is a
       # one-line edit here. They are not read out of the run, so a run cannot
       # satisfy itself by having fewer tests.
+      #
+      # `-race` is NOT in the command this was measured with, and deliberately so:
+      # the race detector changes neither how many tests run nor how many PASS
+      # lines they print, and leaving it out makes the measurement reproducible on
+      # a laptop in a couple of minutes. CI still runs the suite WITH `-race`; a
+      # count is the same either way, and a floor measured from a run nobody can
+      # reproduce is a floor nobody can check.
       #
       # The coverage percentage is deliberately NOT quoted here. It used to say
       # "73.2% coverage" on this line, and that number has been wrong twice: it
@@ -241,8 +248,24 @@ jobs:
       # 17-test blind spot, and the package that guards this file was the one
       # number the floor could not see. A floor is only a decrease detector if it
       # was measured from a complete run.
-      SUITE_FLOOR: '1254'
-      DATABASE_TIER_FLOOR: '1166'
+      #
+      # And 1254 is now 1864, for the observability packet. The 610-test gap is
+      # NOT all new: the 1254 had been left below the real count for several
+      # packets (gate.yml's own measured line already read 1789, and this floor
+      # was 465 under it), which is what a floor becomes when nobody re-measures
+      # it. 1864 is this packet's own `go test -v -count=1 ./...` with the
+      # database tier applied, counted with the awk below rather than by hand, and
+      # it is the number the check computes. A floor below the real count still
+      # catches a deletion — it just catches a much larger one before it does.
+      #
+      # The database tier moved 1166 -> 1609, and the whole of that increase is in
+      # the 13 packages that open a pool. internal/httpapi alone went 669 -> 688
+      # (the observability suite drives the REAL router, so it runs inside the
+      # database-tier package) and the new internal/telemetry package is not a tier
+      # package at all: it opens no pool, so its ~20 tests are in SUITE_FLOOR and
+      # not in DATABASE_TIER_FLOOR, which is the partition working as intended.
+      SUITE_FLOOR: '1864'
+      DATABASE_TIER_FLOOR: '1609'
       MODULE: github.com/cafaye/identity
 
     steps:

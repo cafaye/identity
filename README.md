@@ -91,6 +91,32 @@ Direct dependencies, each with a cause:
   `bmatcuk/doublestar`, `otel`, `gorilla/securecookie` and their closures).
   `go mod tidy` is idempotent and `go.sum` is committed.
 
+Two more, and both are the floor rather than a choice among alternatives:
+
+- `go.opentelemetry.io/otel/sdk` and
+  `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp` (v1.46.0) —
+  identity emits OpenTelemetry spans into the collector that ships with kit's
+  stack, so "where did that 500 come from" is a question with an answer rather
+  than a log tail. Without these two, identity cannot emit a span at all.
+  **grpc, the protobuf runtime and grpc-gateway arrive transitively**, through
+  `otlpconfig`; that is a cost of the OTLP exporter's own configuration path, not
+  a second transport this service asked for.
+  - **Deliberately not `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`.**
+    Its handler records `url.path`, `url.query` and request headers as its own
+    span attributes. Those are exactly the values a redacting collector strips,
+    and stripping them downstream is one control; `internal/httpapi/telemetry.go`
+    is hand-rolled so that what identity records is *only* what
+    `internal/telemetry`'s allowlist permits. Two controls beat one, and the
+    second one is the one this repository tests.
+  - **Deliberately not `otel/sdk/metric`.** Metrics come from kit's collector's
+    `spanmetrics` connector, which derives them from spans *after* redaction — so
+    a derived metric can never carry a dimension the allowlist stripped, and
+    there is no second definition of the same series anywhere in the fleet.
+  - **Deliberately not `otel/log`.** Logs are the container's stdout: compose's
+    `logging:` driver ships them to the collector's `syslog/crash` receiver, which
+    makes a panic a log record with a `service.name` on it and adds no
+    per-language dependency to this module.
+
 ## Running it
 
 Nothing but Go is needed, and no database is required — v0 supports an unset
@@ -132,6 +158,10 @@ service quietly listening on the wrong port.
 | `OIDC_ALLOW_INSECURE` | `false` | Permits an `http` issuer. For `localhost` and compose stacks only. |
 | `MFA_ENCRYPTION_KEY` | *(unset)* | base64url, **exactly 32 bytes**. Seals the TOTP secret at rest. Never generated. Unset means MFA is not turned on: the management routes are absent and the login challenge is still enforced. A value of the wrong length is a startup failure. |
 | `MFA_ISSUER` | `cafaye identity` | The account label an authenticator app displays. A display string, not a secret; changing it does not affect any confirmed credential. |
+| `IDENTITY_OTEL_ENDPOINT` | `http://otel-collector:4318` | The OTLP endpoint spans go to. **The only contract** (core D16), and the collector that ships with kit's stack is just its default value — so tracing is on by default and a deployer who already runs Datadog or Grafana sets one variable and kit's stack goes quiet. Unset costs spans and nothing else: no queue, no retry loop, no dial at boot. |
+| `IDENTITY_TENANT_ID` | *(unset)* | The `tenant_id` **resource** attribute. Never a span attribute — see the allowlist rule in [AGENTS.md](AGENTS.md). Unset by default, because an empty one shows up as a second service row in every collector's service list. |
+| `DEPLOYMENT_ENVIRONMENT` | *(unset)* | The `deployment.environment` resource attribute. An enum in core's resource schema (`development`/`test`/`staging`/`production`), so there is no fourth spelling to invent. |
+| `OTEL_SERVICE_VERSION` | *(detected)* | The `service.version` resource attribute. Absent is treated as "unknown" rather than defaulted to a string, because a configured-but-empty version renders as a second service row in a collector's service list. |
 
 ## Endpoints
 

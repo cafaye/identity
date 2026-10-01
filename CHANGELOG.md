@@ -6,6 +6,107 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added (observability)
+
+- **identity emits OpenTelemetry spans into the collector that ships with kit's
+  stack.** `IDENTITY_OTEL_ENDPOINT` is the only contract (core D16) and it is
+  **on by default** — unset, it is `http://otel-collector:4318`. Before this, a
+  deployed identity produced no traces and no request timings, and the collector
+  kit ships had nothing to receive.
+
+  - **One request span per request, named `identity.http.request`**, with the
+    status class, the method and — where one exists — the **route template**.
+  - **`http.route` is chi's `RoutePattern()`, never `r.URL.Path`.** A template has
+    one value per endpoint; a concrete path has one per request, and kit's
+    collector derives metrics with a `spanmetrics` connector that mints a series
+    per distinct value. It is read from the `chi.RouteContext` **inside** the
+    handler chain, because a middleware outside the router sees no route at all —
+    and an assertion placed in the wrong place passes against an empty string.
+  - **A 404 carries NO route.** The path is caller-controlled text there, so
+    recording it is the cardinality bomb and the content leak in one move. The
+    404 status is the answer.
+  - **Only 5xx is an error span.** A 401 or a 404 is identity refusing a caller,
+    which is identity working; an error rate that counts them is a function of
+    how much guessing the internet absorbs, and an alert on that pages somebody
+    to switch off the protection doing its job.
+  - **One allowlist, one choke point.** Every attribute goes through
+    `telemetry.Record/2`, projected from `core/schemas/telemetry/*.schema.json`.
+    The realistic failure is not an attacker; it is a well-meaning engineer in
+    six months adding a user's email because it would help debug a login, in the
+    service that holds every user's email and password digest.
+  - **The redaction proof fails when the boundary leaks.**
+    `internal/telemetry/canary_test.go` plants a canary in every field a caller
+    controls — path, query, bearer token, API key, cookie, user-agent, a
+    malformed `traceparent`, a login body, a TOTP code — drives real requests
+    through the real router, and fails if that string reaches an exportable
+    attribute. Every absence assertion is paired with a presence one, because a
+    boundary that deletes everything passes "no canary" and is useless.
+  - **Metrics come from the collector, not from identity.** `spanmetrics` runs
+    after redaction, so a derived metric cannot carry a dimension the allowlist
+    stripped, and there is no second definition of the same series in the fleet.
+  - **Logs cost nothing.** compose `logging:` ships the container's stdout to the
+    collector's `syslog/crash` receiver, which makes a panic a log record with a
+    `service.name` on it and no per-language log SDK in the module.
+- **Two dependencies, with their cause:** `go.opentelemetry.io/otel/sdk` and
+  `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp` (v1.46.0).
+  grpc, protobuf and grpc-gateway arrive transitively through `otlpconfig`.
+  Deliberately **not** added: `otelhttp`'s handler (it records `url.path`,
+  `url.query` and headers itself — one control where this repository insists on
+  two, which is why the middleware is hand-rolled), `otel/sdk/metric` (metrics
+  come from the collector), and `otel/log` (logs come from the container).
+- **`kit.ref`, kit's `bin/dev` verbatim, and `docker-compose.yml` reduced to an
+  OVERRIDE** on kit's stack — this service, its database name and role, and the
+  crash layer. No collector configuration (kit derives the redaction allowlist
+  from core's schemas, and a service that owned that file would be shipping a
+  telemetry boundary nobody derived), no postgres container of its own, and no
+  `depends_on: otel-collector`: a service that waits for the collector serves no
+  traffic while the collector is down, which is strictly worse than serving
+  traffic with no traces.
+- **`bin/migrate`,** so `bin/dev` has a migration step to call. Migrations stay a
+  deploy step and are still above the suite, never inside it.
+- **`-healthcheck` on the binary.** The image is distroless, so there is no
+  `curl` and no shell for a `CMD-SHELL` probe; a flag the binary itself answers
+  is the only healthcheck that works there.
+
+### Changed (observability)
+
+- **`internal/httpapi`'s router is now wrapped, not rebuilt.** Every route is
+  registered through a `tracedRouter` decorator that wraps the handler, so a
+  route added by any of the seven `register*` functions is traced without that
+  function knowing telemetry exists. It is a decorator and not a chi `Use`
+  middleware for a **measured** reason: chi fills `RoutePattern` in on the
+  request it routes to, and neither an outer middleware nor a `Use` middleware
+  ever sees it — only the matched handler does. No handler behaviour changed, no
+  route moved, and the authorization matrix walk reads the undecorated tree so
+  that a wrapper is not counted as a second route. The authorization matrix suite
+  is unchanged and still green.
+- **`New`'s middleware order is now `telemetry → trace id → recovery → mux`**, and
+  recovery is deliberately *inside* telemetry: a panic recovered above the span
+  would write its 500 with no span carrying the status, which is the one request
+  an operator most wants to find.
+- **Two test seams on `httpapi.options`,** both empty in every real process. A
+  route that panics, and a *parameterised* route. The second exists because of a
+  fault injection, and the finding is worth stating: replacing `traced`'s
+  `RoutePattern()` with `r.URL.Path` made **every** observability test in this
+  package pass. A suite of fixed requests cannot tell a template from a path,
+  because for a request with no path parameters the two are the same string. The
+  first version of the panic seam also swapped out the whole mux, which meant the
+  request never passed through chi, never got a template, and produced a 500 on a
+  span with no route on it — a test asserting about a service that is not the one
+  that ships. Both seams replace exactly one route and change nothing else.
+- **CI's `SUITE_FLOOR` 1254 → 1864 and `DATABASE_TIER_FLOOR` 1166 → 1609**, in the
+  same commit as the tests that moved them and counted by CI's own awk rather
+  than by hand: 1864 `--- PASS:` lines, 0 `--- SKIP:`, across 19 packages; the
+  1609 is the whole of that inside the 13 packages that open a pool.
+  `internal/httpapi` went 669 → 688 because the observability suite drives the
+  **real** router and therefore runs inside the database-tier package, and the
+  new `internal/telemetry` package opens no pool — so its tests are in
+  `SUITE_FLOOR` and not in `DATABASE_TIER_FLOOR`, which is the partition working
+  as intended rather than a rounding error.
+  The 1254 was also **stale by 535** before this packet: `gate.yml`'s own measured
+  line already read 1789. A floor nobody re-measures is a floor that only catches
+  a very large deletion.
+
 ### Fixed (one postgres image fleet-wide)
 
 - **CI runs the same postgres the dev stack does.** This workflow pinned

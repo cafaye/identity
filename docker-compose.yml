@@ -1,52 +1,173 @@
-# The local development stack for identity: the service and the Postgres it will
-# use. `docker compose up -d` is the whole thing.
+# identity's own compose file — an OVERRIDE, not a copy.
 #
-#   docker compose up -d
-#   curl localhost:8080/healthz
-#   curl localhost:8080/readyz
+#   bin/dev            # fetch the pinned kit stack, merge it with this file, up
+#   docker compose -f <kit>/templates/compose/docker-compose.yml \
+#                  -f ./docker-compose.yml up -d --wait
 #
-# The service also runs without a database (v0 supports an unset
-# DATABASE_URL, and /readyz then reports `"deps":"none"`), so this stack exists
-# for the packets that need real Postgres, not to make the service start.
+# THIS FILE OWNS FOUR THINGS AND NOTHING ELSE
+#
+#   1. the `postgres` service's database name and role   (kit ships the container)
+#   2. the `identity` service: its image, its port, its environment
+#   3. the crash layer: where this container's stdout/stderr goes
+#   4. nothing at all about the collector
+#
+# WHY THERE IS NO `postgres:` CONTAINER HERE ANY MORE, and it is the first thing
+# a reader will look for. kit's stack already ships one, and a second copy is two
+# postgres majors to upgrade and a port collision on the second developer on the
+# machine. Pointing at kit's is an ENVIRONMENT override, which is the one kind
+# compose merges correctly — see the note on `ports:` below for the kind it does
+# not.
+#
+# WHAT THIS FILE MAY NOT DO, and the collector is the reason
+#
+#   It may not touch `otel-collector`. Not its image, not its command, and above
+#   all not the `volumes:` entry that mounts `otel-collector.yml`. That file
+#   carries the redaction allowlist, which kit DERIVES from core's schemas; a
+#   service that owned it would be shipping a telemetry boundary nobody derived,
+#   and prompt content would leave the process inside it. kit's
+#   tests/fleet_check.py fails this repository over any of the three, and the
+#   moment `kit.ref` exists below, that failure has no discretion left in it.
+#
+#   `<SERVICE>_OTEL_ENDPOINT` is the only contract between this service and an
+#   observability backend. It is set below, to the collector that ships with the
+#   stack. A self-hoster already running Datadog, Honeycomb or Grafana Cloud sets
+#   that one variable in THEIR deployment and this stack goes quiet — bring-your-own
+#   is a supported deployment, not a degraded mode.
+#
+# WHY THERE IS NO `depends_on: otel-collector`, and it is load-bearing
+#
+#   Nothing but the collector may be in a readiness path. A service that waits for
+#   the collector serves no traffic while the collector is down, which is strictly
+#   worse than serving traffic with no traces — and it teaches people to switch
+#   telemetry off, which is the opposite of what this packet is for. kit's gate
+#   fails on a `depends_on` naming the collector, and its
+#   tests/no_telemetry_in_readiness.sh proves the underlying property against a
+#   real collector by killing it and showing the service still serving.
+#
+#   The same rule is why the SDK's exporter is constructed but never retried: a
+#   collector that is not up yet is the normal state of a fresh `docker compose
+#   up`, and the service must not care.
 
 services:
+  # kit ships the postgres container; this is the one thing about it that belongs
+  # to this service. Overriding `environment:` merges per key, so kit's own
+  # POSTGRES_* defaults survive for anything not named here.
   postgres:
-    image: postgres:17-alpine
     environment:
+      POSTGRES_DB: identity
       POSTGRES_USER: identity
       POSTGRES_PASSWORD: identity
-      POSTGRES_DB: identity
-    ports:
-      # Host-side DSNs only (goose, TEST_DATABASE_URL). The service talks to
-      # postgres over the compose network, not through this mapping. If 5432 is
-      # already taken by a local Postgres, override it: POSTGRES_PORT=5433 docker
-      # compose up -d, and point DATABASE_URL at localhost:${POSTGRES_PORT}.
-      - "${POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      # The identity service is started only once this reports healthy, so
-      # pgx never races a Postgres that is still in its init phase.
-      test: ["CMD-SHELL", "pg_isready -U identity -d identity"]
-      interval: 2s
-      timeout: 3s
-      retries: 15
-      start_period: 5s
 
   identity:
     build:
       context: .
       args:
         GO_VERSION: "1.26"
+    image: cafaye/identity:dev
+    # Published, because a developer runs `curl localhost:8080/healthz` and because
+    # a test container on the host has to reach it.
+    #
+    # A literal, and NOT a `${KIT_*:default}` — this is a service's OWN port, not
+    # one of kit's, and kit's port block is a statement about the shared
+    # infrastructure. 8080 is identity's own historical port and clients'
+    # documentation says so; moving it is a breaking change to a published
+    # contract, not a compose edit.
+    ports:
+      - "8080:8080"
     environment:
       PORT: "8080"
       LOG_LEVEL: debug
+      # Over the compose network, by service name. The host mapping above is for
+      # the developer and the host-side test suite, and is not how the service
+      # reaches its own database.
       DATABASE_URL: postgres://identity:identity@postgres:5432/identity?sslmode=disable
-    ports:
-      - "8080:8080"
+
+      # ---------------------------------------------------------------------
+      # OBSERVABILITY, ON BY DEFAULT
+      #
+      # One variable, and it is the only contract (core D16). Unset it and the
+      # collector that ships with the stack is the default — that is the whole of
+      # "a deployer gets traces without assembling them". Point it at any OTLP
+      # endpoint and identity exports there instead.
+      #
+      # It is declared here, in the service's own file, rather than defaulted in
+      # the Go code alone, so that a reader of this file can see where telemetry
+      # goes without reading the source. The code's default is the same address:
+      # two places naming one value is the cost of the code having to work when
+      # nobody runs compose at all, and TestTheEndpointContractIsOneVariable holds
+      # the Go side to `<SERVICE>_OTEL_ENDPOINT`.
+      IDENTITY_OTEL_ENDPOINT: http://otel-collector:4318
+      OTEL_SERVICE_VERSION: "0.0.0-dev"
+
+      # resource, not a measurement. `tenant_id` on a span is a series per
+      # tenant, and at a thousand tenants the collector has folded the stream and
+      # every per-tenant breakdown silently undercounts while the total stays
+      # right. Unset by default: a single-tenant development stack has no tenant
+      # to name, and an empty one would show up as a second service row in every
+      # collector's service list.
+      # IDENTITY_TENANT_ID: ""
+      #
+      # deployment.environment is an ENUM in core's resource schema
+      # (development/test/staging/production), so the four values below are the
+      # four that are legal and `local` is not one of them.
+      DEPLOYMENT_ENVIRONMENT: development
+
+    # THE CRASH LAYER, and it is the reason a panic reaches an operator with no
+    # per-language log SDK in it.
+    #
+    # Every one of the six languages writes a fatal error to stderr; in a
+    # container that is the log stream. Docker's `syslog` driver ships it over the
+    # compose network to the collector's `syslog/crash` receiver, which makes a
+    # panic a log record with a `service.name` on it and no per-language
+    # dependency at all.
+    #
+    # `syslog` rather than `filelog` on `/var/lib/docker/containers`, and that is
+    # a portability decision with a history: the filelog form works on a Linux host
+    # and does not work at all under Docker Desktop or OrbStack, where the
+    # daemon's filesystem lives inside a VM the host cannot bind-mount without
+    # asking for a shared directory. The syslog driver delivers the same bytes from
+    # the same place on every platform.
+    #
+    # NO HOST PORT, and the receiver it talks to is not published either. A syslog
+    # receiver on the host loopback is an unauthenticated log-injection point for
+    # anything else on the machine.
+    #
+    # `tag` is the process identity the collector promotes to `service.name` when a
+    # record has none — see `transform/cafaye_logs` in the collector config. It
+    # has to match the service name or a crash is filed against `unknown`.
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "tcp://otel-collector:15514"
+        tag: "identity"
+
+    # The database, and ONLY the database. Not the collector, for the reason at
+    # the top of this file.
     depends_on:
       postgres:
         condition: service_healthy
-
-volumes:
-  postgres-data:
+    restart: unless-stopped
+    healthcheck:
+      # `/app/service -healthcheck`, and NOT `curl /readyz`, because the runtime
+      # image is `gcr.io/distroless/static-debian12:nonroot` — no shell, no HTTP
+      # client, no wget. The alternatives were a `build:` stanza adding curl to a
+      # security service's image, or no healthcheck at all.
+      #
+      # The binary probes its OWN /readyz over the container loopback and exits 0
+      # or 1. /readyz rather than /healthz because readiness is the one that
+      # consults the database, and a probe that reports healthy against a
+      # database that is gone is a probe that reports a service which answers 503
+      # to everybody.
+      #
+      # The path is the image's own entrypoint path, not a bare name: WORKDIR is
+      # /app and there is no PATH entry for it in a distroless image, so `service`
+      # alone is "executable file not found".
+      test: ["CMD", "/app/service", "-healthcheck"]
+      # 5 * 15s plus a 5s start period is an 80s budget. The binary's own probe
+      # times out at 2s, so `timeout` above it only covers the exec, and the
+      # budget is about how long a service that is genuinely broken stays in
+      # `starting` before it is reported unhealthy.
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
