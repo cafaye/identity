@@ -6,6 +6,28 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed (one postgres image fleet-wide)
+
+- **CI runs the same postgres the dev stack does.** This workflow pinned
+  `postgres:17.11-alpine` while `docker-compose.yml` floated at
+  `postgres:17-alpine`. Both are now `postgres:17-alpine`, which is also what
+  core declares fleet-wide.
+
+  The minor pin was deliberate — pinned to the exact minor the numbers in this
+  file's comments had been measured on — and that is what made it the wrong pin.
+  Pinning a minor only buys a stronger guarantee when nothing else needs to
+  agree with it, and here everything did: a machine running the dev stack and
+  anything CI-shaped stored **two postgres builds**, and a developer and a runner
+  could sit on different ones. The cost was invisible in the line that carried
+  it.
+
+  A digest is the stronger pin and is still not used, for the reason the previous
+  comment gave and which survives: the digest that resolves on an arm64
+  workstation is not the one that resolves on this linux/amd64 runner, so a digest
+  would pin CI to a build no developer can run locally. `17-alpine` is the finest
+  pin that still means "the fleet's image" on every platform, and it is what
+  makes one pull serve both. No test behaviour changed.
+
 ### Fixed (kit-18 D12 sweep)
 
 - **The `env:` caveat no longer explains itself with a limitation core no longer

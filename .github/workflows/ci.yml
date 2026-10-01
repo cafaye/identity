@@ -165,17 +165,22 @@ jobs:
 
     services:
       postgres:
-        # 17.11-alpine, which is the minor docker-compose.yml's `postgres:17-alpine`
-        # resolved to on the commit that added this line, pinned to the exact
-        # minor every number in this file's comments was measured on. kit's fleet
-        # compose template uses the same shape (`16.6-alpine`), so this is a full
-        # minor and not `latest` or a bare major. Two things to know rather than
-        # infer: docker-compose.yml still floats at `17-alpine`, so the dev stack
-        # and CI can drift onto different minors; and a minor pin still floats
-        # across rebuilds of that minor. A digest cannot be pinned here — the
-        # digest that resolves on an arm64 workstation is not the one that
-        # resolves on this linux/amd64 runner.
-        image: postgres:17.11-alpine
+        # `17-alpine` — the same reference docker-compose.yml carries, and the one
+        # core declares fleet-wide. This was `17.11-alpine`, pinned to the exact
+        # minor that every number in this file's comments had been measured on,
+        # and that was the wrong trade. The dev stack floats at `17-alpine` and CI
+        # pinned a minor, so a machine that ran both stored TWO postgres builds
+        # and a developer and a runner could sit on different ones. The comments
+        # below are not re-measured against any particular minor, so nothing here
+        # needed the pin — it was holding a weaker guarantee at a higher cost.
+        #
+        # A DIGEST is the stronger pin and is still not used, for a reason worth
+        # keeping: the digest that resolves on an arm64 workstation is not the one
+        # that resolves on this linux/amd64 runner, so a digest would pin CI to a
+        # build no developer can run locally. `17-alpine` is the finest pin that
+        # still means "the fleet's image" on every platform, which is what makes
+        # one pull serve both.
+        image: postgres:17-alpine
         env:
           # The credentials docker-compose.yml sets, so the DSN below is one a
           # developer already has working locally. TEST-ONLY, and named as such:
