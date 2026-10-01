@@ -609,6 +609,15 @@ func (c *Client) ConfirmPasswordReset(ctx context.Context, body generated.Confir
 // Registration does not send one, so a product that wants an address proved calls
 // this after `RegisterUser`. Same constant response as every other request route;
 // same rule — a non-nil result means "asked", not "sent".
+//
+// **IT ANSWERED 409 FOR AN ALREADY-PROVED ADDRESS UNTIL 2026-10-02, and this method
+// has no conflict case to hand a caller.** That 409 was an account-enumeration oracle
+// on a route that requires no credential: `security` on this operation is `[]`, so
+// posting a list of addresses and reading the statuses back was a list of verified
+// accounts. A caller that needs to know whether an address is already proved must ask
+// `GetEmailVerification`, which requires a session and answers for the caller alone.
+// `ConflictError` is still returned by this client for the routes where a 409 is the
+// honest answer — registering a taken address, and starting an email change to one.
 func (c *Client) RequestEmailVerification(ctx context.Context, body generated.RequestEmailVerificationJSONRequestBody) (*generated.Accepted, error) {
 	var out generated.Accepted
 	err := call(c, "requestEmailVerification", func() (*http.Response, error) {

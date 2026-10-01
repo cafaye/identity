@@ -264,11 +264,6 @@ func TestEveryRecoveryRefusalMapsToItsOwnStatus(t *testing.T) {
 			route: "/v1/email-changes", body: `{"email":"new@example.com"}`, token: "a-session",
 		},
 		{
-			name: "an already-verified account", err: recovery.ErrAlreadyVerified,
-			wantStatus: http.StatusConflict, wantCode: CodeConflict,
-			route: "/v1/email-verifications", body: `{"email":"kaka@example.com"}`,
-		},
-		{
 			name: "a change that describes no move", err: recovery.ErrSameAddress,
 			wantStatus: http.StatusUnprocessableEntity, wantCode: CodeValidationFailed,
 			route: "/v1/email-changes", body: `{"email":"kaka@example.com"}`, token: "a-session",

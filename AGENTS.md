@@ -575,7 +575,30 @@ the toolchain pin matches `go.mod`, and that no secret is written down.
    matrix's fixture names its accounts with a counter and not with the test path,
    because `accounts.Slugify` truncates at 63 characters and two long names that
    share a prefix become one slug.
-6. `bin/prime`, `go vet ./...`, `gofmt -l .`, `go test -race ./...`.
+6. **If a caller with no credential can reach it, it gets a row in
+   `anonymousFamilyAudit()`** in `internal/httpapi/anonymous_enumeration_test.go`,
+   and that row must answer one question in a sentence: *can the response tell
+   "this account exists" from "it does not"?*
+   `TestEveryRouteThatAnswersAnAnonymousCallerIsInThisAudit` walks the router and
+   requires the table to be exactly the mounted family in **both** directions, so
+   the omission is a red build rather than a silent one. **A 401 is a row too** —
+   "this route demands a credential, so no identifier arrives from a stranger" is an
+   answer worth writing down, and the check has no exemption for it. The census
+   caught `POST /v1/email-verifications`'s 409 (identity-27), which had sat behind
+   eleven lines of comment naming the exact threat it was.
+7. `bin/prime`, `go vet ./...`, `gofmt -l .`, `go test -race ./...`.
+
+**A response a stranger can reach may not depend on a row they cannot see.** That is
+the whole rule, and it fails in one direction only: a status, a header or a body
+field that differs for "exists" versus "does not" is an enumeration oracle, and the
+branch that introduces it always reads like a feature — "tell the user their address
+is already verified", "tell them to wait out the lockout". The safe copy of that fact
+is almost always on a route that knows who is asking (`GET /v1/email-verification`
+rather than a 409 on an anonymous request route), and the argument has to be about
+**who is asking**, not about what the caller could not act on. `POST /v1/users`
+answers 409 for a taken address and `POST /v1/session` answers 423 for a locked one:
+both are deliberate, both are named in DECISIONS.md D9, and both are held to the
+smallest disclosure they must be by tests in that same file.
 
 **A new route gets rows in BOTH documents and both walks, and the second one is
 the one that bites.** A route is not finished when it is documented and gated: it

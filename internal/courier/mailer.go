@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -119,11 +120,15 @@ var knownSubjects = map[string]struct{}{
 //	<% end %>
 //
 // That is a registration's address confirmation, and it renders `@url` — which
-// is where the token goes. `recovery.RequestVerification` refuses with
-// `ErrAlreadyVerified` for an account that has already proved its address, so
-// this message only ever reaches an account that has never proved one, which is
-// what the template's words describe. It is courier's own copy about courier's
-// own event, not identity's prose forced through courier's mouth.
+// is where the token goes. The message's own words ("Welcome aboard") describe an
+// address that has not been proved, and identity sends it to the account's own
+// address whether or not one has been: `recovery.RequestVerification` asks the same
+// question for every address and answers it the same way, because a route that
+// refused for a proved address was an account-existence oracle on an anonymous
+// route. A person who asked for a second confirmation link and gets one is not
+// misled by it — the link confirms a fact that already holds. It is courier's own
+// copy about courier's own event, not identity's prose forced through courier's
+// mouth.
 //
 // **THE DOCUMENT IS WRONG ABOUT ONE THING, AND THE CODE IS RIGHT.** courier's
 // `openapi.yaml` says `url` is "unused by `welcome`", and its
@@ -394,21 +399,36 @@ func NewRecoveryMailer(cfg RecoveryMailerConfig) (*RecoveryMailer, error) {
 //	                             here, where that knowledge is.
 func resolveLinkTemplates(raw map[recovery.Purpose]string) (LinkTemplates, error) {
 	out := make(LinkTemplates, len(linkPurposeFor))
-	for subject, purpose := range linkPurposeFor {
-		value, present := raw[purpose]
+	// THE ORDER IS FIXED AND THAT IS NOT TIDINESS. `linkPurposeFor` is a map, so
+	// ranging it visits its two entries in a RANDOM order, and this function returns
+	// on the FIRST purpose with no template. A deployment that had configured neither
+	// was therefore told to set a different variable on each boot — and
+	// `TestTheConstructorRefusesAPurposeWithNoLinkTemplate`'s "no template for either"
+	// row, which asserts which purpose gets named, failed about half the time.
+	//
+	// Both halves of that are defects and the smaller one is the operator's: the
+	// refusal exists to name the variable to set, and a message that names a
+	// different one per attempt is a worse instruction than one that names the first
+	// missing thing every time. Ranging a map where the answer depends on the order is
+	// the whole of it.
+	for _, deliverable := range linkPurposesInOrder() {
+		value, present := raw[deliverable.purpose]
 		if !present {
 			return nil, fmt.Errorf("courier: no link template for the %q message, so a %s "+
 				"link has nowhere to point and the mail would carry a button that goes "+
 				"nowhere. Set the %s variable to the screen that redeems one",
-				subject, purpose, purpose)
+				deliverable.subject, deliverable.purpose, deliverable.purpose)
 		}
 		template, err := ValidateLinkTemplate(value)
 		if err != nil {
-			return nil, fmt.Errorf("courier: the %s link template: %w", purpose, err)
+			return nil, fmt.Errorf("courier: the %s link template: %w", deliverable.purpose, err)
 		}
-		out[purpose] = template
+		out[deliverable.purpose] = template
 	}
-	for purpose := range raw {
+	// And the same rule on the way out: a configuration naming more than one
+	// undeliverable purpose is refused naming the same one every time, so a reader
+	// comparing two boot logs is comparing the logs.
+	for _, purpose := range purposesInOrder(raw) {
 		if _, deliverable := out[purpose]; deliverable {
 			continue
 		}
@@ -417,6 +437,44 @@ func resolveLinkTemplates(raw map[recovery.Purpose]string) (LinkTemplates, error
 			"for it, so the setting would be honoured nowhere", purpose)
 	}
 	return out, nil
+}
+
+// deliverableLink is one row of `linkPurposeFor` with the subject its refusal names.
+type deliverableLink struct {
+	subject string
+	purpose recovery.Purpose
+}
+
+// linkPurposesInOrder is every purpose this adapter can deliver, SORTED BY PURPOSE,
+// so the walk above visits the same one first on every boot.
+//
+// SORTED BY PURPOSE AND NOT BY SUBJECT, and that is the whole of the choice: the
+// refusal is about a configuration VARIABLE, so the order that decides which variable
+// gets named should be the order of the variables. Sorting by the mail subject would
+// be deterministic too and would name `verify_email` first, because "Confirm your
+// cafaye email address" precedes "Reset your cafaye password" — an answer that depends
+// on courier's prose rather than on anything identity can state.
+//
+// SORTED rather than a hand-written list, because a second list is a second thing to
+// forget when a purpose is added, and forgetting it is exactly the shape of bug this
+// package keeps spending paragraphs on.
+func linkPurposesInOrder() []deliverableLink {
+	out := make([]deliverableLink, 0, len(linkPurposeFor))
+	for subject, purpose := range linkPurposeFor {
+		out = append(out, deliverableLink{subject: subject, purpose: purpose})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].purpose < out[j].purpose })
+	return out
+}
+
+// purposesInOrder is a purpose set's members, sorted, for the same reason.
+func purposesInOrder(set map[recovery.Purpose]string) []recovery.Purpose {
+	purposes := make([]recovery.Purpose, 0, len(set))
+	for purpose := range set {
+		purposes = append(purposes, purpose)
+	}
+	sort.Slice(purposes, func(i, j int) bool { return purposes[i] < purposes[j] })
+	return purposes
 }
 
 // Send delivers one rendered message, and reports what courier said.

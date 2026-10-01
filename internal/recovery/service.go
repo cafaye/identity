@@ -362,10 +362,35 @@ func (s *Service) RedeemPasswordReset(ctx context.Context, in RedeemPasswordRese
 // behind them ("does an account exist for this address?") and only one of them
 // being careful would leave the other as the oracle.
 //
-// A verified address is refused with ErrAlreadyVerified rather than quietly
-// ignored. The caller is a product, and a product told "we emailed you" on the
-// strength of a request that was refused renders a confirmation screen the user
-// then cannot leave.
+// # A VERIFIED ADDRESS IS NOT A SEPARATE ANSWER, and that used to be the defect
+//
+// This function returned ErrAlreadyVerified — a 409 — for an account whose address
+// was already proved. The comment above names the exact threat:
+//
+//	"only one of them being careful would leave the other as the oracle"
+//
+// and then the body walked into it. `security: []` on POST /v1/email-verifications
+// means no credential is required, so a caller posting a list of addresses could
+// read the statuses back as a list of VERIFIED ACCOUNTS. The branch was defended on
+// UX grounds — "a client told 'we emailed you' on the strength of a refused request
+// renders a confirmation screen the user cannot leave" — and never accounted for
+// the route being anonymous. The argument was about what the caller could not act
+// on; it was not an argument about who was asking.
+//
+// THE INFORMATION IS PUBLISHED SAFELY ON AN AUTHENTICATED ROUTE.
+// GET /v1/email-verification requires a session cookie and answers 200 for every
+// signed-in account, unverified or not, carrying `email_verified` and
+// `email_verified_at`. A product that needs to tell a user "this address is already
+// verified" asks the route that knows who is asking. The 409 published the same
+// fact to a stranger, and the safe copy was already there.
+//
+// SO THERE IS NO BRANCH ON THE ROW AT ALL. Not "return nil quietly" either: a
+// `if user.IsVerified() { return nil }` would keep the 202 honest while leaving the
+// route's behaviour a function of the row's state, which is the shape the 409 came
+// from and is one line away from being an oracle again. A verified account is asked
+// for a link and is sent one, exactly as an unverified account is — the message
+// confirms a fact that is already true, `MarkEmailVerified`'s write is conditional,
+// and the cost is one message to the account's own inbox.
 func (s *Service) RequestVerification(ctx context.Context, email string) error {
 	if err := s.deliverable(ctx); err != nil {
 		return err
@@ -379,15 +404,14 @@ func (s *Service) RequestVerification(ctx context.Context, email string) error {
 	now := s.clk.Now()
 	q := s.read.Queryer()
 
+	// A miss is the same answer as a hit, and a proved address is the same answer as
+	// an unproved one. There is nothing else to ask.
 	user, err := s.users.ByEmail(ctx, q, normalized)
 	if err != nil {
 		if errors.Is(err, users.ErrNotFound) {
 			return nil
 		}
 		return fmt.Errorf("recovery: looking up the account to verify: %w", err)
-	}
-	if user.IsVerified() {
-		return ErrAlreadyVerified
 	}
 	if s.insideWindow(ctx, q, user.ID, PurposeVerifyEmail, now) {
 		return nil

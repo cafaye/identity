@@ -207,9 +207,9 @@ service quietly listening on the wrong port.
 | `POST /v1/accounts/:id/admin/invitation-revocations` | `200 {requested, revoked}` | Revoke up to 50 pending invitations in one transaction, **one** audit record for the lot. `confirm: true` and a non-empty array are both required. **Owner, `account_invitations:write`, scoped api key only.** |
 | `POST /v1/password-resets` | `202 {"status":"accepted"}` | Mail a single-use link, valid 30 minutes. **The same body for every address** — registered, unregistered, or inside the one-minute cooldown — so it cannot be used to discover who has an account. `503` when the deployment cannot send mail. |
 | `POST /v1/password-resets/confirm` | `204` | Set the new password and **revoke every session and every live access token**, in one transaction. Mints no session; sign in again. `404` for anything that is not a live token — never existed, expired, spent, or another flow's. |
-| `POST /v1/email-verifications` | `202 {"status":"accepted"}` | Mail a link proving the address **already on the account**. Registration does not send one. `409 conflict` once the address is already verified. |
-| `POST /v1/email-verifications/confirm` | `204` | Mark the address proved. **Revokes nothing and mints nothing** — a verification is a fact about an address, not a credential. |
-| `GET /v1/email-verification` | `200 {email, email_verified, email_verified_at?}` | Whether the caller's own address is proved. `email_verified_at` is **absent** when it was never proved, which is a different state from a proved address that has since been changed. |
+| `POST /v1/email-verifications` | `202 {"status":"accepted"}` | Mail a link proving the address **already on the account**. Registration does not send one. **The same body for every address, including one whose account has already proved it** — the route needs no credential, so a status that differed would publish a list of verified accounts. Ask `GET /v1/email-verification` if you need to know. |
+| `POST /v1/email-verifications/confirm` | `204` | Mark the address proved. **Revokes nothing and mints nothing** — a verification is a fact about an address, not a credential. `404` for anything that is not a live token, **including a token of the wrong length**. |
+| `GET /v1/email-verification` | `200 {email, email_verified, email_verified_at?}` | Whether the caller's own address is proved — **the authenticated route for that question**, and the one a client should ask where it used to read a 409. `email_verified_at` is **absent** when it was never proved, which is a different state from a proved address that has since been changed. |
 | `POST /v1/email-changes` | `201 {current_email, new_email, expires_at}` | Start a move. A link goes to the address the account has **now**; nothing moves until two addresses have each confirmed. `409 conflict` if the new address is taken, `422 already_current` if it is the one already there. |
 | `POST /v1/email-changes/current-address` | `202 {"status":"accepted"}` | Prove the current address; a second link is then minted for the **new** one. The body deliberately does not say where it went. |
 | `POST /v1/email-changes/new-address` | `200 {…, email_verified:false}` | Complete the move: the address changes, the verification is **cleared**, and every session and access token is revoked. `email_verified` is false on purpose — reading an inbox is not proof the address is yours. |
@@ -264,6 +264,25 @@ is a declared gap, not an oversight.
 API keys.** Same rule and same reasoning as MFA: a key is a credential somebody
 deliberately created for a script, and silently revoking one breaks a CI job with
 nothing in the response saying why. Verification revokes nothing.
+
+**Both anonymous request routes answer the same bytes for every address, and
+`internal/httpapi/anonymous_enumeration_test.go` is the census that says so.** The
+question behind both is "does an account exist for this address?", so a status that
+differed on either would be an account-enumeration oracle to anyone posting a list of
+addresses — and the route that had one is why the census exists:
+`POST /v1/email-verifications` answered **409** for an address whose account had
+already proved it, which on a route with no credential was a list of verified
+accounts. It answers 202 now, for every address. **The fact itself is still published,
+on `GET /v1/email-verification`, which requires a session** — a client that needs to
+tell a user "this address is already verified" asks the route that knows who is
+asking.
+
+Two disclosures on this surface are left open deliberately and named, rather than
+quietly reclassified: `POST /v1/users` answers `409` for an address that is taken
+(one account per address is the unique index, and a caller registering has to be told
+— see DECISIONS.md D9), and `POST /v1/session` answers `423` for a locked account,
+which a stranger can reach by failing five passwords themselves. Both are pinned to
+the smallest disclosure they must be by tests in the same file.
 
 **No message is ever logged**, and `TestNoRecoveryTokenReachesTheLogs` drives all
 three flows through a logger that keeps everything to prove it.
@@ -1598,7 +1617,10 @@ than an oversight:
 - **No registration-time verification mail.** `POST /v1/users` sends nothing and a
   client that wants an address proved calls `POST /v1/email-verifications`
   afterwards. Registration is the one request that must not start failing because a
-  mail provider is unavailable, and the cost is one extra call in a product.
+  mail provider is unavailable, and the cost is one extra call in a product. **And
+  that route answers the same 202 whether or not the account has already proved its
+  address**, so a client cannot use it to find out — it asks
+  `GET /v1/email-verification`, with a session, when it needs to know.
 - **No sweeper for expired recovery tokens.** `recovery_tokens_expires_at_idx` is in
   the migration so the job is one statement when somebody wants it; in the meantime
   the read query filters on `expires_at`, so an unswept row is harmless.
