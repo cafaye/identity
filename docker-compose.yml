@@ -6,7 +6,8 @@
 #
 # THIS FILE OWNS FOUR THINGS AND NOTHING ELSE
 #
-#   1. the `postgres` service's database name and role   (kit ships the container)
+#   1. `KIT_POSTGRES_DATABASES: identity`   (kit ships the cluster; the DATABASE
+#      is the isolation boundary, so naming identity is the whole of it)
 #   2. the `identity` service: its image, its port, its environment
 #   3. the crash layer: where this container's stdout/stderr goes
 #   4. nothing at all about the collector
@@ -17,6 +18,29 @@
 # machine. Pointing at kit's is an ENVIRONMENT override, which is the one kind
 # compose merges correctly — see the note on `ports:` below for the kind it does
 # not.
+#
+# THE POSTGRES MAJOR IS KIT'S TO CHOOSE, AND THIS ADOPTION CHANGES WHOSE IT IS.
+# A pre-kit-22 shared volume was provisioned by `postgres:17-alpine`; kit's
+# cluster is `kit-postgres:${KIT_POSTGRES_TAG:-17}`, which is Debian rather than
+# alpine because pgvector cannot load on musl. Nothing in this repository pins a
+# major, which is the point — it is raised in kit and picked up here.
+#
+# WHAT THAT COSTS A DEVELOPER WITH AN EXISTING VOLUME, reproduced deliberately
+# rather than described. `docker-entrypoint-initdb.d` runs once per volume, so
+# provisioning is not re-applied and a server that cannot read its own data
+# directory refuses to start:
+#
+#   $ docker compose up postgres        # PG 17 volume, stack asking for major 16
+#   FATAL:  database files are incompatible with server
+#   DETAIL: The data directory was initialized by PostgreSQL version 17, which is
+#           not compatible with this version 16.
+#
+# so after moving the pin, `bin/dev down && bin/dev up` is NOT enough — the
+# volume has to be recreated once with `bin/dev nuke`. kit's own "Adopting this"
+# says the same thing for the same reason; it is repeated here because this is a
+# major change and the failure names a version rather than the cause. The
+# alternative is leaving a developer's local `identity` rows to avoid one command,
+# which is the wrong trade for a development database.
 #
 # WHAT THIS FILE MAY NOT DO, and the collector is the reason
 #
@@ -49,14 +73,115 @@
 #   up`, and the service must not care.
 
 services:
-  # kit ships the postgres container; this is the one thing about it that belongs
-  # to this service. Overriding `environment:` merges per key, so kit's own
-  # POSTGRES_* defaults survive for anything not named here.
+  # THE ONLY THING THIS FILE SAYS ABOUT POSTGRES, and it is one variable.
+  #
+  # `KIT_POSTGRES_DATABASES` is the declaration. Each comma-separated name
+  # becomes BOTH a database and a NOSUPERUSER role that owns it, provisioned by
+  # kit's `templates/compose/postgres/initdb/10-cluster.sh` on a fresh volume.
+  # Everything else about the cluster belongs to kit.
+  #
+  # WHY POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD ARE NOT HERE ANY MORE.
+  # They were, and this file's git history is the receipt, because kit's own
+  # `tests/fleet_check.py` recommends exactly that override — "point it at its
+  # own database by overriding the postgres service's environment (POSTGRES_DB /
+  # POSTGRES_USER)" — which was correct when each service ran its OWN container
+  # and is a boundary breach on a shared one. `POSTGRES_USER` is not a service's
+  # role: it is the SUPERUSER the official image creates, the one role the whole
+  # cluster's privileges are anchored to. Overriding it to `identity` therefore
+  # does not give identity its own database — it makes the AUTH SERVICE's
+  # credentials a cluster superuser, and a superuser reads every database in the
+  # cluster regardless of what the init script revoked.
+  #
+  # Measured on a real cluster built from kit's own stack at the pinned ref, with
+  # this file's previous three lines in place and nothing else changed:
+  #
+  #   $ psql -U courier -d courier -c 'create table deliveries(id int, note text)'
+  #   $ psql -U courier -d courier -c "insert into deliveries values (1,'private')"
+  #   $ psql -U identity -d courier -c 'select * from deliveries;'
+  #    id |  note
+  #   ----+---------
+  #     1 | private
+  #   (1 row)                                     <-- the auth service read
+  #                                               another service's rows
+  #
+  # and `pg_roles` agreed with the reason rather than the symptom:
+  #
+  #   rolname  | rolsuper | rolconnlimit
+  #   ---------+----------+--------------
+  #    courier | f        |           10
+  #    identity| t        |           -1        <-- superuser, no blast radius
+  #
+  # So the isolation the whole cluster contract exists to provide was defeated by
+  # a three-line override that kit's gate recommends. That is worth saying here
+  # rather than only in the commit message: the next reader is one `grep` away
+  # from reintroducing it, and the file above used to look like the safe answer.
+  #
+  # THE LOG LINE THIS FILE'S REMOVAL BUYS BACK. With those three lines present
+  # the cluster still came up HEALTHY and still printed kit's closing sentence:
+  #
+  #   [cluster] done: 1 service database(s), one role each, PUBLIC holds CONNECT
+  #                    on none of them
+  #
+  # which was false of identity in two ways at once — identity's database was
+  # created by the IMAGE rather than by the init script, so it never got a
+  # NOSUPERUSER role, a per-role CONNECTION LIMIT or the two timeouts; and
+  # `identity` held no declared database at all. A green healthcheck and a
+  # reassuring boundary sentence, over a superuser. That is the failure shape
+  # kit's own README calls out as the one that must not be papered over.
+  #
+  # WHY THE DEFAULT IS `${KIT_POSTGRES_DATABASES:-identity}` AND NOT A LITERAL.
+  # This is a KIT variable, not identity's own port: the value an operator wants
+  # is the whole fleet's list, because one cluster serves every service, and that
+  # list does not fit in a service's repository. So it stays overridable from the
+  # environment or `.env`, and a single-service checkout still works with no
+  # configuration at all. The consequence is stated rather than hidden: whoever
+  # declares the list LAST against a shared volume decides what the next `bin/dev
+  # up` sees, so a genuinely shared local cluster wants one operator-owned `.env`
+  # and not nine checkouts each contributing one name.
   postgres:
     environment:
-      POSTGRES_DB: identity
-      POSTGRES_USER: identity
-      POSTGRES_PASSWORD: identity
+      KIT_POSTGRES_DATABASES: ${KIT_POSTGRES_DATABASES:-identity}
+      # THE ROLE CONNECTION LIMIT IS RAISED, AND THE REASON IS A MEASURED
+      # FAILURE RATHER THAN A PREFERENCE.
+      #
+      # kit's default is 10, which is sized for ONE service process: identity's
+      # own pool defaults to `MaxConns = 8` (internal/platform/db/db.go), so the
+      # running service fits inside 10 with room for the readiness probe. It fit
+      # before this packet for a different reason — identity ran its OWN
+      # container, which had no per-role cap at all.
+      #
+      # What does not fit is `bin/prime`. `go test ./...` runs several package
+      # binaries concurrently and each opens its own pool, and the cap is per
+      # ROLE, so they share one budget of 10. Measured on this repository's
+      # committed suite against the shared cluster at kit's default:
+      #
+      #   --- FAIL: TestCreateStoresWhatItWasGiven (0.34s)
+      #       failed to connect to `user=identity database=identity`:
+      #       [::1]:15500 (localhost): server error: FATAL: too many connections
+      #       for role "identity" (SQLSTATE 53300)
+      #
+      # 34 failures, all with that same sentence, and none of them about the code
+      # under test. Raising the limit to 50 on the same cluster and re-running
+      # the identical command gave exit 0 with zero `--- FAIL` lines. So the
+      # limit is the whole story and nothing else was adjusted.
+      #
+      # WHY 50 AND NOT "ENOUGH". It is the number of concurrent pool-holding test
+      # packages with headroom, not a target. The honest cost: this variable is
+      # applied by the init script to EVERY role in the cluster, so raising it for
+      # identity raises the blast radius for all of them. That is the mechanism
+      # kit provides — `templates/database/README.md` says a service that needs
+      # more raises its share here and says why in the PR, which is what this
+      # paragraph is — and it is the right trade for a development cluster.
+      #
+      # IT INTERACTS WITH `KIT_POSTGRES_MAX_CONNECTIONS`, which kit checks as a
+      # FLOOR of (role limit x declared databases) + reserved connections. One
+      # database at 50 is 53 against a default of 200 and passes. The whole fleet
+      # declared at 50 would be 453 and would fail that check, so a genuinely
+      # shared local cluster carrying every service needs
+      # `KIT_POSTGRES_MAX_CONNECTIONS` raised alongside this. Left operator-owned
+      # rather than defaulted here: a number that has to move when the fleet moves
+      # belongs where the fleet is declared.
+      KIT_POSTGRES_ROLE_CONNECTIONS: ${KIT_POSTGRES_ROLE_CONNECTIONS:-50}
 
   identity:
     build:
@@ -80,7 +205,23 @@ services:
       # Over the compose network, by service name. The host mapping above is for
       # the developer and the host-side test suite, and is not how the service
       # reaches its own database.
-      DATABASE_URL: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      #
+      # `identity:...` is the ROLE that `KIT_POSTGRES_DATABASES: identity` above
+      # provisioned, and `identity` at the end is that role's own database. The
+      # password is the CLUSTER's development password rather than a per-service
+      # one, and that is kit's stated arrangement rather than a shortcut here:
+      # every role in a development cluster takes `$POSTGRES_PASSWORD`, and
+      # isolation is by privilege and never by secret — which is exactly why the
+      # boundary can be demonstrated by anyone who has the file. Production roles
+      # carry distinct passwords from the deployment secret store, and nothing
+      # about the boundary changes.
+      #
+      # The literal password `identity` this used to carry was correct only while
+      # identity ran its OWN container with its own POSTGRES_PASSWORD. Against the
+      # shared cluster it is simply the wrong password: the role's password is
+      # the cluster's, so leaving it here is an authentication failure at boot,
+      # not a security improvement.
+      DATABASE_URL: postgres://identity:${KIT_POSTGRES_PASSWORD:-cafaye}@postgres:5432/identity?sslmode=disable
 
       # ---------------------------------------------------------------------
       # OBSERVABILITY, ON BY DEFAULT

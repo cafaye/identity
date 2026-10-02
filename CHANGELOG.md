@@ -6,6 +6,84 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security (packet identity-27: identity joins kit's one shared cluster, and stops being its own superuser)
+
+**identity's development database was a cluster superuser, and this packet is
+the fix.** The `postgres` override in `docker-compose.yml` set `POSTGRES_USER:
+identity`. On the cluster identity now shares with the rest of the fleet, that
+variable is not a service's role — it is the **superuser the official image
+creates**, the one role every other privilege is anchored to. Overriding it did
+not give identity its own database; it gave the **auth service** credentials
+that read every database on the cluster.
+
+Measured on a real cluster built from kit's own stack, with those three lines
+alone changed:
+
+```
+$ psql -U courier -d courier -c "insert into deliveries values (1,'courier-private')"
+$ psql -U identity -d courier -c 'select * from deliveries;'
+ id |      note
+----+---------
+  1 | courier-private
+(1 row)
+
+$ select rolname, rolsuper, rolconnlimit from pg_roles;
+ rolname  | rolsuper | rolconnlimit
+----------+----------+--------------
+ courier  | f        |           10
+ identity | t        |           -1        <-- superuser, no blast radius
+```
+
+**And the cluster reported itself healthy while it did.** `docker compose up
+--wait` exited 0, the container was `healthy`, and kit's init script still
+printed its closing sentence — *"done: 1 service database(s), one role each,
+PUBLIC holds CONNECT on none of them"* — which was false of identity in two ways
+at once: its database had been created by the image rather than by the script,
+so it never got a `NOSUPERUSER` role, a `CONNECTION LIMIT` or the two timeouts,
+and it was in no declared database list at all. This is the failure kit's own
+`templates/database/README.md` calls the one that must not be papered over.
+
+**kit's gate recommends the override that causes it.** `tests/fleet_check.py`
+says, in two places, to "point it at its own database by overriding the
+`postgres` service's environment (`POSTGRES_DB` / `POSTGRES_USER`)". That advice
+was correct when each service ran its own container and is a boundary breach on
+a shared one. Reported upstream; not fixed here, because kit is another
+repository's gate and a service must not edit the gate that judges it.
+
+- **`docker-compose.yml` now declares exactly one postgres variable:**
+  `KIT_POSTGRES_DATABASES: ${KIT_POSTGRES_DATABASES:-identity}`, which becomes one
+  `NOSUPERUSER` role owning one database. `POSTGRES_DB`, `POSTGRES_USER` and
+  `POSTGRES_PASSWORD` are **deleted**. `DATABASE_URL` takes the cluster's
+  password (`${KIT_POSTGRES_PASSWORD:-cafaye}`) because that is what the role's
+  password now is.
+- **`kit.ref` moves `a095992` → `1770009`.** The old pin had **no
+  `templates/compose/postgres/` at all** — no `Dockerfile`, no
+  `initdb/10-cluster.sh`, and a plain `postgres:17-alpine` in its place — so the
+  shared cluster identity now joins did not exist at the pin this repository was
+  running. 1770009 is kit's `master` and `origin/master`.
+- **`KIT_POSTGRES_ROLE_CONNECTIONS` raised 10 → 50**, because the shared cluster's
+  per-role cap is a *runtime* budget sized for one process and `bin/prime` is not
+  one process. identity's pool defaults to `MaxConns = 8`, which fits; but `go
+  test ./...` runs several package binaries concurrently and they share one
+  per-role budget. At 10, the suite produced 34 failures, all reading
+  `FATAL: too many connections for role "identity" (SQLSTATE 53300)`. At 50, the
+  identical command is exit 0 with zero failures.
+- **Production (`config/deploy.yml`) and CI (`.github/workflows/ci.yml`) are
+  deliberately unchanged**, and both comments that had become untrue were
+  corrected rather than left. Neither shares the development topology: CI's
+  container is scoped to one job, and production's accessory is single-tenant on
+  its own host, so there is no second service for either to be isolated from. The
+  one rule that travels is that **neither may gain a `POSTGRES_USER` override**,
+  and that is now written at each site with the reason.
+
+### Added (packet identity-27)
+
+- **`docker-compose.yml` records the measured isolation proof in the file that
+  establishes it**, including the exact psql transcript above and the failure
+  mode's shape. The reasoning sits at the top of the file because the next
+  reader is one `grep` away from reintroducing the override, and until this
+  packet the override looked like the safe answer.
+
 ### Changed (packet identity-29: identity serves no HTML, and the browser belongs to parlor)
 
 **`identity` renders no views, and never did — it rendered one page, and that

@@ -182,10 +182,37 @@ jobs:
         # one pull serve both.
         image: postgres:17-alpine
         env:
-          # The credentials docker-compose.yml sets, so the DSN below is one a
-          # developer already has working locally. TEST-ONLY, and named as such:
-          # a service database with a real password in it would put that password
-          # in every log.
+          # THESE CREDENTIALS NO LONGER MATCH docker-compose.yml, and the comment
+          # that used to claim they did was deleted with the claim.
+          #
+          # Since packet identity-27 identity joins kit's SHARED development
+          # cluster, where the role is provisioned by `KIT_POSTGRES_DATABASES` and
+          # takes the CLUSTER's password (`${KIT_POSTGRES_PASSWORD:-cafaye}`) —
+          # every role in a dev cluster takes one password by design, because
+          # isolation there is by privilege and never by secret. So the local DSN
+          # is `identity:cafaye@...` and the one below is `identity:identity@...`.
+          #
+          # They diverge HERE ON PURPOSE and the divergence is safe, in three
+          # specific ways rather than as a matter of taste:
+          #
+          #   1. This is a service container scoped to one job. There is no shared
+          #      cluster on a runner and no second service to be isolated from, so
+          #      the per-role CONNECTION LIMIT that forced
+          #      `KIT_POSTGRES_ROLE_CONNECTIONS: 50` locally does not exist here —
+          #      and that limit is the one thing that would otherwise make this
+          #      file's `POSTGRES_USER` dangerous.
+          #   2. `POSTGRES_USER: identity` here is SAFE for the same reason it is
+          #      not safe in docker-compose.yml: on a single-database container the
+          #      superuser has nothing to escalate to. It becomes a breach the
+          #      moment a second service's database exists on the server.
+          #   3. It is test-only and the password is literal in a public
+          #      repository, so it is a throwaway value by construction rather
+          #      than by promise.
+          #
+          # If this container is ever pointed at a shared server, rule 2 stops
+          # holding and this block becomes the same defect docker-compose.yml
+          # documents at length. The image reference below and the reasoning for
+          # it are unchanged by any of this.
           POSTGRES_USER: identity
           POSTGRES_PASSWORD: identity
           POSTGRES_DB: identity
