@@ -21,6 +21,38 @@ package ci
 // file: the check has to read the source, and no core rule will ever do it
 // without a decision about reading another language's code.
 //
+// RE-VERIFIED 2026-10-02 by packet `identity-28`, and the sentence above is out
+// of date in a way worth correcting rather than leaving. "core ships one identity
+// payload schema (user/created) for twelve published types" was true when it was
+// written and is no longer: **core-23 paid that debt**, and core now ships NINE
+// identity payload schemas — `api_key/{created,revoked}`,
+// `mfa/{enabled,disabled}`, `oidc_client/{created,revoked}`, `session/revoked` and
+// `user/{created,email_verified}`.
+//
+// The blocker is unchanged, and it was re-MEASURED rather than assumed, against
+// core at `5ec0cec` and again at `15a5df2`: `core/schemas/events/identity/` has
+// `api_key`, `mfa`, `oidc_client`, `session` and `user` and **no `account/` and no
+// `member/`**, and `identity.member.accepted` has no catalog row at all under that
+// name — core calls the fact `identity.member.joined`.
+//
+// The five were declared anyway on a scratch copy and core's own checker was run
+// against it. Six findings, and the reasons in this map are exactly them:
+//
+//	event.unknown-published        identity.member.accepted is published here and
+//	                               core's catalog does not list it, so no consumer
+//	                               is known to be waiting for it
+//	event.payload-schema-missing  … identity/account/created.schema.json
+//	event.payload-schema-missing  … identity/member/invited.schema.json
+//	event.payload-schema-missing  … identity/member/accepted.schema.json
+//	event.payload-schema-missing  … identity/member/role_changed.schema.json
+//	event.payload-schema-missing  … identity/member/removed.schema.json
+//
+// So the gap is still blocked on CORE, by the mechanism these reasons name, and
+// the evidence is a red build rather than a reading of a directory listing. What
+// core needs is written down in DECISIONS.md D1: those five files, plus a catalog
+// row for `identity.member.accepted` or a recorded ruling that `accepted` and
+// `joined` are one fact.
+//
 // The comparison is a SET comparison, not a count, for the reason
 // TestEveryServedRouteIsDocumentedOrNamed in internal/httpapi gives. One event
 // declared and one dropped leaves the count alone, and a count is not a claim
@@ -107,10 +139,12 @@ func emittedEventTypes(t *testing.T) map[string]string {
 //
 // Neither is a legal change to this map on its own. Declaring one of these is
 // blocked on CORE, not here: `event.payload-schema-missing` reads
-// schemas/events/… out of the core checkout, and core ships one identity payload
-// schema (user/created) for twelve published types. Declaring these five today
-// would trade a silent gap for five loud reds, which is not obviously better —
-// so the gap is written down, pinned, and reported instead.
+// schemas/events/… out of the core checkout, and core has no payload schema for
+// `identity.account.created` or for any `identity.member.*` type — see the file
+// header for the measurement and for the six findings declaring them produces.
+// Declaring these five today would trade a silent gap for six loud reds, which
+// is not obviously better — so the gap is written down, pinned, and reported
+// instead, with the red build quoted rather than the reasoning behind it.
 //
 // The values are the reason each one is still here, so a reader arriving at this
 // map in six months learns why rather than only that.

@@ -35,10 +35,15 @@ import (
 //     that started skipping is the failure this rule was written for, and quietly
 //     allowing one is how a green badge comes to mean nothing.
 //
-// So the list is pinned at its exact contents, in both directions, the way
-// `knownDrift` in `internal/httpapi` is pinned: it cannot grow and it cannot be
-// emptied, and the only legal change to it is a change to the reasoning in the
-// workflow's own comment.
+// So the list is pinned at its exact contents, in both directions, and the only
+// legal change to it is a change to the reasoning in the workflow's own comment.
+//
+// (It used to end "the way `knownDrift` in `internal/httpapi` is pinned: it cannot
+// grow and it cannot be emptied". Packet identity-28 emptied that list, correctly
+// and by documenting twelve routes, and had to drop the "cannot be emptied" half
+// of the comparison — see DECISIONS.md D1. Citing it here as a model for a rule
+// this repository no longer follows is the same class of mistake as citing a stale
+// fact, so the citation goes.)
 
 // e2eSkipExceptions are the tests permitted to skip because they need a live
 // courier.
@@ -47,8 +52,7 @@ import (
 // duplication is the assertion: `TestTheExemptionListIsExactlyTheseThreeNames`
 // fails when the two disagree. A test that read the workflow for its expectations
 // would agree with it by construction and prove nothing — which is the same reason
-// `knownDrift` and `.golangci.yml`'s exclusion are each stated in the test that
-// holds them.
+// `.golangci.yml`'s exclusion is stated in the test that holds it.
 var e2eSkipExceptions = []string{
 	"TestAPasswordResetGoesOutThroughARealCourier",
 	"TestAVerificationLinkReachesCouriersWelcomeTemplate",

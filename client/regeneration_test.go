@@ -4,7 +4,7 @@ package client
 //
 // Without this test, a client and its document drift apart and the drift is
 // invisible: `openapi/v1.yaml` gains an operation, `api.gen.go` keeps the old
-// twenty methods, and every test in this package still passes because none of them
+// forty-one methods, and every test in this package still passes because none of them
 // reads the document. The caller gets a 404 from a method that is not there. That
 // is the same failure `internal/httpapi/openapi_drift_test.go` exists to catch on
 // the router side, and a client needs its own tripwire for the same reason — the

@@ -268,30 +268,36 @@ owner:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# DECISION NEEDED — twelve operations are served and written down in no document.
+# DECIDED 2026-10-02 — twelve operations were served and written down in no
+# document. All twelve are documented; this file no longer carries a gap.
 #
-# Open as D1 in this repository's DECISIONS.md. Recorded here as well because
-# `exposes.api` names openapi/v1.yaml, and the first thing a consumer reads is
-# this file: it promises a document describes this service's HTTP surface, and
-# for twelve operations it does not.
+# Open as D1 in this repository's DECISIONS.md, which holds the finding, the two
+# calls that were available, the ruling and what it cost. The short version:
 #
-# WHAT IS MISSING, read out of the router's own chi.Walk rather than off a list:
+#   - the ten tenancy operations are in openapi/v1.yaml under a new `tenancy`
+#     tag, with operationIds and full request and response schemas. They were
+#     listed here because `exposes.api` names openapi/v1.yaml and this file is
+#     the first thing a consumer reads: it promises a document describes this
+#     service's HTTP surface, and for ten operations it did not.
+#   - POST /oidc/authorize and POST /oidc/userinfo are in openid/openid.yaml,
+#     which had declared only the GET of each although registerOIDCRoutes mounts
+#     both deliberately.
 #
-#   - the ten tenancy operations: POST and GET /v1/accounts, GET, PATCH and
-#     DELETE /v1/accounts/{account_id}, GET /v1/accounts/{account_id}/members,
-#     POST /v1/accounts/{account_id}/invitations, PATCH and DELETE
-#     /v1/accounts/{account_id}/members/{user_id}, POST /v1/invitations/accept.
-#   - POST /oidc/authorize and POST /oidc/userinfo, which openid/openid.yaml
-#     leaves out although registerOIDCRoutes mounts them deliberately.
+# What that gap cost is worth repeating, because it is the reason it is closed
+# rather than documented: a client generated from these documents could list an
+# account's API keys and register its OIDC clients, and had NO method for
+# creating the account, inviting anybody into it, or accepting an invitation.
 #
-# They are gated, scope-checked and in the authorization matrix. They are simply
-# not in a contract, so a client generated from either document has no method for
-# any of them. That is what the tripwire in internal/httpapi/openapi_drift_test.go
-# reports, and it is pinned in a list called knownDrift — named for what it is,
-# not for what it excuses — which cannot grow and cannot be emptied.
+# openapi/v1.yaml is at 1.7.0. knownDrift in internal/httpapi/openapi_drift_test.go
+# is EMPTY and pinned at empty, and internal/httpapi/known_drift_test.go holds the
+# check biting by reconstructing that pre-1.7.0 state out of the real documents
+# and the real router.
 #
-# THIS SERVICE DOES NOT PICK A SIDE. Documenting them is a contract change and
-# belongs in its own packet; ruling them out of the contract has to be recorded
-# in the document and the README, not in a list. See D1 for the two calls and
-# the cost of each.
+# WHAT IS STILL A GAP IN THIS FILE, and is not this packet's: five emitted
+# events are declared nowhere. `event.payload-schema-missing` reads payload
+# schemas out of the core checkout, and core has no schemas/events/identity/account/
+# or .../member/ (verified against core 5ec0cec on 2026-10-02), so declaring them
+# here would trade a silent gap for five loud reds. Pinned with a reason in
+# internal/platform/ci/event_grammar_test.go. What core needs is written down in
+# DECISIONS.md D1.
 # ---------------------------------------------------------------------------

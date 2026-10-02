@@ -6,7 +6,141 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added (packet identity-28: the tenancy surface is in a document, and D1 is decided)
+
+Ten operations the router has served since the accounts packet are now in
+`openapi/v1.yaml`, under a new `tenancy` tag, with request and response schemas,
+operationIds and the status table each route really answers:
+
+| operationId | method and path | minimum role | token scope |
+|---|---|---|---|
+| `createAccount` | `POST /v1/accounts` | — (any session) | **refused, 403** |
+| `listAccounts` | `GET /v1/accounts` | — (any session) | **refused, 403** |
+| `getAccount` | `GET /v1/accounts/{account_id}` | member | `accounts:read` |
+| `renameAccount` | `PATCH /v1/accounts/{account_id}` | admin | `accounts:write` |
+| `deleteAccount` | `DELETE /v1/accounts/{account_id}` | owner | `accounts:delete` |
+| `listMembers` | `GET /v1/accounts/{account_id}/members` | member | `accounts:read` |
+| `inviteMember` | `POST /v1/accounts/{account_id}/invitations` | admin | `accounts:write` |
+| `changeMemberRole` | `PATCH /v1/accounts/{account_id}/members/{user_id}` | owner | `accounts:write` |
+| `removeMember` | `DELETE /v1/accounts/{account_id}/members/{user_id}` | admin | `accounts:write` |
+| `acceptInvitation` | `POST /v1/invitations/accept` | — (any session) | **refused, 403** |
+
+And two more on the OpenID Connect document, which mounted both methods and wrote
+down only one of each: `POST /oidc/authorize` (`authorizeViaPost`) and
+`POST /oidc/userinfo` (`userinfoViaPost`).
+
+**What it cost before this packet:** a client generated from these documents could
+list an account's API keys and register its OIDC clients, and had **no method at
+all** for creating the account, inviting anybody into it, or accepting an
+invitation. `cafaye-ts` had ten identity methods and none of them was
+`createAccount`.
+
+`openapi/v1.yaml` is at **1.7.0**. `knownDrift` in
+`internal/httpapi/openapi_drift_test.go` is **empty** and pinned at empty, and
+**D1 is decided** in [DECISIONS.md](DECISIONS.md): these are contract surface.
+
+### Fixed (found by having to document the response: a member list identified nobody)
+
+`GET /v1/accounts/{account_id}` and `GET /v1/accounts/{account_id}/members`
+returned entries whose `user_id` was `""` and whose `created_at` was
+`0001-01-01T00:00:00Z`. `membershipResponses` filled only `role`, because
+`accounts.MemberSummary` is shaped for "which accounts does this user belong to"
+and carries the account and the role and no user — so `Members`, which reuses the
+same struct for the other direction, had nothing to project.
+
+The wire looked like this, with three indistinguishable rows:
+
+```json
+[{"account_id":"","user_id":"","role":"admin","created_at":"0001-01-01T00:00:00Z"},
+ {"account_id":"","user_id":"","role":"member","created_at":"0001-01-01T00:00:00Z"},
+ {"account_id":"","user_id":"","role":"owner","created_at":"0001-01-01T00:00:00Z"}]
+```
+
+**Both operations that act on a member — `PATCH` and
+`DELETE /v1/accounts/{account_id}/members/{user_id}` — need a user id the response
+did not carry**, so nothing could render or remove a member. It went unnoticed
+because these operations were in no document, so no generated client had a method
+for either and there was no consumer whose complaint would have surfaced it.
+
+`MemberSummary` now carries `UserID` and `JoinedAt`, the two membership columns
+are selected, and every entry is the membership it claims to be.
+`TestEveryMemberInAMemberListIdentifiesItself` holds it, on both routes.
+
+**This is a behaviour change and it has no migration**, because there is nothing to
+migrate: the operations were undocumented, so no client exists that reads the old
+shape.
+
+### Security (found while verifying the neighbouring gap, and NOT fixed here)
+
+**A revoked invitation still redeems.** `POST /v1/invitations/accept` creates a
+membership from a token an account admin explicitly withdrew, and leaves the row
+with **both** `accepted_at` and `revoked_at` set — a state
+`migrations/00013_account_invitation_revocation.sql`'s own header says cannot
+happen.
+
+Three statements, none of which mentions `revoked_at`:
+
+- `Store.InvitationByToken` — `SELECT … FROM account_invitations WHERE token_digest = $1`
+- `Service.Accept` — checks `AcceptedAt` and `ExpiresAt`, nothing else
+- `Store.MarkInvitationAccepted` — `… WHERE id = $1 AND accepted_at IS NULL`
+
+Reproduced against a real database on 2026-10-02: mint an invitation, revoke it
+with the statement the admin route runs (one row affected), then redeem it as a
+different signed-in user — **200, and a new membership**.
+
+`TestTheRevokedInvitationIsActuallyDead` passes while this is true, because it
+posts the redemption **with no credential** and reads the resulting 401 as the
+refusal. The test asserts `accept.Code != 200`, and 401 satisfies that.
+
+**Nothing in this packet fixes it and nothing in this packet's document change
+depends on it.** It is the admin surface's whole reason for existing — recalling a
+link that still works — so it belongs to its own packet. Recorded here and in
+[DECISIONS.md](DECISIONS.md) D1 so it is not lost.
+
+### Changed (the drift tripwire's admission list)
+
+`knownDrift` is empty. The old pin said it could not grow **and could not be
+emptied**; the second half is gone, because that clause was written against a list
+of *known bugs* where deleting an entry could have meant deleting the memory of a
+gap. The twelve and the commit that closed them are now in the list's own comment
+and in DECISIONS.md D1, so the memory survives the removal.
+`TestKnownDriftIsEmptyBecauseEveryServedOperationIsDocumented` pins it at zero and
+its failure message is the argument for why a future entry is not the answer.
+
+`internal/httpapi/known_drift_test.go` is new and is the proof the tripwire still
+bites: it reads the **real** router walk and the **real** documents, removes this
+packet's entries, and asserts all twelve come back unexplained — the same
+expression `TestEveryServedRouteIsDocumentedOrNamed` evaluates, pointed at the
+state the repository was in on 2026-09-30. Separately, a route was actually
+reintroduced in `registerTenancyRoutes` during development and
+`TestEveryServedRouteIsDocumentedOrNamed` named it and went red.
+
+### Changed (the generated client)
+
+`client/generated/api.gen.go` is regenerated, and `Transport` plus `Client` gain ten
+methods to match: `CreateAccount`, `ListAccounts`, `GetAccount`, `RenameAccount`,
+`DeleteAccount`, `ListMembers`, `InviteMember`, `ChangeMemberRole`, `RemoveMember`,
+`AcceptInvitation`. Two of them return a one-time secret (`InviteMember.Token`,
+`AcceptInvitation`'s body) and are documented as never being loggable.
+
+### Re-confirmed, not changed (five emitted events are still declared nowhere)
+
+`identity.account.created`, `identity.member.invited`, `identity.member.accepted`,
+`identity.member.role_changed` and `identity.member.removed` are emitted and
+undeclared, and **the blocker is unchanged**: core has no payload schema for
+`identity/account/` or `identity/member/`, and `identity.member.accepted` has no
+catalog row (core calls it `identity.member.joined`). Verified against core at
+`5ec0cec` and again at `15a5df2`.
+
+The five were declared on a scratch copy anyway and core's own checker run against
+it: **five `event.payload-schema-missing` and one `event.unknown-published`**, which
+is exactly what the reasons in `knownUndeclaredEvents` name. So the gap is left
+open, pinned, and the evidence is a red build rather than a reading of a directory
+listing. What core needs — five files plus a catalog row — is written down in
+DECISIONS.md D1.
+
 ### Fixed (packet identity-27: the enumeration oracle on /v1/email-verifications)
+
 
 - **`POST /v1/email-verifications` answered `409` when the address belonged to an
   account that had already proved its address, and the route requires no credential.**

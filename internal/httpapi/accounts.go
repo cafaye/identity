@@ -920,10 +920,25 @@ func (o options) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 }
 
 // membershipResponses projects a member list onto the wire.
+//
+// EVERY FIELD IS FILLED, and that is the whole point of the function. It set only
+// `Role` until packet identity-28 documented this surface, because
+// `accounts.MemberSummary` was shaped for `ListMine` and carries no user — so
+// the wire carried `account_id: ""`, `user_id: ""` and a zero `created_at` on
+// every entry, and a member list was three rows a client could not tell apart and
+// could not act on. `TestEveryMemberInAMemberListIdentifiesItself` holds it.
+//
+// The account id is `m.Account.ID` rather than a request parameter, so a member
+// entry cannot describe an account other than the one whose members these are.
 func membershipResponses(members []accounts.MemberSummary) []membershipResponse {
 	out := make([]membershipResponse, 0, len(members))
 	for _, m := range members {
-		out = append(out, membershipResponse{Role: m.Role})
+		out = append(out, membershipResponse{
+			AccountID: m.Account.ID.String(),
+			UserID:    m.UserID.String(),
+			Role:      m.Role,
+			CreatedAt: m.JoinedAt,
+		})
 	}
 	return out
 }

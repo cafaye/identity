@@ -96,15 +96,31 @@ type NewInvitation struct {
 	InvitedBy   id.UUID
 }
 
-// MemberSummary is an account paired with the caller's role in it.
+// MemberSummary is an account paired with a membership in it.
 //
-// It exists because both list endpoints need exactly that pair and neither can
-// get it from the accounts table alone: accounts has no role, account_users has
-// no name. Returning the pair from one query is what keeps "list my accounts"
-// from being an N+1.
+// It exists because both list endpoints need exactly that and neither can get it
+// from the accounts table alone: accounts has no role, account_users has no name.
+// Returning the pair from one query is what keeps "list my accounts" from being
+// an N+1.
+//
+// UserID and JoinedAt name WHICH membership, and they were added when packet
+// identity-28 documented this surface. The struct was written for `ListMine` —
+// "which accounts does this user belong to" — where the user is the caller and
+// the account is the answer, so the user id is redundant. `Members` reuses it
+// for the other direction, and there it is the whole content: a member list of
+// entries carrying no user id is a list nothing can be acted on, because
+// `PATCH` and `DELETE /v1/accounts/{account_id}/members/{user_id}` both need
+// one. Carried on the shared struct rather than a second type so a future caller
+// of either query cannot reach the anonymous shape by accident.
 type MemberSummary struct {
 	Account Account
 	Role    Role
+	// UserID is who holds Role. For `ListMine` it is the caller, every time.
+	UserID id.UUID
+	// JoinedAt is when that membership was created — NOT the account's, which is
+	// on Account.CreatedAt and is a different fact. The two are both called
+	// `created_at` on their own rows and mixing them up is a plausible bug.
+	JoinedAt time.Time
 }
 
 // Store is the accounts, account_users and account_invitations tables.
@@ -125,12 +141,18 @@ const membershipColumns = `account_id, user_id, role, created_at, updated_at`
 const invitationColumns = `id, account_id, email, role, token_digest, expires_at, accepted_at, invited_by, created_at, updated_at`
 
 // membersSelectList is the accounts column list qualified with the `a` alias plus
-// the caller's role, for the two statements that join account_users to accounts.
+// the membership's own three columns, for the two statements that join
+// account_users to accounts.
 //
 // It is a var rather than a const because it is built from prefixed() at run
 // time: the point of the helper is that a column added to accountColumns cannot
 // be forgotten here, and a constant cannot call a function.
-var membersSelectList = prefixed("a", accountColumns) + `, au.role`
+//
+// The three are qualified rather than taken from membershipColumns, because that
+// list opens with `account_id` and this query already has the account's own
+// columns — selecting it twice under two names is how a scan ends up reading one
+// row's account_id into another's.
+var membersSelectList = prefixed("a", accountColumns) + `, au.role, au.user_id, au.created_at`
 
 // Create inserts an account and returns the stored row.
 //
@@ -299,7 +321,7 @@ func (s *Store) Members(ctx context.Context, q db.Querier, accountID id.UUID) ([
 			a   Account
 			err error
 		)
-		if err = rows.Scan(&a.ID, &a.Name, &a.Slug, &a.Personal, &a.CreatedAt, &a.UpdatedAt, &m.Role); err != nil {
+		if err = rows.Scan(&a.ID, &a.Name, &a.Slug, &a.Personal, &a.CreatedAt, &a.UpdatedAt, &m.Role, &m.UserID, &m.JoinedAt); err != nil {
 			return nil, fmt.Errorf("scanning a member: %w", err)
 		}
 		m.Account = a
@@ -397,7 +419,7 @@ func (s *Store) ListForUser(ctx context.Context, q db.Querier, userID id.UUID) (
 			m MemberSummary
 			a Account
 		)
-		if err := rows.Scan(&a.ID, &a.Name, &a.Slug, &a.Personal, &a.CreatedAt, &a.UpdatedAt, &m.Role); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.Slug, &a.Personal, &a.CreatedAt, &a.UpdatedAt, &m.Role, &m.UserID, &m.JoinedAt); err != nil {
 			return nil, fmt.Errorf("scanning an account: %w", err)
 		}
 		m.Account = a
