@@ -26,6 +26,7 @@ import (
 	"github.com/cafaye/identity/internal/platform/db"
 	"github.com/cafaye/identity/internal/platform/id"
 	"github.com/cafaye/identity/internal/sessions"
+	"github.com/cafaye/identity/internal/tenancy"
 	"github.com/cafaye/identity/internal/users"
 )
 
@@ -280,6 +281,26 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (RegisteredUse
 // is the point: the account's slug is derived from the user id, and the ownership
 // is what makes the account administrable. A service that created the membership
 // first would have no account to attach it to.
+//
+// # THE ONE REQUEST WITH NO ACCOUNT THAT STILL WRITES ACCOUNT-SCOPED ROWS
+//
+// BETWEEN Provision AND AddOwner IS WHERE begin_account HAPPENS, and it is here
+// rather than in the transaction runner because a registration has no account to
+// resolve at all: the caller is anonymous, there is no session, and the account
+// does not exist until Provision returns it. So the identity cannot come from the
+// request — it comes from the row that was just created.
+//
+// WITHOUT IT the owner membership INSERT meets
+// `with check (account_id = (select cafaye.current_account_id()))` with a NULL
+// identity, NULL is not true, and Postgres refuses the write with SQLSTATE 42501.
+// That is the substrate working: it is refusing an account-scoped write that
+// claims no account. The symptom it produced was `POST /v1/users` answering 500,
+// which is how this branch shipped red.
+//
+// The alternative — leaving it NULL and letting the INSERT fail — is not a
+// choice, it is the bug. The alternative of writing the membership BEFORE the
+// account exists would have no account_id to write, which is the ordering
+// constraint the paragraph above already explains.
 func (s *Service) provisionTenancy(ctx context.Context, q db.Querier, u users.User) error {
 	if s.tenancy == nil {
 		// NewService requires a provisioner, so this is a wiring bug rather than a
@@ -294,6 +315,14 @@ func (s *Service) provisionTenancy(ctx context.Context, q db.Querier, u users.Us
 	if err != nil {
 		return fmt.Errorf("creating the personal account: %w", err)
 	}
+
+	// Before AddOwner and on the SAME transaction, because begin_account is
+	// transaction-local and the membership write is the account-scoped statement
+	// that needs it. On a different transaction it would have expired.
+	if err := tenancy.BeginAccount(ctx, q, account.ID); err != nil {
+		return fmt.Errorf("beginning as the new personal account: %w", err)
+	}
+
 	if _, err := s.tenancy.AddOwner(ctx, q, account.ID, u.ID); err != nil {
 		return fmt.Errorf("granting ownership of the personal account: %w", err)
 	}

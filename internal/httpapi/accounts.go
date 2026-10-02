@@ -13,6 +13,7 @@ import (
 	"github.com/cafaye/identity/internal/apikeys"
 	"github.com/cafaye/identity/internal/auth"
 	"github.com/cafaye/identity/internal/platform/id"
+	"github.com/cafaye/identity/internal/tenancy"
 	"github.com/cafaye/identity/internal/users"
 )
 
@@ -323,11 +324,29 @@ func (o options) requireAccountRole(min accounts.Role, next http.HandlerFunc) ht
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), accountContextKey{}, accountScope{
+		// TENANCY.WithAccount IS WHERE THE ACCOUNT BOUNDARY IS SET FOR THIS
+		// REQUEST, and this middleware is the only place it can be set from.
+		//
+		// Every role check above has already passed by the time this runs, so the
+		// account is a fact established by a membership read rather than anything
+		// the caller supplied — which is the rule that keeps tenancy out of
+		// request bodies. The value then travels on the context to whichever
+		// transaction the handler's use case opens, and internal/tenancy sets the
+		// GUC there, inside it. See that package for why the context rather than a
+		// parameter.
+		//
+		// IT IS SET HERE AND NOT IN THE HANDLERS, for one reason: a handler that
+		// forgot would still pass every authorization test in this file, because
+		// the tests drive programmable doubles that have no database and no RLS.
+		// The failure would be a 42501 from the substrate at run time, on the
+		// first account-scoped write, in whatever deployment reached a real
+		// database — which is exactly how the previous state of this branch
+		// shipped a 500 on registration.
+		ctx := tenancy.WithAccount(context.WithValue(r.Context(), accountContextKey{}, accountScope{
 			Account: account, Role: role, User: user,
 			Scopes: caller.Key.Scopes,
 			KeyID:  caller.Key.ID,
-		})
+		}), account.ID)
 		next(w, r.WithContext(ctx))
 	}
 }

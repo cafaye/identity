@@ -21,6 +21,12 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	// acctboundary is internal/tenancy under a name that does not collide with
+	// the `tenancy` local below, which is the accounts SERVICE. The distinction
+	// matters to a reader: one is the database boundary, the other is the use
+	// cases that sit inside it.
+	acctboundary "github.com/cafaye/identity/internal/tenancy"
+
 	"github.com/cafaye/identity/internal/accounts"
 	"github.com/cafaye/identity/internal/apikeys"
 	"github.com/cafaye/identity/internal/auth"
@@ -377,7 +383,7 @@ func buildAuth(
 	// two blocks is the dependency order, which is the reason they share a
 	// function rather than being two independent builders in newApp.
 	tenancy := accounts.NewService(
-		db.TxRunner{Pool: pool},
+		acctboundary.TxRunner{TxRunner: db.TxRunner{Pool: pool}},
 		accounts.NewStore(pool),
 		events,
 		apiKeyStore,
@@ -407,7 +413,7 @@ func buildAuth(
 	_, mfaUsable := vault.(mfa.Unavailable)
 	mfaUsable = !mfaUsable
 	secondFactor := mfa.NewService(
-		db.TxRunner{Pool: pool},
+		acctboundary.TxRunner{TxRunner: db.TxRunner{Pool: pool}},
 		db.Direct{Pool: pool},
 		mfa.NewStore(pool),
 		events,
@@ -434,7 +440,7 @@ func buildAuth(
 		// events; login's session and cleared failure counter; and the
 		// second-factor login's session, challenge consumption and two cleared
 		// counters, are each one transaction.
-		db.TxRunner{Pool: pool},
+		acctboundary.TxRunner{TxRunner: db.TxRunner{Pool: pool}},
 		// Everything else is a single statement and does not need one.
 		db.Direct{Pool: pool},
 		users.NewStore(pool),
@@ -515,7 +521,7 @@ func buildRecovery(
 	service := recovery.NewService(
 		// A spent token and the state it changes are one transaction, so every
 		// redemption runs on the runner rather than on a bare querier.
-		db.TxRunner{Pool: pool},
+		acctboundary.TxRunner{TxRunner: db.TxRunner{Pool: pool}},
 		// Everything else is a single statement: the lookup that decides whether
 		// the account exists, the cooldown read, and the resolution of a presented
 		// token.
@@ -713,7 +719,7 @@ func buildAPIKeys(
 	}
 
 	service := apikeys.NewService(
-		db.TxRunner{Pool: pool},
+		acctboundary.TxRunner{TxRunner: db.TxRunner{Pool: pool}},
 		db.Direct{Pool: pool},
 		apikeys.NewStore(pool),
 		outbox.NewStore(pool),
@@ -810,7 +816,7 @@ func buildOIDC(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*oid
 	// that have to be configured identically and nothing that stops them drifting.
 	events := outbox.NewStore(pool)
 	clients := oidc.NewService(
-		db.TxRunner{Pool: pool},
+		acctboundary.TxRunner{TxRunner: db.TxRunner{Pool: pool}},
 		store,
 		events,
 		storage,

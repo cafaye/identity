@@ -1,14 +1,17 @@
 package recovery
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cafaye/identity/internal/platform/db"
 	"github.com/cafaye/identity/internal/platform/dbtest"
 	"github.com/cafaye/identity/internal/platform/id"
 	"github.com/cafaye/identity/internal/sessions"
+	"github.com/cafaye/identity/internal/tenancy"
 )
 
 // THE PASSWORD RESET FLOW, AND EVERY NEGATIVE IT HAS TO HAVE.
@@ -290,26 +293,50 @@ func TestAResetDoesNotRevokeAScopedAPIKey(t *testing.T) {
 	// question about one statement's absence. The account and the membership go in
 	// with it: the row has to be a real one on the real table for the assertion to
 	// mean anything, and a key needs an account to belong to.
+	//
+	// ALL THREE GOES IN ONE TRANSACTION THAT BEGINS AS THE FIXTURE ACCOUNT, and
+	// that is the same rule the service follows rather than a concession to the
+	// substrate. `account_users` and `api_keys` are protected by row-level
+	// security, so an INSERT into them meets
+	// `with check (account_id = (select cafaye.current_account_id()))`, and a
+	// fixture that inserted with no identity was refused with SQLSTATE 42501 —
+	// the substrate correctly refusing an account-scoped write that claims no
+	// account.
+	//
+	// It is a transaction rather than three statements because begin_account is
+	// TRANSACTION-LOCAL: outside one it expires at the end of the statement that
+	// set it, so a bare `pool.Exec` could never carry an identity. `accounts` is
+	// not itself protected, which is why it can go in the same transaction
+	// before the identity matters.
 	accountID, keyID := id.MustNew(), id.MustNew()
-	if _, err := h.pool.Exec(t.Context(),
-		`INSERT INTO accounts (id, name, slug, personal) VALUES ($1, 'Reset Fixture', $2, false)`,
-		accountID, "reset-fixture-"+strings.ReplaceAll(accountID.String(), "-", "")[:8]); err != nil {
-		t.Fatalf("creating the fixture account: %v", err)
-	}
-	if _, err := h.pool.Exec(t.Context(), `
-		INSERT INTO account_users (account_id, user_id, role) VALUES ($1, $2, 'owner')`,
-		accountID, who.id); err != nil {
-		t.Fatalf("creating the fixture membership: %v", err)
-	}
 	_, keyDigest, err := sessions.NewToken()
 	if err != nil {
 		t.Fatalf("minting the fixture key's digest: %v", err)
 	}
-	if _, err := h.pool.Exec(t.Context(), `
-		INSERT INTO api_keys (id, user_id, account_id, name, token_digest, scopes, created_at, expires_at)
-		VALUES ($1, $2, $3, 'reset-fixture', $4, ARRAY['accounts:read'], $5, $6)`,
-		keyID, who.id, accountID, keyDigest, h.now(), h.now().Add(90*24*time.Hour)); err != nil {
-		t.Fatalf("creating the fixture api key: %v", err)
+	runner := db.TxRunner{Pool: h.pool}
+	if err := runner.Do(t.Context(), func(ctx context.Context, q db.Querier) error {
+		if _, err := q.Exec(ctx,
+			`INSERT INTO accounts (id, name, slug, personal) VALUES ($1, 'Reset Fixture', $2, false)`,
+			accountID, "reset-fixture-"+strings.ReplaceAll(accountID.String(), "-", "")[:8]); err != nil {
+			return fmt.Errorf("creating the fixture account: %w", err)
+		}
+		if err := tenancy.BeginAccount(ctx, q, accountID); err != nil {
+			return fmt.Errorf("beginning as the fixture account: %w", err)
+		}
+		if _, err := q.Exec(ctx, `
+			INSERT INTO account_users (account_id, user_id, role) VALUES ($1, $2, 'owner')`,
+			accountID, who.id); err != nil {
+			return fmt.Errorf("creating the fixture membership: %w", err)
+		}
+		if _, err := q.Exec(ctx, `
+			INSERT INTO api_keys (id, user_id, account_id, name, token_digest, scopes, created_at, expires_at)
+			VALUES ($1, $2, $3, 'reset-fixture', $4, ARRAY['accounts:read'], $5, $6)`,
+			keyID, who.id, accountID, keyDigest, h.now(), h.now().Add(90*24*time.Hour)); err != nil {
+			return fmt.Errorf("creating the fixture api key: %w", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("building the account-scoped fixture: %v", err)
 	}
 
 	token := h.requestReset(t, who)
@@ -319,9 +346,24 @@ func TestAResetDoesNotRevokeAScopedAPIKey(t *testing.T) {
 		t.Fatalf("the redemption: %v", err)
 	}
 
+	// THE ASSERTION READS AS THE FIXTURE ACCOUNT TOO, on the same rule as the
+	// fixture above and for the same reason: `api_keys` is protected, so a bare
+	// pool query carrying no identity reads zero rows — which is the safe
+	// direction, but it would make this test pass for the wrong reason. "The
+	// reset did not revoke the key" and "the reset could not see the key" both
+	// yield no rows here, and only one of them is the property being claimed.
+	//
+	// So the read begins as the account the key belongs to. If the reset HAD
+	// revoked it, `revoked_at` would be non-nil and the assertion below would
+	// fire — which is the whole test, and it can only fire if the row is visible.
 	var revokedAt *time.Time
-	if err := h.pool.QueryRow(t.Context(),
-		`SELECT revoked_at FROM api_keys WHERE id = $1`, keyID).Scan(&revokedAt); err != nil {
+	readRunner := db.TxRunner{Pool: h.pool}
+	if err := readRunner.Do(t.Context(), func(ctx context.Context, q db.Querier) error {
+		if err := tenancy.BeginAccount(ctx, q, accountID); err != nil {
+			return fmt.Errorf("beginning as the fixture account to read it: %w", err)
+		}
+		return q.QueryRow(ctx, `SELECT revoked_at FROM api_keys WHERE id = $1`, keyID).Scan(&revokedAt)
+	}); err != nil {
 		t.Fatalf("reading the api key: %v", err)
 	}
 	if revokedAt != nil {

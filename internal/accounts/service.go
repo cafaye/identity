@@ -10,6 +10,7 @@ import (
 	"github.com/cafaye/identity/internal/platform/clock"
 	"github.com/cafaye/identity/internal/platform/db"
 	"github.com/cafaye/identity/internal/platform/id"
+	"github.com/cafaye/identity/internal/tenancy"
 	"github.com/cafaye/identity/internal/users"
 )
 
@@ -143,6 +144,15 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Created, error) {
 		})
 		if err != nil {
 			return err
+		}
+
+		// Begin as the account that was just created, for the same reason
+		// registration does (internal/auth's provisionTenancy): the membership
+		// write below is account-scoped and the account did not exist when the
+		// request arrived, so there is nothing on the context to resolve. Without
+		// this the INSERT is refused with SQLSTATE 42501 and the route 500s.
+		if err := tenancy.BeginAccount(ctx, q, account.ID); err != nil {
+			return fmt.Errorf("beginning as the new account: %w", err)
 		}
 
 		membership, err := s.addOwner(ctx, q, account, in.Owner)
@@ -514,6 +524,19 @@ func (s *Service) Accept(ctx context.Context, in AcceptInput) (Membership, error
 
 	var out Membership
 	err = s.uow.Do(ctx, func(ctx context.Context, q db.Querier) error {
+		// Begin as the account the invitation names. It is on the row rather than
+		// on the request, because accepting an invitation is the one account-scoped
+		// write a caller reaches WITHOUT being a member of the account yet — that
+		// is what the invitation is for. So there is no membership to resolve and
+		// nothing on the context, and the membership INSERT below would otherwise
+		// be refused with SQLSTATE 42501.
+		//
+		// The account id comes from the invitation row the caller presented, not
+		// from a request body, so it is not a tenancy the caller chose.
+		if err := tenancy.BeginAccount(ctx, q, invitation.AccountID); err != nil {
+			return fmt.Errorf("beginning as the invited account: %w", err)
+		}
+
 		membership, err := s.store.AddMember(ctx, q, Membership{
 			AccountID: invitation.AccountID,
 			UserID:    in.User,
