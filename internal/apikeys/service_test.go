@@ -17,6 +17,7 @@ import (
 	"github.com/cafaye/identity/internal/platform/db"
 	"github.com/cafaye/identity/internal/platform/dbtest"
 	"github.com/cafaye/identity/internal/platform/id"
+	"github.com/cafaye/identity/internal/tenancy"
 	"github.com/cafaye/identity/internal/users"
 )
 
@@ -34,6 +35,7 @@ import (
 func realService(pool *pgxpool.Pool, clk clock.Clock) *Service {
 	return NewService(
 		db.TxRunner{Pool: pool},
+		resolver(pool),
 		db.Direct{Pool: pool},
 		NewStore(pool),
 		outbox.NewStore(pool),
@@ -41,6 +43,17 @@ func realService(pool *pgxpool.Pool, clk clock.Clock) *Service {
 		users.NewStore(pool),
 		clk,
 	)
+}
+
+// resolver is the REAL credential seam over the same pool, for the reason
+// realTenancy below names for the tenancy service: these tests run against a
+// private fixture schema, which `dbtest.Schema` builds by cloning tables with
+// `LIKE … INCLUDING ALL`, and LIKE does not copy row-level security. So the
+// GUC this issues lands on a table with no policies and the tests cannot tell
+// whether it was issued. The issuance is asserted where it can be — against the
+// real protected tables, in internal/tenancy, where the policies exist.
+func resolver(pool *pgxpool.Pool) tenancy.CredentialResolver {
+	return tenancy.CredentialResolver{TxRunner: db.TxRunner{Pool: pool}}
 }
 
 // realTenancy is accounts.NewService over the same pool, with no outbox of its own

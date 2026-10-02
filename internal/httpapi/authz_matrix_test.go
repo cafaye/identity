@@ -22,6 +22,7 @@ import (
 	"github.com/cafaye/identity/internal/platform/db"
 	"github.com/cafaye/identity/internal/platform/dbtest"
 	"github.com/cafaye/identity/internal/platform/id"
+	acctboundary "github.com/cafaye/identity/internal/tenancy"
 	"github.com/cafaye/identity/internal/users"
 )
 
@@ -484,6 +485,7 @@ func newMatrixFixture(t *testing.T) *matrixFixture {
 func matrixAPIKeys(pool *pgxpool.Pool, clk clock.Clock, tenancy *accounts.Service) *apikeys.Service {
 	return apikeys.NewService(
 		db.TxRunner{Pool: pool},
+		acctboundary.CredentialResolver{TxRunner: db.TxRunner{Pool: pool}},
 		db.Direct{Pool: pool},
 		apikeys.NewStore(pool),
 		outbox.NewStore(pool),

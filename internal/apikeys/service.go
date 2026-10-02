@@ -109,13 +109,14 @@ type RoleReader interface {
 
 // Service is the api key use cases.
 type Service struct {
-	uow    UnitOfWork
-	read   db.QuerierSource
-	store  KeyStore
-	events EventAppender
-	roles  RoleReader
-	users  UserReader
-	clk    clock.Clock
+	uow     UnitOfWork
+	resolve CredentialResolver
+	read    db.QuerierSource
+	store   KeyStore
+	events  EventAppender
+	roles   RoleReader
+	users   UserReader
+	clk     clock.Clock
 }
 
 // NewService wires the use cases.
@@ -128,8 +129,20 @@ type Service struct {
 //
 // users may be nil for the same reason and with the same effect: Authenticate
 // refuses everything, because a token that resolves to nobody is not a caller.
+//
+// `resolve` is the credential seam and it is NOT `uow`, which is the whole point
+// of it taking its own parameter: `uow` is tenancy.TxRunner, which sets the
+// request's ACCOUNT on every transaction it opens, and a resolution transaction
+// that also began the account would have its read set be the union of "the row
+// whose digest you presented" and "every row of the account you act as". Today
+// the two cannot overlap because requireAccountRole resolves the credential
+// before it calls tenancy.WithAccount, and that is call ORDER in another
+// package — which is not a thing a security property should rest on. Passing one
+// rather than two makes the narrowing structural: there is no spelling of this
+// constructor that hands the resolution an account.
 func NewService(
 	uow UnitOfWork,
+	resolve CredentialResolver,
 	read db.QuerierSource,
 	store KeyStore,
 	events EventAppender,
@@ -138,9 +151,53 @@ func NewService(
 	clk clock.Clock,
 ) *Service {
 	return &Service{
-		uow: uow, read: read, store: store,
+		uow: uow, resolve: resolve, read: read, store: store,
 		events: events, roles: roles, users: users, clk: clk,
 	}
+}
+
+// CredentialResolver is the slice of tenancy.CredentialResolver these use cases
+// need: it opens a transaction carrying the digest the caller presented, and a
+// test can substitute a double for it without standing up Postgres.
+//
+// It is an interface rather than the concrete type because the alternative is a
+// test that reaches the database to check that a statement was issued, and a test
+// that needs a database to check a statement is a test that stops running.
+type CredentialResolver interface {
+	Do(ctx context.Context, digest string, fn func(ctx context.Context, q db.Querier) error) error
+}
+
+// resolveByDigest is the one lookup that has no account to predicate on, and it
+// is HERE rather than inlined at each of its two call sites because the seam is
+// the security-relevant part: the digest is hashed off the request by the
+// caller, handed to Postgres as the statement that scopes the read, and expired
+// with the transaction — before any query runs.
+//
+// THE QUERY IS UNCHANGED, and that is the point of adopting kit's mechanism
+// rather than a local workaround. `where k.token_digest = $1` was always there;
+// what changed is that the boundary now knows how to read it, because the
+// policy carries the same predicate the query does.
+//
+// An error from inside the transaction is returned unchanged, so a refused
+// resolution is still ErrNotFound and still 401. A failure to SET the digest is
+// a different thing — a database problem, not an unknown credential — and it
+// keeps its own sentinel (tenancy.ErrNoCredential) rather than being folded into
+// ErrNotFound, because the two mean opposite things to whoever is reading the
+// log at three in the morning.
+func (s *Service) resolveByDigest(ctx context.Context, digest string, now time.Time) (Key, error) {
+	var key Key
+	err := s.resolve.Do(ctx, digest, func(ctx context.Context, q db.Querier) error {
+		resolved, err := s.store.ByDigest(ctx, q, digest, now)
+		if err != nil {
+			return err
+		}
+		key = resolved
+		return nil
+	})
+	if err != nil {
+		return Key{}, err
+	}
+	return key, nil
 }
 
 // MintInput is a request for a credential.
@@ -389,11 +446,18 @@ type UserReader interface {
 // here either. The caller renders ErrNotFound as `{"active": false}`, which is
 // RFC 7662's answer and the one that keeps "revoked" and "never existed"
 // indistinguishable.
+//
+// IT RESOLVES ON THE SAME SEAM Authenticate DOES, and that is not an
+// implementation detail. This is the second reader of `api_keys` by digest, and
+// leaving it on the bare pool would be a lookup that reads zero rows under the
+// enforced boundary — so `/v1/introspections` would answer `{"active": false}` for
+// every live token in the fleet, which is a silently wrong answer rather than a
+// failure anyone would be paged for. See `resolveByDigest`.
 func (s *Service) Introspect(ctx context.Context, token string, now time.Time) (Claims, error) {
 	if token == "" {
 		return Claims{}, ErrNotFound
 	}
-	key, err := s.store.ByDigest(ctx, s.read.Queryer(), Digest(token), now)
+	key, err := s.resolveByDigest(ctx, Digest(token), now)
 	if err != nil {
 		return Claims{}, err
 	}
@@ -434,8 +498,25 @@ func (s *Service) Introspect(ctx context.Context, token string, now time.Time) (
 // judges it against the same instant the response is timestamped with. The
 // Service's own clock is the default in the HTTP layer, which is the only caller
 // that has one.
+//
+// WHERE THE RESOLUTION RUNS, and it is the second thing this method needs saying.
+// The lookup runs inside a transaction that already carries
+// `cafaye.begin_credential(digest)`, because `api_keys` is a credential table
+// (migrations/00016 calls `cafaye.protect_credential_table('api_keys',
+// 'token_digest')`) and the query that turns a presented secret into a caller has
+// no account to predicate on — the account is what it is FOR. Protected the ordinary
+// way, that query read zero rows for a request with no identity set, which is the
+// state every scoped-token request is in before it has resolved anything, and
+// ErrNotFound became 401 for every valid machine credential in the fleet. Measured,
+// not recalled: see the characterisation that used to pin it,
+// TestTenancyACredentialLookupReadZeroRowsBeforeMD24AndThisIsItsReplacement.
+//
+// The transaction is transaction-local, so after it commits the digest is gone and
+// the connection is an ordinary no-identity session until `requireAccountRole` sets
+// the account — which is what keeps this from being a standing grant on a pooled
+// connection. And the resolver cannot set an account at all; see `resolveByDigest`.
 func (s *Service) Authenticate(ctx context.Context, token string, now time.Time) (Caller, error) {
-	key, err := s.store.ByDigest(ctx, s.read.Queryer(), Digest(token), now)
+	key, err := s.resolveByDigest(ctx, Digest(token), now)
 	if err != nil {
 		// Already ErrNotFound for every case, and the store's error is not wrapped
 		// again here: a caller matching on it is the HTTP layer, and a wrapped

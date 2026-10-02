@@ -720,6 +720,7 @@ func buildAPIKeys(
 
 	service := apikeys.NewService(
 		acctboundary.TxRunner{TxRunner: db.TxRunner{Pool: pool}},
+		acctboundary.CredentialResolver{TxRunner: db.TxRunner{Pool: pool}},
 		db.Direct{Pool: pool},
 		apikeys.NewStore(pool),
 		outbox.NewStore(pool),

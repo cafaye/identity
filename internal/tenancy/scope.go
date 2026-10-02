@@ -5,7 +5,13 @@
 //
 //   - scope.go, here: the RUNTIME seam. Where the account a request acts as is
 //     carried, and the one call that hands it to Postgres.
-//   - the proof beside it: isolation.sql, assertions.txt and tenancy_test.go,
+//   - credential.go: the SECOND runtime seam, for the one lookup that has no
+//     account to predicate on — resolving a presented secret to its row. It is a
+//     separate file rather than two more functions in this one because this file's
+//     whole argument is that there is exactly ONE place that writes
+//     `cafaye.account_id`, and a reader hunting that one place should not have to
+//     decide whether the second statement is part of it.
+//   - the proof beside them: isolation.sql, assertions.txt and tenancy_test.go,
 //     which assert that the substrate in migrations/00016 actually holds.
 //
 // # WHY begin_account IS CALLED HERE AND NOWHERE ELSE
