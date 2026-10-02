@@ -491,6 +491,106 @@ func TestAcceptIsRefusedTwice(t *testing.T) {
 	}
 }
 
+// A REVOKED INVITATION DOES NOT REDEEM.
+//
+// This is the test for identity-30, and it is a regression test against a
+// shipped bypass: RevokePendingInvitation stamps revoked_at and the row stays —
+// deliberately, so the audit trail can tell "withdrawn" from "never existed" —
+// while Accept looked the token up, saw AcceptedAt nil and not-expired, and
+// created the membership anyway. The token the account's admin had withdrawn was
+// a working credential.
+//
+// Three claims, and the third is the one that would catch a partial fix:
+//
+//  1. Accept refuses.
+//  2. It refuses with ErrInvitationNotFound specifically, not ErrInvitationUsed
+//     and not ErrInvitationExpired. openapi/v1.yaml promises 404 for a revoked
+//     invitation, and a distinct status would tell whoever holds a stolen token
+//     that this invitation was once real.
+//  3. Nothing was written. A refusal that returned the right error while leaving
+//     the membership behind would pass 1 and 2 and still be a bypass.
+func TestAcceptIsRefusedAfterRevocation(t *testing.T) {
+	h := newHarness(t)
+	owner := addUser(t, h.q)
+	account := h.owned(t, "Revoked", owner)
+	user := addUser(t, h.q)
+
+	invited, err := h.svc.Invite(t.Context(), InviteInput{
+		AccountID: account.ID, Email: dbtest.UniqueEmail(t), Role: RoleMember, InvitedBy: owner,
+	})
+	if err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+
+	// Revoked through the same store statement the admin surface uses, so this
+	// test does not pass by revoking in a way production never does.
+	changed, err := h.store.RevokePendingInvitation(t.Context(), h.q, account.ID, invited.Invitation.ID)
+	if err != nil {
+		t.Fatalf("RevokePendingInvitation: %v", err)
+	}
+	if changed != 1 {
+		t.Fatalf("RevokePendingInvitation changed %d row(s), want 1 — without this the rest of the test proves nothing", changed)
+	}
+
+	_, err = h.svc.Accept(t.Context(), AcceptInput{Token: invited.Token, User: user})
+	if !errors.Is(err, ErrInvitationNotFound) {
+		t.Errorf("Accepting a revoked invitation = %v, want ErrInvitationNotFound so the handler answers the 404 the contract promises", err)
+	}
+
+	var members int
+	if err := h.q.QueryRow(t.Context(),
+		`SELECT count(*) FROM account_users WHERE account_id = $1 AND user_id = $2`,
+		account.ID, user).Scan(&members); err != nil {
+		t.Fatalf("counting memberships: %v", err)
+	}
+	if members != 0 {
+		t.Errorf("a refused redemption left %d membership row(s) behind; the error was right and the write was not", members)
+	}
+}
+
+// The atomic half: a revocation that lands between the lookup and the UPDATE
+// must not be overwritten by a redemption that started before it.
+//
+// This is not reachable through Accept — the whole thing is one transaction and
+// the read is inside it — so it is tested at the store, which is where the
+// guarantee actually lives. The call above was on a row this transaction had not
+// touched; a service-level test of it would be a test of timing rather than of
+// the WHERE clause.
+func TestMarkInvitationAcceptedRefusesARevokedRow(t *testing.T) {
+	h := newHarness(t)
+	owner := addUser(t, h.q)
+	account := h.owned(t, "Late", owner)
+
+	invited, err := h.svc.Invite(t.Context(), InviteInput{
+		AccountID: account.ID, Email: dbtest.UniqueEmail(t), Role: RoleMember, InvitedBy: owner,
+	})
+	if err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+	if _, err := h.store.RevokePendingInvitation(t.Context(), h.q, account.ID, invited.Invitation.ID); err != nil {
+		t.Fatalf("RevokePendingInvitation: %v", err)
+	}
+
+	err = h.store.MarkInvitationAccepted(t.Context(), h.q, invited.Invitation.ID, h.clock.Now())
+	if !errors.Is(err, ErrInvitationRevoked) {
+		t.Fatalf("MarkInvitationAccepted on a revoked row = %v, want ErrInvitationRevoked", err)
+	}
+
+	// And it did not quietly stamp accepted_at on the way to reporting that.
+	var accepted, revoked bool
+	if err := h.q.QueryRow(t.Context(),
+		`SELECT accepted_at IS NOT NULL, revoked_at IS NOT NULL FROM account_invitations WHERE id = $1`,
+		invited.Invitation.ID).Scan(&accepted, &revoked); err != nil {
+		t.Fatalf("reading the invitation back: %v", err)
+	}
+	if accepted {
+		t.Error("accepted_at was stamped on a revoked invitation; the refusal reported itself but still wrote")
+	}
+	if !revoked {
+		t.Error("revoked_at is no longer set, so the refusal undid the withdrawal")
+	}
+}
+
 // Accepting an invitation for an account you are already in is a 409, not a
 // silent success: the caller's intent was to add a membership, and the state
 // they asked for already holds.

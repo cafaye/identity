@@ -480,6 +480,27 @@ func (s *Service) Accept(ctx context.Context, in AcceptInput) (Membership, error
 		return Membership{}, fmt.Errorf("looking up the invitation: %w", err)
 	}
 
+	// REVOKED FIRST, AND IT BECOMES ErrInvitationNotFound.
+	//
+	// This is the check whose absence made a revoked invitation redeemable
+	// (identity-30), and both halves of how it fails are deliberate.
+	//
+	// It runs before the other two because a withdrawal is the strongest thing
+	// known about the token: whatever else is true of this row, an admin decided
+	// it must not work. It answers NotFound rather than ErrInvitationRevoked
+	// because openapi/v1.yaml already promises that "an invitation an admin
+	// revoked is also 404 — it is not redeemable and there is nothing to redeem",
+	// and because a distinct status would tell whoever holds the token that this
+	// invitation was once real — which is the one piece of an answer an
+	// enumeration of stolen tokens is trying to extract.
+	//
+	// The account's own admin surface does not come through here and is entitled
+	// to the distinction: it reads revocation state directly instead of by
+	// redeeming.
+	if invitation.RevokedAt != nil {
+		return Membership{}, ErrInvitationNotFound
+	}
+
 	// Order matters and it is the order a client would want them in: used before
 	// expired, because an invitation that was accepted and has since expired is
 	// "used" — the caller's link was already spent, and telling them to request a
@@ -505,7 +526,18 @@ func (s *Service) Accept(ctx context.Context, in AcceptInput) (Membership, error
 		// Conditional: a second redemption of the same token updates zero rows
 		// and rolls the whole transaction back, so two concurrent redemptions
 		// cannot both produce a membership.
+		//
+		// ErrInvitationRevoked is the same withdrawal the check above catches,
+		// arriving late: an admin revoked this token between the read and this
+		// statement, so the row said "live" when it was read. The transaction
+		// rolls back either way — no membership is created — and the caller gets
+		// the same 404 it would have got had the revocation landed a moment
+		// earlier, which is the only answer that keeps "what this token's status
+		// is" from depending on how fast the machine was.
 		if err := s.store.MarkInvitationAccepted(ctx, q, invitation.ID, now); err != nil {
+			if errors.Is(err, ErrInvitationRevoked) {
+				return ErrInvitationNotFound
+			}
 			if errors.Is(err, ErrInvitationUsed) {
 				return ErrInvitationUsed
 			}

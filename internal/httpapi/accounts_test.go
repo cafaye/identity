@@ -588,6 +588,50 @@ func TestAcceptInvitationReturnsTheMembership(t *testing.T) {
 	}
 }
 
+// Every status openapi/v1.yaml documents for this route, asserted at the
+// handler that produces it.
+//
+// The contract promises four, and they are four different facts: 404 for a token
+// that names nothing, 410 for one that expired, 410 for one already spent, 409
+// for a membership that already exists. There was no test covering any of them,
+// which is how identity-30's revoked invitation went unnoticed for as long as it
+// did — the route had a happy path and a documentation.
+//
+// THE REVOKED CASE IS THE FIRST ROW, and that is the whole design decision:
+// accounts.Accept turns a revoked invitation into ErrInvitationNotFound, so the
+// handler has nothing to distinguish and nothing to leak. It is the 404 a wrong
+// token gets, because a status that differed would tell whoever holds a stolen
+// token that this invitation was once real — the one thing an enumeration of
+// tokens is trying to extract. The service test
+// (TestAcceptIsRefusedAfterRevocation) is what proves a revocation really does
+// arrive here as ErrInvitationNotFound; this table is what proves the answer it
+// arrives with.
+func TestAcceptInvitationAnswersTheDocumentedStatuses(t *testing.T) {
+	cases := map[string]struct {
+		err  error
+		want int
+	}{
+		"a revoked invitation, and a token that never existed": {accounts.ErrInvitationNotFound, http.StatusNotFound},
+		"one that expired":                 {accounts.ErrInvitationExpired, http.StatusGone},
+		"one already accepted":             {accounts.ErrInvitationUsed, http.StatusGone},
+		"a membership that already exists": {accounts.ErrAlreadyAMember, http.StatusConflict},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			fake := newFakeAuth()
+			tenancy := newFakeTenancy()
+			tenancy.acceptErr = tc.err
+
+			rec := requestAs(t, New(nil, WithAuth(fake), WithTenancy(tenancy)), fake.token,
+				http.MethodPost, "/v1/invitations/accept", `{"token":"a-token"}`)
+			if rec.Code != tc.want {
+				t.Errorf("status = %d, want %d; body: %s", rec.Code, tc.want, rec.Body)
+			}
+		})
+	}
+}
+
 // A malformed id in the path is a 404, not a 422. The path is part of a
 // resource's identity: "this id is not an id this service issued" and "this id
 // is an id this service issued but you cannot see it" must be the same answer,
