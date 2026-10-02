@@ -1,405 +1,207 @@
-# HANDOFF — identity isolation (packet identity-isolation-01)
+# HANDOFF — identity isolation (packet identity-isolation-02)
 
-Branch `worker/identity-isolation-01` in `cafaye/identity`. Two commits, nothing
-pushed, nothing merged, nothing tagged. Nothing outside `migrations/` and
-`internal/tenancy/` was touched.
+Branch `worker/identity-isolation-01` in `cafaye/identity`, worktree
+`cafaye/wt-m39-identity-isolation-01`. Six commits total: the relay's three plus
+the three below. Nothing pushed, nothing merged, nothing tagged.
 
-Read this before starting: **the substrate and the proof are done. But this branch
-is NOT MERGEABLE, and the reason is the most important thing the pilot found:
-applying the substrate alone makes registration return `500`.** Every account-scoped
-`INSERT` now needs `cafaye.begin_account(...)`, and nothing in this service calls it
-yet. The migration and the application wiring cannot be separated — which is the
-opposite of how kit's README presents them as independent numbered steps.
+**Read §1 before anything else. It is a measured production break that a green
+suite cannot see, and it is more urgent than `tenancy.yml`.**
 
-There is also a blocker in core that has to be resolved by somebody who owns kit or
-core before the declaration can be written honestly. Those are the two things left.
+---
 
-## THE BRANCH IS RED, AND THE RED IS 00016
+## 1. FIRST: the credential lookup has no identity to run under
 
-`go test ./...` **with** a database, on this branch:
+**With 00016 applied, scoped-token authentication reads zero rows and every machine
+credential is refused as 401.** Measured on the proof cluster, as the **owner**
+role, against the **real protected table**:
 
-```
---- FAIL: TestNewAppServesTheAuthSurfaceWithADatabase (0.09s)
-    wiring_test.go:58: POST /v1/users = 500, want 201
---- FAIL: TestNewAppMountsMFAWithAKey (0.10s)
-    mfa_wiring_test.go:59: POST /v1/users = 500
---- FAIL: TestNewAppWithoutMFAKeyMountsNoManagementRoutesAndStillChallenges (0.07s)
-    mfa_wiring_test.go:152: POST /v1/users = 500
---- FAIL: TestNewAppWithoutOIDCKeysIsNotAProvider (0.06s)
-    oidc_wiring_test.go:137: POST /v1/users = 500, want 201
-FAIL	github.com/cafaye/identity/cmd/identity	2.505s
---- FAIL: TestAResetDoesNotRevokeAScopedAPIKey (0.04s)
-    password_reset_test.go:302: creating the fixture membership:
-    ERROR: new row violates row-level security policy for table "account_users" (SQLSTATE 42501)
-FAIL	github.com/cafaye/identity/internal/recovery	9.967s
---- FAIL: TestTheCoverageExclusionIsOnlyGeneratedCode (0.03s)   ← PRE-EXISTING, unrelated
-FAIL	github.com/cafaye/identity/internal/platform/ci	3.113s
+| | rows seen |
+|---|---|
+| **no identity — the state a request presenting a scoped token is in** | **0** |
+| identity = the credential's own account | 1 |
+| identity = A, reading another tenant's credential | 0 |
+
+`internal/apikeys/store.go:219` resolves a token with no `account_id` predicate,
+**and cannot have one** — the account is what the query is *for*:
+
+```sql
+SELECT … FROM api_keys k JOIN account_users au ON …
+ WHERE k.token_digest = $1 AND k.revoked_at IS NULL AND k.expires_at > $2
 ```
 
-`POST /v1/users` is registration. It provisions a personal account and its owner
-membership, and `account_users` is now protected, so the membership `INSERT` is
-refused by `with check (account_id = (select cafaye.current_account_id()))` —
-`current_account_id()` is NULL because nothing has called `begin_account`, and a
-NULL identity is `not true`. `internal/recovery`'s failure is the same defect with
-the error left visible.
+Per-request RLS cannot answer a query whose subject it does not yet know. The
+failure is silent: `ByDigest` maps `pgx.ErrNoRows` to `ErrNotFound`, the HTTP layer
+maps that to **401**, so a valid token is indistinguishable from a forged one.
 
-**This is not a bug in the substrate.** It is the substrate refusing to work
-without the caller, which is exactly what it is for. It is a bug in the *packet*,
-which put the migration in this hour and the wiring in the next one.
+Same shape in `account_invitations.InvitationByToken` and the `oidc_clients`
+lookup by `client_id`. **One property, three sites: a table accessed by "find the
+row by an unguessable secret, then learn the account from it" cannot be scoped by
+an account you do not have yet.**
 
-### Your first move, then
+### Why the green suite does not catch it
 
-Choose one, and this is the decision the packet could not make for itself:
+`dbtest.Schema(t)` clones tables with `LIKE … INCLUDING ALL`, and **LIKE does not
+copy row-level security.** Every integration test that drives an account-scoped
+route uses it, so those fixtures have an `account_id` column and **no policies**.
+They pass with the wiring and **they would pass with no wiring at all**. A green
+`go test ./...` is therefore *not* evidence that token auth works in production.
 
-- **(A) Land `begin_account/1` wiring first, then re-apply 00016.** One packet
-  containing both. It touches every query's behaviour, which is why it deserves its
-  own hour — so budget a full packet for it and treat 00016 as part of it.
-- **(B) Revert 00016 and keep only the proof**, which then has to run against a
-  database where the migration is applied by hand. Nothing in the rest of this
-  branch depends on the migration being in the migration chain.
+### It is pinned
 
-Do not merge as-is. Nothing else in this repository is in worse shape than before,
-and the finding is worth more than the code — but a branch that 500s registration
-is not a branch.
+`internal/tenancy/credential_lookup_test.go` —
+`TestTenancyACredentialLookupHasNoIdentityToRunUnder` asserts the measurement and
+is **green while doing so**. It is a characterisation, not a claim that token auth
+works. When this is fixed the test goes red and names exactly what changed.
 
-### And one more kit finding, which the same run produced
+### What NOT to do about it
 
-`internal/tenancy`'s own copy of kit's assertion set goes red **only when the whole
-suite runs**, never when the package runs alone:
+- **Do not drop `FORCE`.** Kit measures it: an owner carrying another tenant's
+  identity reads **1 row with FORCE, 3 without**. It would leave the fleet's only
+  account boundary unenforced on the table holding every machine credential.
+- **Do not reach for `SECURITY DEFINER`. It does not work.** `FORCE` applies to the
+  *definer* too; only a role with `BYPASSRLS` bypasses RLS and no service role has
+  one. This is the option most likely to be proposed — it is killed here so nobody
+  spends an hour discovering it.
+- **Do not write `00017` from inside a service.** Every candidate forks a kit rule.
+  It is kit's or core's call. The honest option, if it is taken, is a *deliberate*
+  owner exemption for credential tables with its cost written down — which is a
+  statement about kit's rule, not about this service.
+
+---
+
+## 2. Done, and verified
+
+### 2.1 The wiring — `00016` stays, registration answers 201
+
+`internal/tenancy/scope.go` is the runtime seam; the proof lives beside it.
+
+| Where | What it does |
+|---|---|
+| `requireAccountRole` (`internal/httpapi/accounts.go`) | puts the **resolved** account on the request context — the request path |
+| `internal/tenancy.TxRunner` | sets it inside every transaction; **embeds `db.TxRunner`, adds no field**, so it satisfies all six `UnitOfWork` interfaces unchanged and no service can be wired unwired by accident |
+| `tenancy.BeginAccount` | the three writes that create the account they act as: `auth.provisionTenancy`, `accounts.Create`, `accounts.Accept` |
+
+Full reasoning, including why the context rather than a parameter and why the
+boundary is set in middleware rather than in handlers, is in
+`moon/logs/REPORT-identity-isolation-02.md` §1–2. The short version of the last
+one: **a handler that forgot would still pass every authorization test in that
+file**, because they drive doubles with no database and no RLS — which is exactly
+how this branch shipped a 500 on registration.
+
+**No query predicate was changed.** Every `where account_id = ?` stays; this packet
+changed where the boundary is *set*.
+
+### 2.2 The gates, with real output
 
 ```
---- FAIL: TestTenancyAccountIsolation (0.04s)
-    sweep/the-only-finding-is-the-control
-      expected "cafaye_probe_unprotected:row level security is not enabled"
-      actual   "…,account_audit_log:row level security is not enabled,
-                account_invitations:…,account_users:…,api_keys:…,oidc_clients:…"
+$ go build ./...                          build=0
+$ go vet ./...                            vet=0
+$ gofmt -l .                              clean (excluding client/generated)
+
+$ TEST_DATABASE_URL="postgres://identity:postgres@127.0.0.1:15999/identity?sslmode=disable" \
+    go test ./cmd/identity/ -run '<the four wiring tests>' -count=1
+ok  	github.com/cafaye/identity/cmd/identity	1.377s
+
+$ TEST_DATABASE_URL=… go test ./internal/recovery/ -run TestAResetDoesNotRevokeAScopedAPIKey -count=1
+ok  	github.com/cafaye/identity/internal/recovery	0.801s
+
+$ TEST_DATABASE_URL=… go test ./internal/tenancy/ -run Tenancy -v -count=1
+--- PASS: TestTenancyACredentialLookupHasNoIdentityToRunUnder (0.05s)
+--- PASS: TestTenancyAccountIsolation (0.04s)          ← kit's 24 assertions
+--- PASS: TestTenancyIdentityOwnsItsFiveTables (0.04s) ← 3-way denial, BOTH roles
+ok  	github.com/cafaye/identity/internal/tenancy	0.544s
 ```
 
-Those five are **not** the real tables — `pg_class.relforcerowsecurity` is `t` on
-all five and the proof above reads the denials happening. They are the private
-fixture schemas that `internal/platform/dbtest.Schema(t)` builds with
-`LIKE ... INCLUDING ALL`, and **`LIKE` does not copy row-level security**, so every
-one carries an `account_id` column and no policies. `go test ./...` runs packages
-in parallel, so kit's sweep assertion — which is a *whole-database* assertion
-expecting exactly one finding, its own control — sees a neighbour's fixtures.
+Both originally-red commands are green, and **the cross-tenant property is still
+proven as BOTH roles** — the wire packet added a way to *set* the boundary and
+changed nothing about what it *does*.
+
+---
+
+## 3. The currently-failing commands, and why
+
+```
+$ TEST_DATABASE_URL=… go test ./... -count=1
+```
+
+Green except **two** failures, both named, neither caused by this packet:
+
+**A. `TestTheCoverageExclusionIsOnlyGeneratedCode` — PRE-EXISTING, UNRELATED, LEFT
+ALONE.** Drift in `coverage-exclusions` against `client/generated`; another
+packet's work. Fails identically before and after these three commits.
+
+```
+coverage_exclusions_test.go:214: line 129: client/generated records lines=22435
+and the tree holds 22411. The excluded set changed and the declaration was not
+restated.
+```
+
+**B. `TestTenancyAccountIsolation` — green alone, red only in a whole-suite run.**
+This is the kit finding the relay recorded, and it is **not** a regression:
+
+```
+2 of 24 account-isolation assertions failed:
+  sweep/the-only-finding-is-the-control
+    expected "cafaye_probe_unprotected:row level security is not enabled"
+    actual   "…,account_users:…,api_keys:…,oidc_clients:…"
+```
+
+Those are **not** the real tables — `relforcerowsecurity` is `t` on all five and
+the three-way denial reads the refusals happening. They are other packages'
+**private fixture schemas**, and kit's sweep assertion is a *whole-database*
+assertion expecting exactly one finding, its own control. The count varies per run
+(5 named on one run, 21 on the next) because it depends on how many neighbours
+were mid-test — **which is the evidence that it is a race, not a defect here**.
 
 **kit's assertion set assumes it owns the database.** A service whose tests create
 private schemas cannot use it unmodified. The fix belongs in kit: scope
-isolation.sql's sweep assertion to `pg_temp` (where its own fixture lives) rather
-than to the whole database. This is a separate finding from the scanner one below
-and it will bite every adopter that uses a private-schema fixture helper.
+`isolation.sql`'s sweep assertion to `pg_temp`. It will bite every adopter with a
+private-schema fixture helper.
 
+I did **not** work around it. Loosening a copied assertion set inside a service to
+make a parallel-test race green is the green lie this repository's rules refuse.
+
+### `go test ./...` with NO database is red — the packet's premise is wrong again
+
+```
+$ go test ./...
+FAIL	internal/apikeys     ← TestTheDatabaseTierActuallyRan
+FAIL	internal/courier     ← TestTheDatabaseTierActuallyRan
+FAIL	internal/mfa         ← TestTheDatabaseTierActuallyRan
+FAIL	internal/recovery    ← TestTheDatabaseTierActuallyRan
+FAIL	internal/platform/ci ← the coverage exclusion above
+```
+
+The brief says identity's suite "is designed to run DB-less". **It is not**, and
+that is deliberate: `TestTheDatabaseTierActuallyRan` FAILS rather than skips so a
+database-less green run is impossible. My work follows the repository, not the
+brief. `internal/tenancy` — my package — **is** green DB-less with a loud skip, and
+`REQUIRED_DB=1` still turns it into a failure.
 
 ---
 
-## Done, and verified
+## 4. The successor's first move
 
-### 1. The substrate — `migrations/00016_account_isolation.sql`
-
-kit's `templates/database/tenancy/substrate.sql` copied verbatim, plus five
-`select cafaye.protect_table(...)` calls: `account_users`,
-`account_invitations`, `oidc_clients`, `api_keys`, `account_audit_log`.
-
-The table list was derived by grepping `account_id` across `migrations/` and
-reading each declaration. It is not copied from the packet, though it happens to
-match. The tables deliberately **absent** are named in the migration header,
-because "not in this migration" otherwise reads as "not thought about":
-`users`/`sessions`/`recovery_tokens`/`mfa_*` are global until a request is
-authenticated and have no account column; `connected_accounts` is per-user;
-`accounts` is the row the others point at.
-
-Verified against `postgres:17-alpine` with kit's real
-`initdb/10-cluster.sh` mounted (so `identity` and `identity_app` are provisioned
-the way the dev cluster provisions them), all 16 migrations applied by `goose`:
-
-```
-select * from cafaye.unprotected_tables();
- table_schema | table_name | why
---------------+------------+-----
-(0 rows)
-```
-
-### 2. The proof — `internal/tenancy/`
-
-`isolation.sql` and `assertions.txt` copied from kit; `tenancy_test.go` is kit's
-driver with three deliberate changes, each commented in the file:
-
-| kit's template | here | why |
-|---|---|---|
-| `//go:build tier_db` | **no build tag** | this repo has no `tier_db` convention and `ci.yml` runs `go test ./...` with no tags, so a tagged test is never *compiled* in CI |
-| `TestAccountIsolation` | `TestTenancyAccountIsolation` | so `-run Tenancy` selects it, which is the verification command in the packet |
-| `t.Skip` on absent DSN | skip message that says **NOTHING WAS CHECKED** and gives the command; `REQUIRED_DB=1` turns it into `t.Fatal` | identity's house convention, and CI already fails on any undeclared `--- SKIP:` line |
-
-Plus a second test kit's set cannot be —
-`TestTenancyIdentityOwnsItsFiveTables` — because kit's `isolation.sql` protects
-its own **temporary** fixture table and never names identity's five. It checks
-the catalog half (enabled, and **FORCED**, plus an `account_id`-leading index and
-policies) and the three-way denial half on real rows as **both** roles.
+1. **Get the §1 decision made by whoever owns kit.** It blocks scoped tokens in
+   every service that adopts `templates/database/tenancy/`, not just identity. If
+   the answer is "credential tables keep the owner exemption", identity's migration
+   is a small, deliberate change with its cost written down — and the pinning test
+   tells you when you are there.
+2. **Then write `tenancy.yml`**, once core's scanner fix lands (core cannot see
+   `protect_table`'s `execute format` DDL; seven of its thirteen findings are false
+   negatives against `pg_policy`'s twenty real policies). Start from
+   `core/harness/tests/fixtures/tenancy/conforming/tenancy.yml`; enumerate all five
+   tables × four policies with `constrained.file = migrations/00016_account_isolation.sql`;
+   expect several iterations against `core/harness/bin/tenancy-check .` — it is
+   closed in both directions and FAILURE-severity by design.
+3. **Raise the kit sweep race separately** (§3B). It is a different finding from
+   the scanner one and it is not a service's to fix.
 
 ---
 
-## The gates that ran, and their real output
+## 5. Bringing the cluster back up
 
-```
-$ go build ./...
-build=0
-
-$ go vet ./internal/tenancy/
-vet=0
-
-$ gofmt -l internal/tenancy/
-(clean)
-
-$ TEST_DATABASE_URL="postgres://identity:postgres@127.0.0.1:15999/identity?sslmode=disable" \
-    go test ./internal/tenancy/ -run Tenancy -v -count=1
-=== RUN   TestTenancyAccountIsolation
-    tenancy_test.go:157: kit's assertion set returned 24 assertions
---- PASS: TestTenancyAccountIsolation (0.03s)
-=== RUN   TestTenancyIdentityOwnsItsFiveTables
-=== RUN   TestTenancyIdentityOwnsItsFiveTables/every_declared_table_is_enabled_and_FORCED
-=== RUN   TestTenancyIdentityOwnsItsFiveTables/the_sweep_finds_nothing_unprotected
-=== RUN   TestTenancyIdentityOwnsItsFiveTables/three-way_denial_as_identity_app
-=== RUN   TestTenancyIdentityOwnsItsFiveTables/three-way_denial_as_identity
---- PASS: TestTenancyIdentityOwnsItsFiveTables (0.03s)
-    --- PASS: .../every_declared_table_is_enabled_and_FORCED (0.00s)
-    --- PASS: .../the_sweep_finds_nothing_unprotected (0.00s)
-    --- PASS: .../three-way_denial_as_identity_app (0.01s)
-    --- PASS: .../three-way_denial_as_identity (0.01s)
-PASS
-ok  	github.com/cafaye/identity/internal/tenancy	0.626s
-```
-
-Both skip paths verified too, because a skip that has not been seen skip is not a
-skip:
-
-```
-$ go test ./internal/tenancy/ -count=1          # no TEST_DATABASE_URL
---- SKIP: TestTenancyAccountIsolation (0.00s)
-    tenancy_test.go:114: TEST_DATABASE_URL is unset, so NOTHING WAS CHECKED HERE. …
-ok  	github.com/cafaye/identity/internal/tenancy	0.372s
-
-$ REQUIRED_DB=1 go test ./internal/tenancy/ -run Tenancy -count=1
---- FAIL: TestTenancyAccountIsolation (0.00s)
---- FAIL: TestTenancyIdentityOwnsItsFiveTables (0.00s)
-FAIL	github.com/cafaye/identity/internal/tenancy	0.416s
-```
-
----
-
-## The proof output itself, both roles, measured
-
-Taken by hand against the same cluster with `psql`, because a passing assertion
-name is a filename and a reader wants the numbers.
-
-**As the OWNER (`identity`), which is the role that matters — every service here
-runs its migrations as its own role, so the owner owns every table:**
-
-| | rows visible |
-|---|---|
-| no identity | **0** |
-| ANOTHER tenant's VALID identity, on ITS rows | **1** (its own) |
-| …of that tenant's rows specifically | **0** |
-| its OWN identity, its own rows | **1** |
-| its OWN identity, unqualified read | **1** (its own only) |
-| cross-account `UPDATE` as the other tenant | matched **0** rows; the row came back `unchanged` |
-
-**The FORCE-RLS control — the suite is proven able to fail:**
-
-| | owner reads |
-|---|---|
-| FORCE removed, same owner, same identity, same query | **2** — every tenant's |
-| FORCE on (the shipped state), same owner, same query | **1** — its own only |
-
-**And the login role owns nothing:**
-
-```
-$ psql -U identity -d identity   (then: set role identity_app)
-identity_app, no identity          -> 0 rows
-identity_app, alter table account_audit_log disable row level security
-  ERROR:  must be owner of table account_audit_log
-```
-
-That last line is the half no catalog reports: the application role cannot switch
-its own policies off, because it does not own the table.
-
----
-
-## Half-done, and why
-
-### A. `tenancy.yml` is NOT written. This is the main thing left.
-
-I ran out of hour, and I would rather hand over a correct explanation than a
-guessed file. It is not a 20-minute job, and the reason is specific:
-
-- The enumeration is **closed in both directions**. `entryPoints[]` must name
-  every account-scoped statement in `scope.sources`, and every declaration must
-  be findable on disk. With `scope.sources: [migrations]` the probe run below
-  already found account-scoped statements in `00007`, `00011`, `00012` and
-  `00013` that nobody declared.
-- Each entry point needs an `enforced.file` + `enforced.line` **carrying the
-  tenancy key on that exact line**, and **three** `negative` case lines in a test
-  file, each carrying its token. That is four verified line numbers per entry
-  point, against a service with 17 `internal/` packages.
-- A line number that is off by one is `tenancy.scope-lost` or
-  `tenancy.denial-missing`. Both are failures, which is the design working — but
-  it means a hand-written file with guessed lines is a **red** file, and a file
-  "fixed" by pointing `line:` at a line that merely mentions `account_id` is a
-  **green lie**. Neither is worth shipping.
-
-Start from `core/harness/tests/fixtures/tenancy/conforming/tenancy.yml`, which is
-the format's worked example, and read `core/docs/tenancy.md` §"why the line is a
-line" before the first line number.
-
-### B. The blocker, measured — core's checker cannot see kit's substrate
-
-This is the finding the pilot was for, and it is not a prediction: it is what
-core's own checker prints.
-
-`cafaye.protect_table` writes its DDL through `execute format(...)` inside
-plpgsql. core's scanner matches `^create policy <name> on <table>` and
-`^alter table <name> (enable|force) row level security` as **statement starts**
-(`core/harness/tenancy_check.py:559` and `:547`). Neither matches a line that
-begins with `execute format('create policy %I on %s …`.
-
-So the checker reports the boundary as **absent** when it is present and verified:
-
-```
-$ cp tenancy.probe.yml tenancy.yml
-$ /Users/kaka/Code/any/moon/cafaye/core/harness/bin/tenancy-check .
-FAIL tenancy.rls-not-enabled: account_audit_log (migrations/00012_account_audit_log.sql:59)
-      carries 0 policy/policies and no `alter table account_audit_log enable row
-      level security`, so none of them is ever evaluated.
-FAIL tenancy.rls-owner-bypass: account_audit_log … is NOT set FORCE ROW LEVEL SECURITY.
-FAIL tenancy.rls-policy-absent: rls.tables names policy 'account_audit_log_cafaye_select'
-      on account_audit_log and the migrations do not create it — they write no policy at all
-   …and the same for _insert, _update, _delete
-FAIL …: 13 failure(s), 1 warning(s)
-```
-
-**Seven of those thirteen are false negatives.** `pg_class.relforcerowsecurity` is
-`t` on all five tables and `pg_policy` holds twenty policies; the proof above reads
-the denials happening. Reproduce the contradiction directly:
-
-```
-$ psql -U identity -d identity -c "select count(*) from pg_policy;"
- 20
-```
-
-This is a false negative in the direction that matters least (it cannot let a gap
-through) and it blocks every service that adopts the template, so **it is kit's
-or core's decision, not a service's.** Two candidate fixes:
-
-- **(a) Teach the scanner about the template.** Resolve
-  `execute format('create policy %I on %s …')` against the enclosing
-  `protect_table` call, using the `<table>_cafaye_<command>` naming convention.
-  This is the right fix and it keeps "one entry point" true.
-- **(b) Write the DDL literally as well as calling `protect_table`.** Explicit
-  `alter table … enable`/`force` plus four explicit `create policy` statements
-  next to the call. `protect_table` drops and recreates by name, so it converges
-  and the file becomes statically readable. **This forks the rule that the
-  substrate has one entry point**, so it is kit's call, and I did not do it.
-
-There is a **second, smaller** finding in the same probe run: the substrate's own
-catalog introspection is flagged as service tenancy code —
-
-```
-FAIL tenancy.undeclared-entry: select on pg_attribute at migrations/00016_account_isolation.sql:290
-      carries the tenancy key and nobody declared it
-```
-
-`protect_table` and `unprotected_tables` query `pg_attribute` and `pg_policy`, and
-the `account_id` string in those queries trips the entry-point scanner. A service
-cannot fix this by declaring them — they are the boundary mechanism, not service
-queries — so either `scope.sources` is narrowed or the scanner skips the `cafaye`
-schema. Whoever takes (a) should take this too; it is the same function.
-
-### C. Gate wiring: DECIDED as "already wired", and nothing was changed
-
-identity's CI **does** provision a database, and this is the reason no workflow
-edit was needed:
-
-- `.github/workflows/ci.yml`'s `gate` job runs a `postgres:17-alpine` service and
-  exports `TEST_DATABASE_URL`.
-- It runs `go test -v -count=1 -race ./...` with **no `-tags`**, so an untagged
-  test in `internal/tenancy/` is compiled and run there.
-- It fails the job on **any** `--- SKIP:` line not in `E2E_SKIP_EXCEPTIONS`, so a
-  silently skipped proof is already fatal.
-- Its "the database tier ran" step derives the package list from
-  `grep -rlE 'dbtest\.(Pool|Schema|EnvVar)|TEST_DATABASE_URL'` rather than from a
-  hand-written list, so `internal/tenancy` joins the tier with **no edit**.
-
-The floors (`SUITE_FLOOR: 2020`, `DATABASE_TIER_FLOOR: 1732`) are decrease
-detectors, so four new PASS lines raise the count and need no new number.
-
-**`bin/prime` was deliberately left alone.** The packet suggested wiring
-`REQUIRED_DB=1` there. Measured: `bin/prime` is `go mod download; go build ./...;
-go test -count=1 ./...`, and that `go test` is **already red without a database**
-— see below — because four packages assert `TestTheDatabaseTierActuallyRan`.
-Adding `REQUIRED_DB=1` would change nothing observable and would couple the
-developer's gate to an environment variable for no gain. If you want the account
-proof to be non-optional for developers, the right place is that existing test,
-not a new flag.
-
----
-
-## The currently-failing command, with real output
-
-`go test ./...` **with no database** is red on this branch. **This is
-pre-existing and is not caused by these commits** — these commits add one
-migration and one new package, and every failing test below is in a package
-neither commit touches.
-
-```
-$ go test ./...          # no TEST_DATABASE_URL
---- FAIL: TestTheDatabaseTierActuallyRan (0.00s)
-    store_test.go:790: TEST_DATABASE_URL is not set, so every test in this file skipped.
-    A green run without it verifies nothing: `docker compose up -d postgres`,
-    `goose -dir migrations postgres "$DATABASE_URL" up`, and re-run with TEST_DATABASE_URL set.
-FAIL	github.com/cafaye/identity/internal/apikeys
---- FAIL: TestTheDatabaseTierActuallyRan (0.00s)   … internal/courier
---- FAIL: TestTheDatabaseTierActuallyRan (0.00s)   … internal/mfa
---- FAIL: TestTheDatabaseTierActuallyRan (0.00s)   … internal/recovery
---- FAIL: TestTheCoverageExclusionIsOnlyGeneratedCode (0.01s)
-    coverage_exclusions_test.go:214: line 129: client/generated records lines=22435 and the tree holds 22411.
-        The excluded set changed and the declaration was not restated.
-FAIL	github.com/cafaye/identity/internal/platform/ci
-```
-
-**The packet's premise is wrong about this repository, and the successor should
-know it.** The brief says *"`go test ./...` must stay green WITHOUT a database
-(identity's tests are designed to run DB-less)"*. They are not: identity is
-built the other way round, on purpose, and `TestTheDatabaseTierActuallyRan` exists
-in four packages specifically to make a database-less green run impossible. My
-contribution follows the repository rather than the brief — my package is green
-DB-less with a loud skip — but it does **not** make the whole suite DB-less green
-and cannot.
-
-`TestTheCoverageExclusionIsOnlyGeneratedCode` is unrelated drift in
-`coverage-exclusions` against `client/generated` and is somebody else's packet.
-
-With a database the suite is red **because of 00016** — see "THE BRANCH IS RED" at
-the top. That is the honest state of this branch, and it is not a regression a
-shorter hour would have avoided: it is the finding.
-
----
-
-## The successor's first move
-
-1. **Decide (a) or (b) for the blocker above, and tell kit or core.** It is not
-   yours to fix inside a service, and it blocks every adopter after identity. If
-   the answer is (b), identity's migration is a five-line addition.
-2. **Then write `tenancy.yml`**, starting from
-   `core/harness/tests/fixtures/tenancy/conforming/tenancy.yml`. Enumerate
-   `rls.tables` for all five tables × four policies with `constrained.file` =
-   `migrations/00016_account_isolation.sql`, and expect to iterate against
-   `core/harness/bin/tenancy-check .` several times — it is closed in both
-   directions and it is a FAILURE-severity checker by design.
-3. **The email-index question is answered and closed** — see the report. Nothing
-   to do.
-
-To bring the cluster back up:
-
-```
+```sh
 docker run -d --name wt-m39-identity-pg \
   -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=postgres \
   -e KIT_POSTGRES_DATABASES=identity -e KIT_POSTGRES_ROLE_CONNECTIONS=50 \
@@ -410,3 +212,6 @@ goose -dir migrations postgres "postgres://identity:postgres@127.0.0.1:15999/ide
 TEST_DATABASE_URL="postgres://identity:postgres@127.0.0.1:15999/identity?sslmode=disable" \
   go test ./internal/tenancy/ -run Tenancy -v -count=1
 ```
+
+Docker needs OrbStack running (`orbctl status`); it was stopped when this packet
+started.
