@@ -546,6 +546,18 @@ func TestEveryOperationHasAnOperationIdAndNoOperationIdIsUsedTwice(t *testing.T)
 // 1.6.0 does not. The one response shape that changed (`members` entries, which
 // used to carry an empty `user_id`) is on operations that 1.6.0 did not describe,
 // so no client can be reading the old shape.
+//
+// 1.8.0 is three numeric enums removed and no wire change at all:
+// `RecoveryCodesResponse.recovery_codes_remaining`, `StartedEnrollment.digits` and
+// `StartedEnrollment.period_seconds` each gave up a single-value `enum:` for a
+// plain `integer` with a `minimum`/`maximum` bound, because Kubernetes' API
+// conventions refuse numeric enums (`api-conventions.md:588`) and a count with one
+// legal value is not an enumeration. This pin moves for a reason the previous five
+// bumps did not — not "operations were added" but "generated source changed and
+// the bytes did not". `caf contract breaking --tiers all` reports exactly that:
+// `enum-value-no-delete [SOURCE]`, and no JSON or WIRE finding. A Go consumer that
+// named `client.N10` or `client.StartedEnrollmentDigits` stops compiling; every
+// other client in the fleet cannot tell the difference at all.
 func TestTheDocumentIsOpenAPI31AndCarriesAVersion(t *testing.T) {
 	doc, err := readOpenAPIDocument(v1Document)
 	if err != nil {
@@ -558,7 +570,7 @@ func TestTheDocumentIsOpenAPI31AndCarriesAVersion(t *testing.T) {
 			v1Document, doc.SpecVersion)
 	}
 
-	const want = "1.7.0"
+	const want = "1.8.0"
 	if doc.InfoVersion != want {
 		t.Errorf("%s declares info.version %q, not %q. core's sync rule is that the /v1 "+
 			"prefix says which contract and this says which build of it, and a non-breaking "+

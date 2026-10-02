@@ -85,7 +85,28 @@ info:
   # `deleteAccount` and the other six in its required-scopes table since 1.4.0,
   # because a scope that gates a route no document declared is a promise with
   # nothing behind it. They are now the method names on every generated client.
-  version: 1.7.0
+  #
+  # 1.8.0 REMOVES THREE NUMERIC ENUMS, and it is the only bump in this file that
+  # breaks generated source while leaving the wire untouched — which is the whole
+  # point of it, so both halves are worth stating. `RecoveryCodesResponse`'s
+  # `recovery_codes_remaining`, and `StartedEnrollment`'s `digits` and
+  # `period_seconds`, each carried `enum:` with a single numeric value. Kubernetes'
+  # API conventions refuse those at `api-conventions.md:588`: adding a value is not
+  # a compatible change, because a client that switches over the numbers has to be
+  # recompiled and redeployed to learn a new one exists. Each is really a COUNT with
+  # one legal value, not an enumeration, so each is now a plain `integer` carrying
+  # the bound (`minimum`/`maximum`) and saying so in its description.
+  #
+  # Nothing on the wire moved: `{"recovery_codes_remaining": 10}`, `{"digits": 6}`
+  # and `{"period_seconds": 30}` are exactly the bytes that were sent before, and
+  # every value inside the new bounds was already the only value the service ever
+  # produced. So this is a SOURCE-tier break and not a JSON or WIRE one, which is
+  # what `caf contract breaking --tiers all` reports. A Go consumer that wrote
+  # `client.N10` or named `client.StartedEnrollmentDigits` stops compiling and wants
+  # plain `int`; nothing else in any language in this fleet can tell the difference,
+  # and the compiled Go client gets strictly simpler — three named types with
+  # exported case constants and `Valid()` methods are gone.
+  version: 1.8.0
   summary: Authentication, sessions, multi-factor authentication, account recovery, accounts, tenancy, scoped API tokens, the admin surface and OIDC registrations.
   description: |
     `identity` is the cafaye platform's security boundary: it is what every other
@@ -4625,14 +4646,26 @@ components:
           enum: [totp]
         digits:
           type: integer
-          enum: [6]
-          description: The code length. Fixed, and 6 because that is what authenticator apps display.
+          minimum: 1
+          maximum: 6
+          description: |
+            The code length. Fixed, and 6 because that is what authenticator apps
+            display.
+
+            A count rather than an enumeration, so no `enum` and no `const` here:
+            both mint a named type with an exported case per value and a `Valid()`
+            method in every generated client in the fleet, and there is nothing for
+            a caller to switch over. The constant is `mfa.Digits`.
         period_seconds:
           type: integer
-          enum: [30]
+          minimum: 1
+          maximum: 30
           description: |
             The step, 30 seconds. Returned rather than assumed so a client can
             render a countdown without hard-coding it.
+
+            A count rather than an enumeration — no `enum`, no `const`, for the
+            same reason as `digits`. The constant is `mfa.Period`.
         algorithm:
           type: string
           enum: [SHA1]
@@ -4752,11 +4785,37 @@ components:
           format: date-time
         recovery_codes_remaining:
           type: integer
-          enum: [10]
+          minimum: 0
+          maximum: 10
           description: |
-            Always 10. It is the count of the set just issued rather than a read
-            back from storage, because a client rendering "you now have N codes"
-            wants N and not a round trip to learn it.
+            How many codes are in the set just issued. It is a **count, not an
+            enumeration**: it is always `mfa.RecoveryCodeCount` (10), because the
+            handler sets it from that constant and the set it counts is the one in
+            `recovery_codes` above.
+
+            It is deliberately not declared with `enum` and deliberately not with
+            `const` either, and that is a decision rather than an omission. Both
+            make every generator in the fleet mint a named type with an exported
+            case per value and a `Valid()` method — oapi-codegen v2.8.0 does
+            exactly that for a `const`, which is how this field was found — and a
+            client that switches over those values has to be recompiled and
+            redeployed to learn a new one exists. Kubernetes' API conventions call
+            that out at `api-conventions.md:588`. A plain integer gives a Go `int`,
+            a TypeScript `number` and a Ruby `Integer` with nothing to switch over,
+            and a small integer in [0, 10] round-trips exactly in all of them.
+
+            The "always 10" is not lost, it is enforced where it can actually fail:
+            `mfa.RecoveryCodeCount` is a compile-time constant, and
+            `TestTheDestructiveRoutesRequireAFactor` in
+            `internal/httpapi/mfa_routes_test.go` asserts the body against it. A
+            document annotation fails a validator somebody may not run; that fails
+            the build.
+
+            It is the count of the set just issued rather than a read back from
+            storage, because a client rendering "you now have N codes" wants N and
+            not a round trip to learn it. How many are left afterwards is a
+            different route — `GET /v1/mfa`.
+          example: 10
 
     RecoveryEmailRequest:
       type: object

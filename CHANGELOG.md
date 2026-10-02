@@ -6,6 +6,55 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed (packet polyglot-numeric: three numeric enums become counts, and the generated Go types with them)
+
+**`caf contract lint` refuses numeric enums, and three fields in this document
+carried one.** `RecoveryCodesResponse.recovery_codes_remaining` was
+`enum: [10]`; `StartedEnrollment.digits` was `enum: [6]`; and
+`StartedEnrollment.period_seconds` was `enum: [30]`. Kubernetes' API conventions
+refuse these at `api-conventions.md:588` — adding an enum value is not a
+compatible change, because a client that switches over the numbers has to be
+recompiled and redeployed to learn a new one exists. cafaye is polyglot, and this
+is the class of defect that bites TypeScript and not Go, or Ruby and not
+Python, which is what a contract system exists to prevent.
+
+Each of the three is really a **count with one legal value**, not an
+enumeration, so each is now a plain `integer` carrying its bound as
+`minimum`/`maximum` and saying so in its description.
+
+- **Nothing on the wire moved.** `{"recovery_codes_remaining": 10}`,
+  `{"digits": 6}` and `{"period_seconds": 30}` are byte-for-byte what this service
+  sent before, and every value inside the new bounds was already the only value
+  the service ever produced. `caf contract breaking --tiers all` calls this
+  `enum-value-no-delete [SOURCE]` and nothing else: no JSON-tier break, no
+  WIRE-tier break.
+
+- **So this is a SOURCE-tier break only, and a Go consumer is what it costs.** A
+  caller that wrote `client.N10` or `client.N6`, or that named
+  `client.StartedEnrollmentDigits` in a signature, stops compiling and wants plain
+  `int`. No client in any other language in the fleet can tell the difference, and
+  the compiled client gets strictly simpler: three named types carrying exported
+  case constants (`N10`, `N6`, `N30`) and `Valid()` methods are gone.
+
+- **`const:` was tried first and is not the answer.** oapi-codegen v2.8.0 mints
+  the same named type, the same exported case constant and the same `Valid()`
+  method for a `const` as for a single-value `enum`, so the document would have
+  stopped tripping the linter while every generated client in the fleet kept the
+  shape the rule exists to prevent. The rule is about what a generator emits, so
+  the fix has to be what the generator emits.
+
+- **The "always N" is not lost — it moved where it can actually fail.** Each value
+  is set from a compile-time constant (`mfa.RecoveryCodeCount`, `mfa.Digits`,
+  `mfa.Period`) and asserted against it in `internal/httpapi`'s MFA tests. A
+  document annotation fails a validator somebody may not run; that fails the
+  build.
+
+- **`RecoveryCodesResponse.recovery_codes_remaining` is now the same shape as
+  `MFAStatus.recovery_codes_remaining`**, which was already a plain integer. Two
+  fields with one name and one meaning had two different types in one document,
+  and the document was the odd one out — the service has always implemented the
+  count shape, in `internal/httpapi/mfa.go`, as a plain `int`.
+
 ### Added (packet identity-32: the image `config/deploy.yml` deploys is now built by a pipeline)
 
 **Nothing in this repository built the image the deploy config names.**

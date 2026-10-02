@@ -303,21 +303,6 @@ func (e ProblemCode) Valid() bool {
 	}
 }
 
-// Defines values for RecoveryCodesResponseRecoveryCodesRemaining.
-const (
-	N10 RecoveryCodesResponseRecoveryCodesRemaining = 10
-)
-
-// Valid indicates whether the value is a known member of the RecoveryCodesResponseRecoveryCodesRemaining enum.
-func (e RecoveryCodesResponseRecoveryCodesRemaining) Valid() bool {
-	switch e {
-	case N10:
-		return true
-	default:
-		return false
-	}
-}
-
 // Defines values for RegisterOIDCClientRequestGrantTypes.
 const (
 	RegisterOIDCClientRequestGrantTypesAuthorizationCode RegisterOIDCClientRequestGrantTypes = "authorization_code"
@@ -411,21 +396,6 @@ func (e StartedEnrollmentAlgorithm) Valid() bool {
 	}
 }
 
-// Defines values for StartedEnrollmentDigits.
-const (
-	N6 StartedEnrollmentDigits = 6
-)
-
-// Valid indicates whether the value is a known member of the StartedEnrollmentDigits enum.
-func (e StartedEnrollmentDigits) Valid() bool {
-	switch e {
-	case N6:
-		return true
-	default:
-		return false
-	}
-}
-
 // Defines values for StartedEnrollmentMethod.
 const (
 	StartedEnrollmentMethodTotp StartedEnrollmentMethod = "totp"
@@ -435,21 +405,6 @@ const (
 func (e StartedEnrollmentMethod) Valid() bool {
 	switch e {
 	case StartedEnrollmentMethodTotp:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for StartedEnrollmentPeriodSeconds.
-const (
-	N30 StartedEnrollmentPeriodSeconds = 30
-)
-
-// Valid indicates whether the value is a known member of the StartedEnrollmentPeriodSeconds enum.
-func (e StartedEnrollmentPeriodSeconds) Valid() bool {
-	switch e {
-	case N30:
 		return true
 	default:
 		return false
@@ -1327,16 +1282,35 @@ type RecoveryCodesResponse struct {
 	// `ConfirmedEnrollment.recovery_codes`, and the same one-shot guarantee.
 	RecoveryCodes []string `json:"recovery_codes"`
 
-	// RecoveryCodesRemaining Always 10. It is the count of the set just issued rather than a read
-	// back from storage, because a client rendering "you now have N codes"
-	// wants N and not a round trip to learn it.
-	RecoveryCodesRemaining RecoveryCodesResponseRecoveryCodesRemaining `json:"recovery_codes_remaining"`
+	// RecoveryCodesRemaining How many codes are in the set just issued. It is a **count, not an
+	// enumeration**: it is always `mfa.RecoveryCodeCount` (10), because the
+	// handler sets it from that constant and the set it counts is the one in
+	// `recovery_codes` above.
+	//
+	// It is deliberately not declared with `enum` and deliberately not with
+	// `const` either, and that is a decision rather than an omission. Both
+	// make every generator in the fleet mint a named type with an exported
+	// case per value and a `Valid()` method — oapi-codegen v2.8.0 does
+	// exactly that for a `const`, which is how this field was found — and a
+	// client that switches over those values has to be recompiled and
+	// redeployed to learn a new one exists. Kubernetes' API conventions call
+	// that out at `api-conventions.md:588`. A plain integer gives a Go `int`,
+	// a TypeScript `number` and a Ruby `Integer` with nothing to switch over,
+	// and a small integer in [0, 10] round-trips exactly in all of them.
+	//
+	// The "always 10" is not lost, it is enforced where it can actually fail:
+	// `mfa.RecoveryCodeCount` is a compile-time constant, and
+	// `TestTheDestructiveRoutesRequireAFactor` in
+	// `internal/httpapi/mfa_routes_test.go` asserts the body against it. A
+	// document annotation fails a validator somebody may not run; that fails
+	// the build.
+	//
+	// It is the count of the set just issued rather than a read back from
+	// storage, because a client rendering "you now have N codes" wants N and
+	// not a round trip to learn it. How many are left afterwards is a
+	// different route — `GET /v1/mfa`.
+	RecoveryCodesRemaining int `json:"recovery_codes_remaining"`
 }
-
-// RecoveryCodesResponseRecoveryCodesRemaining Always 10. It is the count of the set just issued rather than a read
-// back from storage, because a client rendering "you now have N codes"
-// wants N and not a round trip to learn it.
-type RecoveryCodesResponseRecoveryCodesRemaining int
 
 // RecoveryEmailRequest An address to look an account up by, on the three routes that start a
 // flow.
@@ -1540,8 +1514,14 @@ type StartedEnrollment struct {
 	// app implements. A user whose app rejected SHA1 has no app.
 	Algorithm StartedEnrollmentAlgorithm `json:"algorithm"`
 
-	// Digits The code length. Fixed, and 6 because that is what authenticator apps display.
-	Digits StartedEnrollmentDigits `json:"digits"`
+	// Digits The code length. Fixed, and 6 because that is what authenticator apps
+	// display.
+	//
+	// A count rather than an enumeration, so no `enum` and no `const` here:
+	// both mint a named type with an exported case per value and a `Valid()`
+	// method in every generated client in the fleet, and there is nothing for
+	// a caller to switch over. The constant is `mfa.Digits`.
+	Digits int `json:"digits"`
 
 	// EnrollmentID The id to confirm. It is the pending row's own id, and another user's,
 	// an expired one's and an already-confirmed one's are all 404 — so it is
@@ -1556,7 +1536,10 @@ type StartedEnrollment struct {
 
 	// PeriodSeconds The step, 30 seconds. Returned rather than assumed so a client can
 	// render a countdown without hard-coding it.
-	PeriodSeconds StartedEnrollmentPeriodSeconds `json:"period_seconds"`
+	//
+	// A count rather than an enumeration — no `enum`, no `const`, for the
+	// same reason as `digits`. The constant is `mfa.Period`.
+	PeriodSeconds int `json:"period_seconds"`
 
 	// ProvisioningURI An `otpauth://totp/…` URI, which is what a QR code encodes. Contains
 	// `secret`, so it is not shareable and not cacheable.
@@ -1584,15 +1567,8 @@ type StartedEnrollment struct {
 // app implements. A user whose app rejected SHA1 has no app.
 type StartedEnrollmentAlgorithm string
 
-// StartedEnrollmentDigits The code length. Fixed, and 6 because that is what authenticator apps display.
-type StartedEnrollmentDigits int
-
 // StartedEnrollmentMethod defines model for StartedEnrollment.Method.
 type StartedEnrollmentMethod string
-
-// StartedEnrollmentPeriodSeconds The step, 30 seconds. Returned rather than assumed so a client can
-// render a countdown without hard-coding it.
-type StartedEnrollmentPeriodSeconds int
 
 // User The public projection of an account. Exactly two fields, always: there is
 // no password digest, no lockout state and no timestamp here, and adding one
