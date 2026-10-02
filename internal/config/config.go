@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cafaye/identity/internal/oidc"
 	"github.com/cafaye/identity/internal/recovery"
 )
 
@@ -120,6 +121,15 @@ type Config struct {
 	// the hostname would be a security decision made by a string match.
 	OIDCAllowInsecure bool
 
+	// OIDCLoginUIURL is where a browser goes to authenticate. `identity` renders no
+	// HTML, so the sign-in form is a page in another service and this is its
+	// address. It is REQUIRED whenever the three variables above are configured,
+	// and there is no default: see internal/oidc/loginui.go for why a provider that
+	// cannot send a browser anywhere to sign in is a startup failure rather than a
+	// degraded mode, and why a compiled-in default would couple two services that
+	// share no release train.
+	OIDCLoginUIURL string
+
 	// MFAEncryptionKeyValue is the raw key a TOTP secret is sealed under, decoded
 	// from MFA_ENCRYPTION_KEY. Empty means "this deployment has no second factor",
 	// which is a supported state and reduces the surface rather than failing.
@@ -220,6 +230,12 @@ func (c Config) MFAEncryptionKeyConfigured() bool {
 // not. A process with an unset OIDC_ISSUER serves its /v1 surface and its probes
 // and nothing else, and the routes are absent rather than present-and-500 — the
 // same rule WithAuth and WithTenancy already follow for a missing DATABASE_URL.
+//
+// IT DOES NOT CHECK OIDCLoginUIURL, and that is not an oversight: a Config from
+// Load with the three above set and the login UI unset never exists, because
+// loadOIDC refuses it. A Config built as a literal can, and `buildOIDC` hands
+// that one to oidc.NewProvider, which refuses it too — so the check a caller
+// would want is a construction failure rather than a second boolean here.
 func (c Config) OIDCEnabled() bool {
 	return c.OIDCIssuer != "" && c.OIDCSigningKey != "" && c.OIDCKeyID != ""
 }
@@ -721,6 +737,14 @@ const recoveryTokenPlaceholder = "{token}"
 //     provider with an issuer and no key can sign nothing; one with a key and no
 //     issuer has no `iss` to put in a token; one with no key id publishes a
 //     document whose `kid` a verifier cannot match against a token header.
+//   - a login UI with no block to apply it to, and a block with no login UI. The
+//     second is the one this function grew a rule for, and it is the same shape as
+//     the first three: a provider that publishes a working discovery document and
+//     then cannot complete a single authorization flow is a broken provider, and
+//     the only place anybody finds out is a user at a product's sign-in button.
+//     `internal/oidc` owns the rule and this function CALLS it rather than
+//     restating it, so a change to what counts as a usable login UI is a change in
+//     one place.
 //   - an http issuer without OIDC_ALLOW_INSECURE. Every verifier on the platform
 //     compares `iss` for equality and fetches the JWKS over the same scheme, so
 //     an http issuer in production is a token nobody can verify and a key
@@ -733,6 +757,7 @@ func (c *Config) loadOIDC(lookup Lookup) error {
 	issuer := lookupValue(lookup, "OIDC_ISSUER")
 	key := lookupValue(lookup, "OIDC_SIGNING_KEY")
 	keyID := lookupValue(lookup, "OIDC_SIGNING_KEY_ID")
+	loginUI := lookupValue(lookup, oidc.LoginUIEnvVar)
 
 	present := 0
 	for _, value := range []string{issuer, key, keyID} {
@@ -748,9 +773,21 @@ func (c *Config) loadOIDC(lookup Lookup) error {
 			// deployment that has an issuer and does not.
 			return fmt.Errorf("%w: OIDC_ALLOW_INSECURE is set but there is no OIDC_ISSUER to apply it to", ErrInvalidOIDC)
 		}
+		if loginUI != "" {
+			// The same argument, for the same variable-shape: a login UI with nothing
+			// to authenticate is a setting an operator changed and nothing reads.
+			return fmt.Errorf("%w: %s is set but there is no OIDC_ISSUER, OIDC_SIGNING_KEY and "+
+				"OIDC_SIGNING_KEY_ID for it to apply to", ErrInvalidOIDC, oidc.LoginUIEnvVar)
+		}
 		return nil
 	case present != 3:
 		return fmt.Errorf("%w: OIDC_ISSUER, OIDC_SIGNING_KEY and OIDC_SIGNING_KEY_ID must all be set, or none of them", ErrInvalidOIDC)
+	}
+
+	// The boot-time half of the login UI rule, and the refusal an operator reads
+	// names the variable they have to set.
+	if err := oidc.ValidateLoginUIURL(loginUI); err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrInvalidOIDC, oidc.LoginUIEnvVar, err)
 	}
 
 	parsed, err := url.Parse(issuer)
@@ -781,6 +818,7 @@ func (c *Config) loadOIDC(lookup Lookup) error {
 	c.OIDCSigningKey = key
 	c.OIDCKeyID = keyID
 	c.OIDCAllowInsecure = allowInsecure
+	c.OIDCLoginUIURL = loginUI
 	return nil
 }
 

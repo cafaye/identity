@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cafaye/identity/internal/oidc"
 	"github.com/cafaye/identity/internal/platform/dbtest"
@@ -497,9 +498,15 @@ func TestOIDCRevocationStopsIssuedTokens(t *testing.T) {
 	}
 }
 
-// The login form's state is the CSRF defence on the one page where a user types a
-// password into a form this service rendered for a third party. A cross-site
-// POST would complete an authorization request the user never chose.
+// The login form's state is the CSRF defence on the one interaction where a user
+// types a password for a third party. A cross-site POST would complete an
+// authorization request the user never chose.
+//
+// THE REFUSAL IS A REDIRECT AND NOT A 400, and the assertion that used to be
+// "no Location header" is now "no Location header carrying a code" — which is
+// the property that was actually being protected. See the interaction section
+// header in oidc.go for why a state mismatch re-shows the step with a fresh state
+// instead of answering a problem document.
 func TestOIDCLoginStateMustMatch(t *testing.T) {
 	t.Parallel()
 
@@ -529,13 +536,12 @@ func TestOIDCLoginStateMustMatch(t *testing.T) {
 
 			f.signOut()
 			form := f.do(t, http.MethodGet, loginURL, "", nil)
-			if form.Code != http.StatusOK {
-				t.Fatalf("GET the login page = %d, want 200; body: %s", form.Code, form.Body)
-			}
-			sealed := hiddenState(t, form.Body.String())
-			if sealed == "" {
-				t.Fatal("the form carried no state")
-			}
+			mustRedirectToLoginUI(t, form)
+			// Read for its side effect: interactionState fails the test when the
+			// redirect carries no state, which is the precondition for every case
+			// here — a case whose form was never sealed would pass for the wrong
+			// reason.
+			interactionState(t, form)
 
 			presented := tt.presented
 			if presented == "" && !tt.dropCookie {
@@ -544,15 +550,13 @@ func TestOIDCLoginStateMustMatch(t *testing.T) {
 
 			jar := &cookieJar{}
 			if !tt.dropCookie {
-				for _, c := range form.Result().Cookies() {
-					jar.absorb([]*http.Cookie{c})
-				}
+				jar.absorb(form.Result().Cookies())
 			}
 
 			post := url.Values{
 				"state":    []string{presented},
 				"email":    []string{client.Email},
-				"password": []string{client.Password},
+				"password": []string{passwordFor(client)},
 			}
 			req := newRequestForm(http.MethodPost, loginURL, post)
 			if cookie := jar.header(); cookie != "" {
@@ -560,22 +564,46 @@ func TestOIDCLoginStateMustMatch(t *testing.T) {
 			}
 
 			rec := newResponse(serveRecorder(f.handler, req))
-			if rec.Code != http.StatusBadRequest {
-				t.Fatalf("POST the login form = %d, want 400; body: %s", rec.Code, rec.Body)
+			mustRedirectToLoginUI(t, rec)
+			if code := mustCodeIfPresent(rec.Header().Get("Location")); code != "" {
+				t.Fatalf("a state that does not verify still completed the flow, carrying "+
+					"an authorization code: %s", rec.Header().Get("Location"))
 			}
-			if rec.Header().Get("Content-Type") != "application/problem+json" {
-				t.Errorf("Content-Type = %q, want application/problem+json", rec.Header().Get("Content-Type"))
+			if got := rec.Header().Get("Location"); strings.Contains(got, oidcTestRedirect) {
+				t.Errorf("the refusal pointed at the client (%q); a completed request is "+
+					"exactly what the attack wanted", got)
 			}
-			if location := rec.Header().Get("Location"); location != "" {
-				t.Errorf("the refusal redirected to %q; a completed request is exactly what the attack wanted", location)
+			// The refusal says so, in the shape the login UI reads.
+			query := interactionParams(t, rec)
+			if got := query.Get(oidc.LoginParamError); got != oidc.LoginErrorInteractionExpired {
+				t.Errorf("%s = %q, want %q", oidc.LoginParamError, got, oidc.LoginErrorInteractionExpired)
+			}
+			if query.Get(oidc.LoginParamErrorDetail) == "" {
+				t.Error("the refusal carried no sentence; a login UI that cannot say why " +
+					"shows the user a form that will fail the same way")
+			}
+			// And a FRESH state, which is the reason it is a redirect: the value the
+			// attacker chose is not a value the login UI can render, so a new one has
+			// to be minted for the form it is about to be sent back to.
+			if fresh := query.Get(oidc.LoginParamState); fresh == "" || fresh == presented {
+				t.Errorf("%s = %q, want a freshly minted one", oidc.LoginParamState, fresh)
 			}
 		})
 	}
 }
 
+// passwordFor is the password a registered client was registered with, which is
+// every password the login interaction tests need and none of the tests above
+// should be able to get wrong by accident.
+func passwordFor(registered) string { return oidcTestPassword }
+
 // The state this service verifies is internal/oauth's, reused rather than
 // reimplemented. The test is that the value in the cookie is one that
 // oauth.VerifyState accepts, which is the whole contract between the two.
+//
+// IT IS THE SAME ASSERTION IT WAS, on a value that now travels in a query
+// string instead of a hidden field. That the value is the one internal/oauth
+// mints is the property; where it is written down on the wire is not.
 func TestOIDCLoginStateIsOauthPackageState(t *testing.T) {
 	t.Parallel()
 
@@ -587,7 +615,32 @@ func TestOIDCLoginStateIsOauthPackageState(t *testing.T) {
 
 	f.signOut()
 	form := f.do(t, http.MethodGet, loginURL, "", nil)
-	sealed := hiddenState(t, form.Body.String())
+	mustRedirectToLoginUI(t, form)
+	sealed := interactionState(t, form)
+
+	// And the sealed copy really is in the cookie the login UI's origin cannot
+	// write, which is what makes the value a binding rather than a hint.
+	cookies := form.Result().Cookies()
+	var found *http.Cookie
+	for _, c := range cookies {
+		if c.Name == OIDCStateCookiePrefix+interactionParams(t, form).Get(oidc.LoginParamRequestID) {
+			found = c
+		}
+	}
+	if found == nil {
+		t.Fatalf("the redirect set no %s* cookie; cookies: %v", OIDCStateCookiePrefix, cookieNames(cookies))
+	}
+	if found.Value != sealed {
+		t.Errorf("the cookie holds %q and the redirect carried %q; they must be the same value",
+			found.Value, sealed)
+	}
+	if !found.HttpOnly {
+		t.Error("the state cookie is not HttpOnly, so a script on the login UI's origin could read it")
+	}
+	if found.SameSite != http.SameSiteNoneMode {
+		t.Errorf("the state cookie is SameSite=%v; the login form is a cross-site POST and a "+
+			"Lax cookie is not sent on one, so every sign-in would be refused", found.SameSite)
+	}
 
 	if !strings.HasPrefix(sealed, OIDCStateProvider+oauthStateSeparator) {
 		t.Errorf("the state %q is not one oauth.NewState(%q) could have minted", sealed, OIDCStateProvider)
@@ -597,6 +650,315 @@ func TestOIDCLoginStateIsOauthPackageState(t *testing.T) {
 	}
 	if oauthVerifyState(OIDCStateProvider, sealed, sealed+"x") {
 		t.Error("a state one character longer verifies; the comparison is not exact")
+	}
+}
+
+// cookieNames is the names on a Set-Cookie batch, for a failure message.
+func cookieNames(cookies []*http.Cookie) []string {
+	names := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		names = append(names, c.Name)
+	}
+	sortStrings(names)
+	return names
+}
+
+// An interaction error code that means the same thing as one of this package's
+// problem codes is THE SAME STRING, and this is the comparison `loginui_test.go`
+// cannot make: it does not import this package, and this one does.
+//
+// The overlap is `account_locked`, and it is not a coincidence worth having twice
+// in two vocabularies. A login UI that already switches on `account_locked` for a
+// `423` on `POST /v1/session` must not have to learn a second spelling of it to
+// render the same lockout three characters later in the same flow.
+//
+// WALKED IN BOTH DIRECTIONS, because a check that only asserts the one pair that
+// happens to match today would be a check that a second, wrong pair could not
+// join.
+func TestAnInteractionCodeThatHasAProblemCodeTwinIsTheSameString(t *testing.T) {
+	t.Parallel()
+
+	if oidc.LoginErrorAccountLocked != CodeAccountLocked {
+		t.Errorf("the lockout is %q on the interaction and %q in the problem envelope; "+
+			"one lockout has one name", oidc.LoginErrorAccountLocked, CodeAccountLocked)
+	}
+
+	// The other direction: every interaction code is checked by hand against the
+	// problem codes, and the ones with no twin must SAY so, because "this is a new
+	// word" is a decision somebody made and a reader cannot infer it.
+	problemCodes := map[string]bool{
+		CodeUnauthorized:     true,
+		CodeForbidden:        true,
+		CodeValidationFailed: true,
+		CodeConflict:         true,
+		CodeNotFound:         true,
+		CodeInvalidRequest:   true,
+		CodeAccountLocked:    true,
+		CodeGone:             true,
+	}
+	for _, code := range []string{
+		oidc.LoginErrorInteractionExpired,
+		oidc.LoginErrorMissingCredentials,
+		oidc.LoginErrorInvalidCredentials,
+		oidc.LoginErrorChallengeRejected,
+		oidc.LoginErrorAccountLocked,
+	} {
+		if code == "" {
+			t.Error("an interaction code in this list is empty")
+		}
+	}
+	// …and the three new ones really are new: none of them collides with a problem
+	// code that means something ELSE, because a collision that means something else
+	// is worse than a new word — a UI would render the wrong message.
+	for _, code := range []string{
+		oidc.LoginErrorInteractionExpired,
+		oidc.LoginErrorMissingCredentials,
+		oidc.LoginErrorInvalidCredentials,
+		oidc.LoginErrorChallengeRejected,
+	} {
+		if problemCodes[code] {
+			t.Errorf("the interaction code %q collides with a problem code of the same "+
+				"spelling that means something else; a login UI switching on it would "+
+				"render the wrong sentence", code)
+		}
+	}
+}
+
+// THE REDIRECT, ASSERTED AS A THING WITH NO BODY.
+//
+// The owner's rule is that identity renders no HTML, and a claim that is only in
+// a commit message is a claim nobody checks. So this asserts the whole shape of
+// the response a browser is sent: the status, the destination, an empty body, no
+// content type, and the two headers that earned their place.
+//
+// IT IS WORTH BEING EXPLICIT ABOUT WHAT WOULD MAKE IT RED. Restoring the login
+// page fails the "no body" and the "no content type" halves. Calling
+// http.Redirect instead of oidcRedirect fails them too, because net/http writes
+// the anchor body — which is the failure this repository is most likely to make
+// by accident, from a well-meaning "just use the standard helper".
+func TestTheLoginRedirectCarriesNoBodyAndTheTwoHeadersThatEarnedTheirPlace(t *testing.T) {
+	t.Parallel()
+
+	f := newOIDCFixture(t)
+	client := f.registerClient(t)
+
+	_, challenge := codeVerifier(t)
+	loginURL := f.authorize(t, client, challenge, "state-redirect-shape", "nonce-redirect-shape", nil)
+
+	f.signOut()
+	rec := f.do(t, http.MethodGet, loginURL, "", nil)
+	redirect := mustRedirectToLoginUI(t, rec)
+
+	// The authorization request id is the one thing the login UI cannot lose, and
+	// it must be the id of THIS request and not a value the browser could have
+	// chosen.
+	query := redirect.Query()
+	if got := query.Get(oidc.LoginParamRequestID); got == "" {
+		t.Fatalf("the redirect carried no %s: %s", oidc.LoginParamRequestID, redirect)
+	}
+	if got := mustParseID(t, query.Get(oidc.LoginParamRequestID)).String(); got != requestIDOf(t, loginURL) {
+		t.Errorf("%s = %q, want the id in the URL the browser was redirected to (%q)",
+			oidc.LoginParamRequestID, got, requestIDOf(t, loginURL))
+	}
+	if got := query.Get(oidc.LoginParamClientName); got != "Anytalk" {
+		t.Errorf("%s = %q, want the product asking", oidc.LoginParamClientName, got)
+	}
+	if got := query.Get(oidc.LoginParamStep); got != oidc.LoginStepPassword {
+		t.Errorf("%s = %q, want %q", oidc.LoginParamStep, got, oidc.LoginStepPassword)
+	}
+	if query.Get(oidc.LoginParamError) != "" {
+		t.Errorf("a fresh step carried an %s (%q); an absent error and an empty one must "+
+			"not both read as success", oidc.LoginParamError, query.Get(oidc.LoginParamError))
+	}
+
+	// NO HTML. A body, and a content type that names a document, are the two ways
+	// this claim fails and both are asserted.
+	if body := rec.Body.String(); body != "" {
+		t.Errorf("the redirect carried a %d-byte body; identity renders nothing:\n%s", len(body), body)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "" {
+		t.Errorf("Content-Type = %q, want none: a response with no body has nothing to declare", got)
+	}
+
+	for header, want := range map[string]string{
+		"Referrer-Policy": "no-referrer",
+		"Cache-Control":   "no-store",
+	} {
+		if got := rec.Header().Get(header); got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+	// …and the two that protected a page, asserted as ABSENT. A header nobody can
+	// explain is worse than a missing one, so their absence is a claim too.
+	for _, header := range []string{"X-Frame-Options", "X-Content-Type-Options"} {
+		if got := rec.Header().Get(header); got != "" {
+			t.Errorf("%s = %q; it protected a document, and there is no document", header, got)
+		}
+	}
+}
+
+// The library's own redirect to this service's login endpoint must not carry
+// net/http's fallback anchor body either, and this is the one that is easiest to
+// miss: it is written by code in another module, on a path this service mounts.
+//
+// `http.Redirect` writes `<a href="…">Found</a>.` with `Content-Type:
+// text/html; charset=utf-8` unless the caller has already set a content type. A
+// reviewer running `curl -i` on /oidc/authorize and reading that header has been
+// told the packet did not land, and the fix has to live in this service because
+// the library is not going to be changed for it.
+func TestTheAuthorizeRedirectCarriesNoBody(t *testing.T) {
+	t.Parallel()
+
+	f := newOIDCFixture(t)
+	client := f.registerClient(t)
+
+	_, challenge := codeVerifier(t)
+	rec := f.do(t, http.MethodGet, oidc.PathAuthorize+"?"+url.Values{
+		"client_id":             []string{client.ClientID},
+		"redirect_uri":          []string{oidcTestRedirect},
+		"response_type":         []string{"code"},
+		"scope":                 []string{"openid email"},
+		"state":                 []string{"state-no-body"},
+		"nonce":                 []string{"nonce-no-body"},
+		"code_challenge":        []string{challenge},
+		"code_challenge_method": []string{"S256"},
+	}.Encode(), "", nil)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("GET /oidc/authorize = %d, want 302; body: %s", rec.Code, rec.Body)
+	}
+	if !strings.HasPrefix(rec.Header().Get("Location"), oidc.PathLogin+"/") {
+		t.Errorf("the browser was sent to %q, want the login endpoint", rec.Header().Get("Location"))
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Errorf("the redirect carried a %d-byte body; net/http's redirect fallback is "+
+			"HTML and identity serves none:\n%s", len(body), body)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "" {
+		t.Errorf("Content-Type = %q, want none", got)
+	}
+}
+
+// requestIDOf reads the authorization request id out of the login URL the library
+// redirected the browser to, which is the one place in a test that the id is
+// known to be this service's own rather than anything a caller supplied.
+func requestIDOf(t *testing.T, loginURL string) string {
+	t.Helper()
+
+	trimmed := strings.TrimPrefix(loginURL, oidc.PathLogin+"/")
+	trimmed, _, _ = strings.Cut(trimmed, "?")
+	if trimmed == "" {
+		t.Fatalf("the login URL %q carries no request id", loginURL)
+	}
+	return trimmed
+}
+
+// octxTime is a fixed instant, so a cookie written by a constructor rather than by
+// a response is comparable and the assertion is about the POLICY and not about the
+// clock.
+func octxTime() time.Time { return time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC) }
+
+// The state and the challenge cookie are `SameSite=None` and the flow and session
+// cookies are not. See `oidcInteractionSameSite` for the argument; this is the
+// check that the argument keeps holding.
+//
+// FOUR COOKIES, AND THE POINT IS THE TWO THAT DID NOT MOVE. Widening the flow
+// cookie would let it ride a cross-site POST for no reason, and would put the
+// cookie the login-CSRF defence rests on into a position the defence was not argued
+// for. Widening the session cookie would attach a credential to every cross-site
+// request to this origin. Both are the change somebody makes by "the interaction
+// cookies are None, let us be consistent", and consistency is the wrong word here.
+//
+// **THE POLICY IS ASSERTED RATHER THAN INFERRED BECAUSE NO TEST CAN REPRODUCE THE
+// FAILURE.** A test's cookie jar is a map of strings and does not implement
+// SameSite at all: every flow in this file completes with the interaction cookies
+// set to `Lax`, and a suite that only drove flows would be green on a login form
+// no browser can submit. The red proof is that `Lax` makes these two assertions
+// fail and leaves every other test in the package green. That is the whole reason
+// this test exists and it is why it is four assertions rather than none.
+func TestTheInteractionCookiesAreNoneAndTheFlowAndSessionCookiesAreNot(t *testing.T) {
+	t.Parallel()
+
+	f := newOIDCFixture(t)
+	client := f.registerClient(t)
+
+	_, challenge := codeVerifier(t)
+	loginURL := f.authorize(t, client, challenge, "state-cookies", "nonce-cookies", nil)
+
+	// The flow cookie is written by the redirect off /oidc/authorize, which
+	// f.authorize already drove; re-drive it so the recorder under test is ours.
+	authorize := f.do(t, http.MethodGet, oidc.PathAuthorize+"?"+url.Values{
+		"client_id":             []string{client.ClientID},
+		"redirect_uri":          []string{oidcTestRedirect},
+		"response_type":         []string{"code"},
+		"scope":                 []string{"openid email"},
+		"state":                 []string{"state-cookies"},
+		"nonce":                 []string{"nonce-cookies"},
+		"code_challenge":        []string{challenge},
+		"code_challenge_method": []string{"S256"},
+	}.Encode(), "", nil)
+	if authorize.Code != http.StatusFound {
+		t.Fatalf("GET /oidc/authorize = %d, want 302; body: %s", authorize.Code, authorize.Body)
+	}
+
+	flow := cookieNamed(authorize.ResponseRecorder, OIDCFlowCookieName)
+	if flow == nil {
+		t.Fatalf("/oidc/authorize set no %s; cookies: %v", OIDCFlowCookieName,
+			cookieNames(authorize.Result().Cookies()))
+	}
+	if flow.SameSite != http.SameSiteLaxMode {
+		t.Errorf("the flow cookie is SameSite=%v, want Lax. It is only ever read on a "+
+			"TOP-LEVEL GET, which is the one case Lax still permits, and it is the "+
+			"cookie D5's login-CSRF defence rests on.", flow.SameSite)
+	}
+	if !flow.Secure || !flow.HttpOnly {
+		t.Errorf("the flow cookie is Secure=%t HttpOnly=%t, want both true", flow.Secure, flow.HttpOnly)
+	}
+
+	// The session cookie, read off a REAL login rather than off a copy the fixture
+	// kept: the writer is where the policy lives, and a parsed value three
+	// refactors ago is not the thing being asserted about.
+	login := f.do(t, http.MethodPost, "/v1/session",
+		`{"email":"`+f.email+`","password":"`+oidcTestPassword+`"}`, nil)
+	if login.Code != http.StatusOK {
+		t.Fatalf("POST /v1/session = %d, want 200; body: %s", login.Code, login.Body)
+	}
+	session := cookieNamed(login.ResponseRecorder, SessionCookieName)
+	if session == nil || session.Value == "" {
+		t.Fatalf("the sign-in set no %s; cookies: %v", SessionCookieName,
+			cookieNames(login.Result().Cookies()))
+	}
+	if session.SameSite != http.SameSiteLaxMode {
+		t.Errorf("the session cookie is SameSite=%v, want Lax. It is only ever SET on a "+
+			"top-level response and read on a top-level GET, so it does not need to "+
+			"survive a cross-site POST.", session.SameSite)
+	}
+
+	// The two that DO need to survive one.
+	f.signOut()
+	form := f.do(t, http.MethodGet, loginURL, "", nil)
+	mustRedirectToLoginUI(t, form)
+	requestID := interactionParams(t, form).Get(oidc.LoginParamRequestID)
+
+	state := cookieNamed(form.ResponseRecorder, OIDCStateCookiePrefix+requestID)
+	if state == nil {
+		t.Fatalf("the redirect set no state cookie; cookies: %v", cookieNames(form.Result().Cookies()))
+	}
+	if state.SameSite != http.SameSiteNoneMode {
+		t.Errorf("the state cookie is SameSite=%v, want None. The login form is a "+
+			"cross-site POST and a Lax cookie is not sent on one, so every sign-in "+
+			"would be refused at the CSRF check.", state.SameSite)
+	}
+	if !state.Secure {
+		t.Error("the state cookie is not Secure, and the __Host- prefix requires it")
+	}
+	if !state.HttpOnly {
+		t.Error("the state cookie is not HttpOnly, so a script on the login UI's origin " +
+			"could read the CSRF token")
+	}
+	if got := oidcChallengeCookie(requestID, "a-token", octxTime()); got.SameSite != http.SameSiteNoneMode {
+		t.Errorf("the challenge cookie is SameSite=%v, want None; the code form is a "+
+			"cross-site POST too", got.SameSite)
 	}
 }
 
@@ -1000,7 +1362,8 @@ func TestOIDCLoginWithNoCredentials(t *testing.T) {
 
 	f.signOut()
 	form := f.do(t, http.MethodGet, loginURL, "", nil)
-	sealed := hiddenState(t, form.Body.String())
+	mustRedirectToLoginUI(t, form)
+	sealed := interactionState(t, form)
 
 	jar := &cookieJar{}
 	jar.absorb(form.Result().Cookies())
@@ -1013,22 +1376,34 @@ func TestOIDCLoginWithNoCredentials(t *testing.T) {
 	req.Header.Set("Cookie", jar.header())
 
 	rec := newResponse(serveRecorder(f.handler, req))
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("an empty login = %d, want 422; body: %s", rec.Code, rec.Body)
+	// A refusal the login UI can render, not a 422 the user sees as a raw JSON
+	// document on an origin nobody styled. The 422 was never the point: it was the
+	// answer to a form submission, and the form now lives somewhere that reads
+	// `error` rather than `errors[]`.
+	mustRedirectToLoginUI(t, rec)
+	query := interactionParams(t, rec)
+	if got := query.Get(oidc.LoginParamError); got != oidc.LoginErrorMissingCredentials {
+		t.Errorf("%s = %q, want %q", oidc.LoginParamError, got, oidc.LoginErrorMissingCredentials)
 	}
-	p := decodeProblem(t, rec.ResponseRecorder)
-	if p.Code != CodeValidationFailed {
-		t.Errorf("code = %q, want %q", p.Code, CodeValidationFailed)
-	}
-	if len(p.Errors) != 2 {
-		t.Errorf("errors = %+v, want one per field", p.Errors)
+	// AND the property the 422 was actually protecting: an empty password is not
+	// verified. A refusal that hashed "" would cost a memory-hard hash to learn
+	// that a form was submitted blank, and would be observable as a slow response.
+	if cookie := cookieNamed(rec.ResponseRecorder, SessionCookieName); cookie != nil && cookie.Value != "" {
+		t.Error("an empty form produced a session")
 	}
 }
 
-// A wrong password on the login page is the same answer as an unknown address,
-// and one sentence. The login page is the most attractive enumeration oracle on
-// the platform: it is unauthenticated, it takes an email, and it is the first
-// thing an attacker types somebody else's address into.
+// A wrong password on the login interaction is the same answer as an unknown
+// address, and one sentence. The sign-in form is the most attractive enumeration
+// oracle on the platform: it is unauthenticated, it takes an email, and it is the
+// first thing an attacker types somebody else's address into.
+//
+// THE TRANSPORT CHANGED AND THE PROPERTY DID NOT. This used to compare two 401
+// problem documents' `detail`; it now compares two redirects' `error` and
+// `error_detail`, plus the STATUS, because a status that differed between the two
+// would be an oracle in the response line where neither body nor Location is
+// looked at. The status is compared because the old test compared it too, and a
+// status is a difference a caller can see without reading anything.
 func TestOIDCLoginDoesNotEnumerateAccounts(t *testing.T) {
 	t.Parallel()
 
@@ -1038,37 +1413,66 @@ func TestOIDCLoginDoesNotEnumerateAccounts(t *testing.T) {
 	_, challenge := codeVerifier(t)
 	loginURL := f.authorize(t, client, challenge, "state-enum", "nonce-enum", nil)
 
-	submit := func(email, password string) Problem {
+	type answer struct {
+		status int
+		code   string
+		detail string
+		step   string
+	}
+	submit := func(email, password string) answer {
 		t.Helper()
 
 		f.signOut()
 		form := f.do(t, http.MethodGet, loginURL, "", nil)
-		sealed := hiddenState(t, form.Body.String())
+		mustRedirectToLoginUI(t, form)
 		jar := &cookieJar{}
 		jar.absorb(form.Result().Cookies())
 
 		req := newRequestForm(http.MethodPost, loginURL, url.Values{
-			"state":    []string{sealed},
+			"state":    []string{interactionState(t, form)},
 			"email":    []string{email},
 			"password": []string{password},
 		})
 		req.Header.Set("Cookie", jar.header())
-		return decodeProblem(t, serveRecorder(f.handler, req))
+		rec := newResponse(serveRecorder(f.handler, req))
+		mustRedirectToLoginUI(t, rec)
+		query := rec.Header().Get("Location")
+		parsed, err := url.Parse(query)
+		if err != nil {
+			t.Fatalf("the redirect is not a URL: %v", err)
+		}
+		return answer{
+			status: rec.Code,
+			code:   parsed.Query().Get(oidc.LoginParamError),
+			detail: parsed.Query().Get(oidc.LoginParamErrorDetail),
+			step:   parsed.Query().Get(oidc.LoginParamStep),
+		}
 	}
 
 	wrongPassword := submit(f.email, "not the password at all")
 	noSuchUser := submit("nobody-at-all@example.com", "not the password at all")
 
-	if wrongPassword.Status != noSuchUser.Status {
+	if wrongPassword.status != noSuchUser.status {
 		t.Errorf("a wrong password answered %d and an unknown address %d; the two must be one",
-			wrongPassword.Status, noSuchUser.Status)
+			wrongPassword.status, noSuchUser.status)
 	}
-	if wrongPassword.Detail != noSuchUser.Detail {
-		t.Errorf("the two answers differ:\n  wrong password: %q\n  unknown address: %q",
-			wrongPassword.Detail, noSuchUser.Detail)
+	if wrongPassword.code != noSuchUser.code {
+		t.Errorf("the two answers name different failures: wrong password %q, unknown address %q",
+			wrongPassword.code, noSuchUser.code)
 	}
-	if wrongPassword.Status != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", wrongPassword.Status)
+	if wrongPassword.detail != noSuchUser.detail {
+		t.Errorf("the two sentences differ:\n  wrong password: %q\n  unknown address: %q",
+			wrongPassword.detail, noSuchUser.detail)
+	}
+	if wrongPassword.step != noSuchUser.step {
+		t.Errorf("the two answers land on different steps: %q and %q",
+			wrongPassword.step, noSuchUser.step)
+	}
+	if wrongPassword.code != oidc.LoginErrorInvalidCredentials {
+		t.Errorf("the refusal code is %q, want %q", wrongPassword.code, oidc.LoginErrorInvalidCredentials)
+	}
+	if wrongPassword.status != http.StatusFound {
+		t.Errorf("status = %d, want 302 back to the login UI", wrongPassword.status)
 	}
 }
 
@@ -1135,40 +1539,97 @@ func TestOIDCUnknownPathIsTheCafayeProblemEnvelope(t *testing.T) {
 	}
 }
 
-// The login page must not leak the session or be framed. A login form for a
-// third party, on this service's own domain, is a target worth hardening and the
-// three headers cost nothing.
-func TestOIDCLoginPageHeaders(t *testing.T) {
+// The login interaction must not leak the session, and the refusal must carry
+// its reason to the page rather than dropping it.
+//
+// This is the case the brief names, so it is worth being precise about what the
+// old test covered and what this one does. The old one asserted four headers on a
+// rendered page; three of them are gone with the page, and the fourth — plus the
+// refusal's own shape — is what is left to assert. The headers it really needed to
+// protect are asserted on the redirect in
+// TestTheLoginRedirectCarriesNoBodyAndTheTwoHeadersThatEarnedTheirPlace.
+func TestTheLoginRefusalCarriesItsReasonToTheLoginUI(t *testing.T) {
 	t.Parallel()
 
-	f := newOIDCFixture(t)
-	client := f.registerClient(t)
-
-	_, challenge := codeVerifier(t)
-	loginURL := f.authorize(t, client, challenge, "state-headers", "nonce-headers", nil)
-
-	// Signed out, so the form renders.
-	f.signOut()
-	req := newRequestNoCookie(http.MethodGet, loginURL)
-	rec := serveRecorder(f.handler, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET the login page = %d, want 200", rec.Code)
+	tests := []struct {
+		name string
+		// form is what the login UI posts back on a second attempt.
+		form url.Values
+		// wantCode is the interaction code the login UI must be able to switch on.
+		wantCode string
+		// wantStep is the step the browser must land back on, because a refusal that
+		// sends a code stepper back to the password box is a lost sign-in.
+		wantStep string
+	}{
+		{
+			name:     "a wrong password",
+			form:     url.Values{"email": {f0Email}, "password": {"not the password at all"}},
+			wantCode: oidc.LoginErrorInvalidCredentials,
+			wantStep: oidc.LoginStepPassword,
+		},
+		{
+			name:     "an address nobody has",
+			form:     url.Values{"email": {f0Email}, "password": {oidcTestPassword}},
+			wantCode: oidc.LoginErrorInvalidCredentials,
+			wantStep: oidc.LoginStepPassword,
+		},
 	}
 
-	for header, want := range map[string]string{
-		"X-Frame-Options":        "DENY",
-		"X-Content-Type-Options": "nosniff",
-		"Referrer-Policy":        "no-referrer",
-		"Cache-Control":          "no-store",
-	} {
-		if got := rec.Header().Get(header); got != want {
-			t.Errorf("%s = %q, want %q", header, got, want)
-		}
-	}
-	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
-		t.Errorf("Content-Type = %q, want text/html", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newOIDCFixture(t)
+			client := f.registerClient(t)
+
+			_, challenge := codeVerifier(t)
+			loginURL := f.authorize(t, client, challenge, "state-refusal", "nonce-refusal", nil)
+
+			f.signOut()
+			form := f.do(t, http.MethodGet, loginURL, "", nil)
+			mustRedirectToLoginUI(t, form)
+
+			post := url.Values{"state": {interactionState(t, form)}}
+			for key, values := range tt.form {
+				post[key] = values
+			}
+			rec := f.do(t, http.MethodPost, loginURL, "", post)
+
+			redirect := mustRedirectToLoginUI(t, rec)
+			query := redirect.Query()
+
+			if got := query.Get(oidc.LoginParamError); got != tt.wantCode {
+				t.Errorf("%s = %q, want %q; a refusal the UI cannot switch on is a refusal "+
+					"the user sees as nothing happening", oidc.LoginParamError, got, tt.wantCode)
+			}
+			if got := query.Get(oidc.LoginParamStep); got != tt.wantStep {
+				t.Errorf("%s = %q, want %q", oidc.LoginParamStep, got, tt.wantStep)
+			}
+			if detail := query.Get(oidc.LoginParamErrorDetail); detail == "" {
+				t.Error("the refusal carried no sentence to show a person")
+			}
+			// A fresh state, because the one that was posted has been spent, and a
+			// form rendered with a spent state is a form that cannot be submitted
+			// again.
+			if got, sealed := query.Get(oidc.LoginParamState), post.Get("state"); got == "" || got == sealed {
+				t.Errorf("%s = %q, want a fresh one (%q was just spent)", oidc.LoginParamState, got, sealed)
+			}
+			// And the two things a refusal must NEVER carry.
+			if got := mustCodeIfPresent(rec.Header().Get("Location")); got != "" {
+				t.Errorf("the refusal minted an authorization code: %s", got)
+			}
+			if cookie := cookieNamed(rec.ResponseRecorder, SessionCookieName); cookie != nil && cookie.Value != "" {
+				t.Error("the refusal set a session cookie")
+			}
+		})
 	}
 }
+
+// f0Email is a syntactically valid address that belongs to nobody in any
+// database, for a table built before the fixture exists. It cannot be a
+// registered account, so the "a wrong password" case is testing the password and
+// not the address.
+const f0Email = "nobody-at-all@example.com"
 
 // A registration is announced in the same transaction as the row, and a
 // revocation in the same transaction as the bulk token revocation. An outbox row

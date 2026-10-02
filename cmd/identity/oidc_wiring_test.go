@@ -7,7 +7,9 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/cafaye/identity/internal/config"
@@ -50,6 +52,7 @@ func oidcConfig(t *testing.T, dsn string) config.Config {
 		OIDCIssuer:     "https://identity.test",
 		OIDCSigningKey: testKeyPEM(t),
 		OIDCKeyID:      "cafaye-wiring-test",
+		OIDCLoginUIURL: "https://login.example.com/sign-in/oidc",
 	}
 }
 
@@ -173,5 +176,55 @@ func TestNewAppRefusesAnUnparseableSigningKey(t *testing.T) {
 
 	if _, err := newApp(context.Background(), cfg, discardLogger()); err == nil {
 		t.Fatal("newApp accepted an unparseable signing key")
+	}
+}
+
+// A provider with no login UI is a STARTUP FAILURE, and this case is here rather
+// than only in `internal/config`'s table because of WHERE the check has to be.
+//
+// `config.Load` refuses an OIDC block with no login UI, but this suite builds a
+// `config.Config` LITERAL, exactly as a one-off tool would — and a Config written
+// as a literal never went near Load. So the second half of the rule has to live
+// where the provider is constructed, or a Config built any other way boots into a
+// provider that publishes a discovery document and cannot complete a flow.
+func TestNewAppRefusesToBeAProviderWithNoLoginUI(t *testing.T) {
+	dsn := testDatabaseURL(t)
+
+	cfg := oidcConfig(t, dsn)
+	cfg.OIDCLoginUIURL = ""
+
+	_, err := newApp(context.Background(), cfg, discardLogger())
+	if err == nil {
+		t.Fatal("newApp built a provider that cannot send a browser anywhere to sign in")
+	}
+	if !errors.Is(err, oidc.ErrNoLoginUI) {
+		t.Errorf("newApp = %v, want an error matching oidc.ErrNoLoginUI", err)
+	}
+	if !strings.Contains(err.Error(), oidc.LoginUIEnvVar) {
+		t.Errorf("the refusal does not name %s: %v", oidc.LoginUIEnvVar, err)
+	}
+}
+
+// With a database, a key and a login UI, the login interaction is mounted and it
+// redirects rather than rendering. This is the wiring case for the packet: it
+// proves `OIDCLoginUIURL` reaches the provider, which nothing above it in the
+// tree can see.
+func TestNewAppSendsTheBrowserToTheConfiguredLoginUI(t *testing.T) {
+	dsn := testDatabaseURL(t)
+
+	a, err := newApp(context.Background(), oidcConfig(t, dsn), discardLogger())
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	defer a.Close()
+
+	// The interaction's first hop is this service's own endpoint, and an id that
+	// does not exist is a 404 — which is enough to prove the route is mounted and
+	// that the storage is the real one. The redirect to the login UI needs a live
+	// authorization request, and internal/httpapi's suite drives that with a real
+	// flow; a wiring test that seeded one would be a second copy of that suite.
+	rec := serveBody(t, a, http.MethodGet, oidc.PathLogin+"/00000000-0000-4000-8000-000000000000", "", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET the login interaction = %d, want 404; body: %s", rec.Code, rec.Body)
 	}
 }

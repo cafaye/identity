@@ -800,6 +800,7 @@ func buildOIDC(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*oid
 		Issuer:        cfg.OIDCIssuer,
 		SigningKey:    key,
 		AllowInsecure: cfg.OIDCAllowInsecure,
+		LoginUIURL:    cfg.OIDCLoginUIURL,
 	}, storage)
 	if err != nil {
 		return nil, nil, fmt.Errorf("building the OIDC provider: %w", err)
@@ -817,10 +818,18 @@ func buildOIDC(cfg config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*oid
 		db.Direct{Pool: pool},
 	)
 
+	// THE LOGIN UI IS IN THIS LINE AND NOT OPTIONAL, because it is the one setting
+	// an operator has to change when this packet lands and the one nothing else in
+	// the process can see is wrong. A browser that is redirected to an address with
+	// no sign-in form on it gets an error page from another service; a browser that
+	// is redirected to a form for the wrong deployment authenticates into the wrong
+	// one. Neither is visible in a health check, and both are the kind of thing
+	// that is found by a user.
 	logger.Info("the OIDC provider is mounted",
 		"issuer", provider.Issuer(),
 		"key_id", key.ID(),
 		"authorize", oidc.PathAuthorize,
+		"login_ui", cfg.OIDCLoginUIURL,
 	)
 
 	return provider, clients, nil

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -21,8 +22,8 @@ import (
 // and "may the owner of another account add one to this one" — and a double
 // would agree with whatever the handler did, which is the bug the matrix exists
 // to find. What a double IS good for is the parts the matrix never drives: the
-// login page, the discovery document and the key set, which exist only so the
-// router can be walked.
+// login interaction, the discovery document and the key set, which exist only so
+// the router can be walked.
 
 // matrixOIDCClients builds the real registration use case over a pool, with the
 // real storage adapter behind it.
@@ -93,12 +94,21 @@ type fakeOIDC struct {
 	bannerErr   error
 	completeErr error
 	jwksErr     error
-	// requested records the request ids the login page was asked about, so a test
-	// can prove the id in the path is the one that reached the use case.
+	// loginRedirect is the address the double redirects to, and it is a real
+	// `internal/oidc` URL rather than a made-up string so a test asserting on a
+	// Location header is asserting on the shape the real provider produces.
+	loginRedirect string
+	// redirects records the parameters every redirect was asked for, so a test can
+	// prove the request id in the path is the one that reached the redirect.
+	redirects []oidc.LoginRedirectParams
+	// requested records the request ids the login interaction was asked about, so a
+	// test can prove the id in the path is the one that reached the use case.
 	requested []string
 }
 
-func newFakeOIDC() *fakeOIDC { return &fakeOIDC{} }
+func newFakeOIDC() *fakeOIDC {
+	return &fakeOIDC{loginRedirect: "https://login.example.com/sign-in/oidc"}
+}
 
 func (f *fakeOIDC) Handler() http.Handler { return http.NotFoundHandler() }
 
@@ -121,6 +131,20 @@ func (f *fakeOIDC) LoginBanner(_ context.Context, requestID string) (oidc.LoginB
 	banner := f.banner
 	banner.RequestID = requestID
 	return banner, nil
+}
+
+// LoginRedirect builds a real `internal/oidc` redirect from the double's address,
+// so the double and the provider cannot disagree about the shape of the answer.
+func (f *fakeOIDC) LoginRedirect(params oidc.LoginRedirectParams) string {
+	f.redirects = append(f.redirects, params)
+	parsed, err := url.Parse(f.loginRedirect)
+	if err != nil {
+		// Unreachable for a constant in a test double; a panic in a double is the
+		// right failure because it can only be a typo in the double itself.
+		panic("fakeOIDC: the login redirect address does not parse: " + err.Error())
+	}
+	parsed.RawQuery = params.Values().Encode()
+	return parsed.String()
 }
 
 func (f *fakeOIDC) CompleteLogin(context.Context, string, id.UUID) error { return f.completeErr }

@@ -41,8 +41,20 @@ const (
 	PathToken = "/oidc/token"
 	// PathUserinfo is where an access token is presented for claims.
 	PathUserinfo = "/oidc/userinfo"
-	// PathLogin is where the browser goes to authenticate. The request id is a
-	// path segment under it.
+	// PathLogin is where the browser goes to authenticate, and it stays THIS
+	// SERVICE's rather than becoming the configured login UI's address.
+	//
+	// THE EXTRA HOP IS THE POINT, and it is what keeps every authorization
+	// decision on this origin. `/oidc/authorize` redirects here; a GET decides
+	// whether this browser is already signed in, whether IT started this flow,
+	// and — if not — redirects again, to the login UI. Each of those is a question
+	// about a credential, and a question about a credential answered by a page on
+	// another origin is a question this service did not answer.
+	//
+	// So the hop costs one round trip and buys three things that are otherwise
+	// impossible: no CORS, no credential crossing an origin boundary, and a
+	// single place where "may this browser authenticate this request" is decided.
+	// loginui.go has the full flow.
 	PathLogin = "/oidc/login"
 	// PathJWKS is where the signing keys are published. It is the path core's
 	// conventions name and the one guard's verifier hardcodes:
@@ -69,6 +81,18 @@ type Config struct {
 	// tests, and it is a field rather than a behaviour because "this deployment
 	// is local" is a fact about the deployment.
 	AllowInsecure bool
+	// LoginUIURL is where a browser goes to authenticate. It is REQUIRED, and
+	// there is no default, and the reason is the whole of loginui.go: identity
+	// renders no HTML, so a provider with no login UI is an authorization server
+	// that cannot log a human in while still publishing a discovery document
+	// that says it can.
+	//
+	// IT IS A FIELD RATHER THAN A CONSTANT because the login UI belongs to
+	// another repository and a deployment may well serve it from a different
+	// origin than this one. Compiling an address in would couple two services
+	// that share no module and no release train, and a compiled-in default that
+	// is wrong is wrong in every deployment at once.
+	LoginUIURL string
 }
 
 // Provider is the assembled OpenID Connect provider.
@@ -76,6 +100,9 @@ type Provider struct {
 	op      *op.Provider
 	storage *Storage
 	issuer  string
+	// loginUI is LoginUIURL, parsed once and validated. Held rather than re-parsed
+	// at every redirect; see LoginRedirect.
+	loginUI *url.URL
 }
 
 // NewProvider builds the provider.
@@ -90,6 +117,22 @@ func NewProvider(cfg Config, storage *Storage) (*Provider, error) {
 	}
 	if cfg.SigningKey == nil {
 		return nil, ErrNoSigningKey
+	}
+	// The login UI is checked HERE and not left to the first sign-in, for the
+	// reason loginui.go gives: a provider that builds and publishes a discovery
+	// document it cannot complete a flow with is a worse state than one that
+	// refuses to start, and the difference is invisible until a user is standing
+	// at a product's sign-in button.
+	if err := ValidateLoginUIURL(cfg.LoginUIURL); err != nil {
+		return nil, fmt.Errorf("%w: set %s to the page that asks a person for their password, "+
+			"for example https://parlor.cafaye.com/sign-in/oidc", err, LoginUIEnvVar)
+	}
+	loginUI, parseErr := url.Parse(cfg.LoginUIURL)
+	if parseErr != nil {
+		// Unreachable: ValidateLoginUIURL just parsed it. Kept rather than
+		// asserted because a constructor that panics on its own input is a
+		// constructor with a second, undocumented failure mode.
+		return nil, fmt.Errorf("%w: it is not a URL: %v", ErrInvalidLoginUI, parseErr)
 	}
 
 	encryptionKey, encryptionKeyID := deriveEncryptionKey(cfg.SigningKey)
@@ -161,7 +204,7 @@ func NewProvider(cfg Config, storage *Storage) (*Provider, error) {
 		return nil, fmt.Errorf("oidc: building the provider: %w", err)
 	}
 
-	return &Provider{op: handler, storage: storage, issuer: cfg.Issuer}, nil
+	return &Provider{op: handler, storage: storage, issuer: cfg.Issuer, loginUI: loginUI}, nil
 }
 
 // Handler is the library's router.

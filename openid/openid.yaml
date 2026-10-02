@@ -70,8 +70,10 @@ info:
     ## The flow
 
     ```
-    GET  /oidc/authorize    -> 302 /oidc/login/{request_id}   (the login page)
-    POST /oidc/login/{id}   -> 302 <redirect_uri>?code=…&state=…
+    GET  /oidc/authorize    -> 302 /oidc/login/{request_id}          (this service)
+    GET  /oidc/login/{id}   -> 302 <OIDC_LOGIN_UI_URL>?…             (the login UI)
+    POST /oidc/login/{id}   -> 302 <redirect_uri>?code=…&state=…     (this service)
+                             …or 302 back to the login UI carrying the refusal
     POST /oidc/token        -> {access_token, id_token, token_type, expires_in, scope}
     GET  /oidc/userinfo     -> {sub, email, email_verified, name, accounts}
     ```
@@ -101,36 +103,86 @@ info:
     can: a document advertising an endpoint that answers 404 is a product
     configured against a route that does not exist.
 
-    ## The login page
+    ## This provider renders no HTML
 
-    `/oidc/login/{request_id}` is this service's own sign-in, against its own
-    sessions and its own cookie — the same `POST /v1/session` credentials. A
-    separate sign-in for OIDC would be a second credential store, which is the one
-    thing a security boundary must not have. A user who already has a session skips
-    the form, which is what makes signing in to a second product not require
-    typing the same password twice.
+    **The sign-in form is not part of this service.** `/oidc/login/{request_id}`
+    is this service's own sign-in — its own sessions, its own cookie, the same
+    `POST /v1/session` credentials, the same lockout counter — and the page a
+    person fills in is configured per deployment as `OIDC_LOGIN_UI_URL` and served
+    by `parlor`. A separate sign-in for OIDC would be a second credential store,
+    which is the one thing a security boundary must not have; equally, a second
+    piece of frontend in a service whose job is to hold every user's password
+    digest is not a thing this service should own.
 
-    The page names the product asking. It has to: a login page that cannot say
-    which application wants a password is the setup for a credential-phishing page
-    on this service's own domain.
+    A deployment that configures an issuer, a signing key and no login UI **refuses
+    to start**. A provider that cannot send a browser anywhere to authenticate is
+    a provider that publishes a working discovery document and cannot complete a
+    single flow, which is worse than not being a provider because the failure is
+    found by a user rather than by an operator.
 
-    ## A second factor is a second step on this page
+    Nothing in this service answers with a document. A redirect is a redirect with
+    no body and no `Content-Type`, and a mistake here is one `http.Redirect` call
+    away — so `internal/platform/ci` walks the router and the source on every
+    commit and refuses either.
+
+    ### The redirect contract
+
+    `GET /oidc/login/{request_id}` answers `302` to `<OIDC_LOGIN_UI_URL>` with these
+    query parameters. `request_id`, `state` and `step` are always present; the rest
+    appear when they have something to say, and **an absent `error` and an empty one
+    are different** — a login UI that switches on `error` must not see a failure on
+    a sign-in that is going fine.
+
+    | Parameter | Meaning |
+    |---|---|
+    | `request_id` | The authorization request. Post it back in your form's action path — it is the one value you cannot lose. |
+    | `state` | A CSRF token this provider minted and sealed in a `__Host-` cookie **on this origin**. Your origin can neither read nor write that cookie; the POST is checked against it and a mismatch is refused. Post it back verbatim. |
+    | `step` | `password` or `challenge`. Which form to render. |
+    | `client_name` | The registration's display name. **Untrusted text**: it is whatever an account owner typed, so escape it. |
+    | `login_hint` | The client's `login_hint`, if it sent one. Untrusted, and never load-bearing — the password is checked against the address the user types. |
+    | `error` | A stable code. The contract; switch on it. |
+    | `error_detail` | A sentence for a person. **Not** the contract and not parsed by anything. |
+    | `retry_after` | Whole seconds, on `account_locked` and nowhere else. |
+
+    The `error` codes are `interaction_expired`, `missing_credentials`,
+    `invalid_credentials`, `challenge_rejected` and `account_locked`. The last one is
+    the same word the JSON surface uses for the same lockout, on purpose: a UI that
+    already switches on `account_locked` must not have to learn a second spelling.
+
+    ### The form post
+
+    `POST /oidc/login/{request_id}`, `application/x-www-form-urlencoded`, with
+    `{state, email, password}` on the first step and `{state, code}` on the second.
+    `code` is a TOTP code or a recovery code in the same field.
+
+    ### The two cookies, and why they are `SameSite=None`
+
+    The form is a top-level cross-site POST, so the state cookie and the
+    MFA-challenge cookie are `SameSite=None; Secure`. That is a transport change and
+    not a weakening: both are `HttpOnly` and `__Host-`-prefixed, so your origin can
+    neither read nor forge them, and the CSRF property is the unguessable value in a
+    cookie your origin cannot read — which is unchanged. Under `Lax` the flow would
+    simply not work, and would fail on the first person to try it.
+
+    The flow cookie and the session cookie stay `Lax`. Nothing you do needs to
+    change them.
+
+    ## A second factor is a second step
 
     A correct password on an account that has enrolled a second factor does not
-    sign anybody in. This page renders its second step — a code box, which takes
-    a TOTP code or a recovery code — and no authorization code is minted until
-    that is answered.
+    sign anybody in. The POST answers `302` back to your login UI with
+    `step=challenge`, and no authorization code is minted until a code is answered.
 
     This is the same use case `POST /v1/session/mfa` is, and the same guarantee: a
     product integrating against this provider cannot obtain a token for a user
     with multi-factor authentication by knowing their password. A user who fails
-    the second step is shown the form again with one sentence that does not say
-    which part was wrong.
+    the second step is sent back to `step=challenge` with one sentence that does not
+    say which part was wrong, and the challenge survives so the next code they type
+    is the code that works.
 
-    The contract a client sees from outside does not move. `/oidc/authorize` still
-    answers 302 to this page, this page still answers 302 to the client with a
-    `code`, and no discovery metadata changes — a browser flow is a browser flow,
-    and the number of fields in a form is not part of the protocol.
+    The contract a *client* sees from outside does not move. `/oidc/authorize`
+    still answers 302, and the flow still ends at a `302` to the client's
+    `redirect_uri` with a `code`. No discovery metadata changes.
   contact:
     name: identity
     url: https://github.com/cafaye/identity
@@ -283,8 +335,10 @@ paths:
       summary: Start an authorization request
       description: |
         The authorization endpoint. On success it redirects the browser to this
-        service's own login page; the login page then redirects to the client's
-        registered `redirect_uri` with a `code`.
+        service's own sign-in interaction at `/oidc/login/{request_id}`; that
+        endpoint either sends the browser straight on to the client's registered
+        `redirect_uri` with a `code`, or on to the configured login UI, which
+        renders a step and posts it back.
 
         **PKCE is required and `S256` is the only accepted method.** `plain` means
         the verifier IS the challenge, which is only safe for a public client that
@@ -353,9 +407,9 @@ paths:
       responses:
         '302':
           description: |
-            To this service's login page, on a request that has been validated. The
-            browser is not sent to `redirect_uri` yet: no code exists until a user
-            has authenticated.
+            To this service's sign-in interaction, on a request that has been
+            validated. The browser is not sent to `redirect_uri` yet: no code
+            exists until a user has authenticated.
           headers:
             Location:
               schema: { type: string, format: uri-reference }
@@ -464,9 +518,9 @@ paths:
       responses:
         '302':
           description: |
-            To this service's login page, on a request that has been validated. The
-            browser is not sent to `redirect_uri` yet: no code exists until a user
-            has authenticated.
+            To this service's sign-in interaction, on a request that has been
+            validated. The browser is not sent to `redirect_uri` yet: no code
+            exists until a user has authenticated.
           headers:
             Location:
               schema: { type: string, format: uri-reference }
@@ -500,14 +554,16 @@ paths:
     get:
       tags: [oidc]
       operationId: authorizeCallback
-      summary: The login page's return leg
+      summary: The sign-in interaction's return leg
       description: |
-        Where the login page sends the browser once a user has authenticated. It
+        Where this service sends the browser once a user has authenticated. It
         mints the authorization code and redirects to the client's `redirect_uri`.
+        This is the only place a code is minted.
 
-        Not called by clients. It exists because the protocol has to hand control
-        to something that is not the protocol, and that something is a login page
-        on this service.
+        Not called by clients, and not called by the login UI either: the POST to
+        `/oidc/login/{request_id}` completes the request and proxies a request to
+        here, so a credential never crosses an origin boundary. It exists because
+        the protocol has to hand control to something that is not the protocol.
       security: []
       parameters:
         - name: id
@@ -729,45 +785,78 @@ paths:
         schema: { type: string, format: uuid }
     get:
       tags: [oidc]
-      operationId: oidcLoginForm
-      summary: The sign-in page
+      operationId: oidcLoginStep
+      summary: Begin the sign-in interaction
       description: |
-        Renders a sign-in form naming the product that asked, or — for a caller
-        who already has a session — redirects straight through to the client with
-        a code. The second path is what makes signing in to a second product not
-        require typing the same password again, and it is what `id_token_hint`
-        needs.
+        **This operation renders nothing.** It is where the authorization
+        protocol hands control to a person, and it hands that control to the login
+        UI configured as `OIDC_LOGIN_UI_URL`, with a `302` carrying everything the
+        UI needs to render a step. The credential checks, the session cookie and
+        the authorization code all stay on this service.
 
-        The form carries a CSRF `state` sealed in a `__Host-` cookie, minted by
-        `internal/oauth`'s own `NewState`. A cross-site POST cannot write a
-        `__Host-` cookie, so a POST whose form and cookie disagree is a 400 — that
-        is the defence against a request binding a user's browser to an
-        authorization request they never chose.
+        Two outcomes, and they are the only two:
+
+        * **A caller who already has a session** is sent straight through to the
+          client's `redirect_uri` with a code. That is what makes signing in to a
+          second product not require typing the same password again, and it is what
+          `id_token_hint` needs.
+        * **A caller who does not** gets a `302` to the login UI with a freshly
+          minted `state`, sealed in a `__Host-` cookie **on this origin**. A
+          cross-site POST cannot write a `__Host-` cookie, so a POST whose form and
+          cookie disagree is refused — that is the defence against a request
+          binding a user's browser to an authorization request they never chose.
+
+        **A signed-in browser with no flow cookie is a 403, not a redirect.** The
+        flow cookie is set at `/oidc/authorize` and marks a browser this service
+        handed a flow to. A browser that arrives here with a session and nothing
+        else has been navigated by somebody else, and completing its request would
+        be login CSRF: the attacker chose the client, holds its secret and its PKCE
+        verifier, and would receive an `id_token` whose subject is the victim. The
+        product restarts the flow from its own redirect, which sets the cookie on
+        the way past.
       security: []
       responses:
-        '200':
-          description: The form.
-          headers:
-            X-Frame-Options:
-              description: Always `DENY`. This page takes a password.
-              schema: { type: string }
-            Referrer-Policy:
-              description: |
-                Always `no-referrer`. This page's URL carries an authorization
-                request id, and a referrer header would hand it to whatever the
-                user clicked next.
-              schema: { type: string }
-          content:
-            text/html:
-              schema:
-                type: string
         '302':
-          description: Already signed in; straight through to the client.
+          description: |
+            Either to the login UI, or — for a caller who already has a session —
+            to the client's `redirect_uri` with a code.
+
+            The response has **no body and no `Content-Type`**. That is deliberate
+            and it is checked: `http.Redirect` would write a small HTML anchor and
+            set `Content-Type: text/html; charset=utf-8`, because RFC 9110 §15.4
+            recommends it for user agents that cannot follow a redirect. This
+            service has no such user agent and serves no documents.
           headers:
             Location:
+              description: |
+                The configured login UI, with `request_id`, `state`, `step`,
+                `client_name` and — on a refusal — `error`, `error_detail` and
+                `retry_after` in the query. Or the client's `redirect_uri` on the
+                silent path.
               schema: { type: string, format: uri }
+            Referrer-Policy:
+              description: |
+                Always `no-referrer`. The `Location` carries an authorization
+                request id and a CSRF state, and this header is what governs what
+                the login UI's own document may hand to whatever it loads next.
+              schema: { type: string }
+            Cache-Control:
+              description: Always `no-store`. Nothing about a sign-in is cacheable.
+              schema: { type: string }
+        '403':
+          description: |
+            A signed-in browser that cannot prove it started this flow. The
+            `403` rather than a `401` because the caller *is* authenticated; a
+            `401` would send a client hunting a login problem that does not exist.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '404':
-          description: The request is unknown or has outlived its ten minutes.
+          description: |
+            The request is unknown or has outlived its ten minutes. The one
+            refusal that is a problem document rather than a redirect: there is no
+            request left to show, so there is nothing for the login UI to render.
           content:
             application/problem+json:
               schema:
@@ -775,28 +864,40 @@ paths:
     post:
       tags: [oidc]
       operationId: oidcLoginSubmit
-      summary: Submit the sign-in form
+      summary: Submit a step of the sign-in interaction
       description: |
         Checks the credentials against this service's own `POST /v1/session`
         path, sets the `__Host-session` cookie, and hands the browser to the
-        authorize callback.
+        authorize callback — or, on a refusal, hands it back to the login UI with
+        the reason.
 
-        **The body is one of two shapes**, because the page is one operation with
-        two steps: `{state, email, password}` on the first, and `{state, code}` on
-        the second. Which one is expected is not in the request — it is in what the
-        browser holds. A correct password for an account with a second factor
-        returns the code form with a fresh `state` and a per-request challenge
-        cookie, and the session cookie is NOT set. A correct code returns the 302
-        below.
+        **This is a cross-site form post.** The form is on the login UI's origin
+        and this endpoint is on this one, so the `state` and MFA-challenge cookies
+        are `SameSite=None; Secure` for the duration of the interaction. They are
+        `HttpOnly` and `__Host-`-prefixed, so the login UI's origin can neither
+        read nor forge them.
 
-        `code` is a TOTP code or a recovery code in the same field, and the page
-        never says which of the two a wrong value failed to be.
+        **The body is one of two shapes**, because the interaction is one
+        operation with two steps: `{state, email, password}` on the first, and
+        `{state, code}` on the second. Which one is expected is not in the request —
+        it is in what the browser holds. A correct password for an account with a
+        second factor answers `302` to the login UI with `step=challenge`, a fresh
+        `state` and a challenge cookie, and the session cookie is NOT set. A
+        correct code answers the `302` to the client below.
 
-        A wrong password and an unregistered address are one 401 with one
-        sentence. This is the most attractive enumeration oracle on the platform —
-        unauthenticated, takes an email, and the first thing anybody types into it
-        is somebody else's address — so the two are indistinguishable in status,
-        in body and in time.
+        `code` is a TOTP code or a recovery code in the same field, and neither
+        refusal ever says which of the two a wrong value failed to be.
+
+        A wrong password and an unregistered address are one `error` with one
+        `error_detail`. This is the most attractive enumeration oracle on the
+        platform — unauthenticated, takes an email, and the first thing anybody
+        types into it is somebody else's address — so the two are indistinguishable
+        in status, in query and in time.
+
+        Every refusal that can be re-shown is a `302` back to the login UI rather
+        than a status code, because the reader is a page on another origin and a
+        problem document is not something it can render. A refusal with a fresh
+        `state`, so the form it is about to be sent back to can be submitted again.
       security: []
       requestBody:
         required: true
@@ -809,7 +910,8 @@ paths:
                 state:
                   type: string
                   description: |
-                    The value from the form, checked against the `__Host-` cookie.
+                    The value from the redirect's query, checked against the
+                    `__Host-` cookie sealed on this origin.
 
                     Re-minted on every step. A sealed value still in the cookie
                     after it has been spent is a CSRF token that works twice.
@@ -826,67 +928,62 @@ paths:
                   description: |
                     The second-factor step only. A six-digit TOTP code or a
                     recovery code. Never echoed back, never logged, and never
-                    reflected into the page's own error text.
+                    reflected into a refusal.
       responses:
         '302':
           description: |
-            To the client's `redirect_uri` with `code` and `state`. The
-            `__Host-session` cookie is set in the same response.
+            One of three things, told apart by the `Location`:
+
+            * the client's `redirect_uri` with `code` and `state`, with the
+              `__Host-session` cookie set in the same response — the flow
+              completed;
+            * the login UI with `step=challenge` and a fresh `state` — the password
+              was right and the authentication is unfinished, which is the same
+              thing the `POST /v1/session` 202 means;
+            * the login UI with `error` and `error_detail` — a refusal, on whichever
+              step it belongs to, with a fresh `state` so the form can be submitted
+              again. `account_locked` also carries `retry_after`.
           headers:
             Location:
               schema: { type: string, format: uri }
-        '200':
-          description: |
-            The second-factor step. The code form, redrawn with a fresh `state`.
-
-            A `200` and not an error: nothing has failed yet, the credentials were
-            right, and the authentication is unfinished — the same thing the
-            `POST /v1/session` 202 means, expressed as a page.
-          content:
-            text/html:
-              schema:
-                type: string
         '400':
           description: |
-            The state does not match the cookie, or the form is not one this page
-            accepts. A cross-site POST arrives here.
+            The body was not one this endpoint accepts. The one refusal on this
+            operation that is a problem document rather than a redirect: identity
+            and the browser do not agree on what was sent, so a redirect would be
+            a page asking for a form a second time.
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
-        '401':
+        '404':
           description: |
-            A wrong password, an unregistered address, or a code that was not
-            accepted. The first two are one answer in one sentence; the third is
-            one answer in a different sentence, because it happens on the page
-            rather than in it.
-          content:
-            text/html:
-              schema:
-                type: string
-        '422':
-          description: The form was submitted with an empty address or password.
+            The authorization request is gone, so there is no step left to re-show
+            and no `request_id` the login UI could post back. A `404` and not a
+            redirect, for the same reason as on the GET.
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
-        '423':
-          description: |
-            Too many consecutive failures against this account. The page says how
-            long to wait; there is no `Retry-After` to read, because there is no
-            client here to read it.
-
-            This is the same lockout `POST /v1/session` uses, on the same counter,
-            so a user who trips it on the login page trips it in the API too.
-          content:
-            text/html:
-              schema:
-                type: string
         '503':
           description: |
-            The page is unreachable: this deployment has no `MFA_ENCRYPTION_KEY`,
-            so it cannot verify the code it is being asked for. It fails closed
-            and says why.
+            This deployment cannot verify a second factor, because it has no
+            `MFA_ENCRYPTION_KEY`. It fails closed and says why, in a problem
+            document rather than a redirect, because a `503` is a statement about
+            the server and there is nothing for the login UI to re-show.
+
+            Unreachable in practice: with no key the enrolment routes are not
+            mounted, so no account has a second factor and the challenge step is
+            never entered. It is documented because the branch is real.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: |
+            A server error, with a `trace_id`. A problem document for the same
+            reason as the `503`: the reader of a server error is an operator with
+            the log, and `trace_id` is what they need.
           content:
             application/problem+json:
               schema:
@@ -1144,10 +1241,16 @@ components:
       type: object
       description: |
         The cafaye error envelope — RFC 9457 plus core's `code` and `trace_id` —
-        used on this surface in exactly two places: the `/oidc/authorize`
-        pre-checks, and the login page. Both are browser-facing and both are
-        cafaye decisions rather than OAuth protocol responses, which is the
-        distinction; everything else on these paths is RFC 6749.
+        used on this surface in exactly three places: the `/oidc/authorize`
+        pre-checks, the refusals on `/oidc/login/{request_id}` that cannot be
+        re-shown, and the 404 for an unknown request. All three are cafaye
+        decisions rather than OAuth protocol responses, which is the distinction;
+        everything else on these paths is RFC 6749.
+
+        **A refusal a login UI could render is not one of them** — that is a
+        `302` back to the login UI carrying `error` and `error_detail`, because
+        the reader is a page on another origin and a problem document is not
+        something it can render.
 
         The reason the split exists at all: an off-the-shelf OIDC client library
         pointed at this service must be able to parse every response it gets, and

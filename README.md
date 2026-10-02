@@ -152,9 +152,10 @@ service quietly listening on the wrong port.
 | `PORT` | `8080` | TCP port to bind. Must be 1-65535. |
 | `DATABASE_URL` | *(unset)* | Postgres DSN. Optional in v0; unset means no pool and no readiness dependency. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Drives `log/slog`. |
-| `OIDC_ISSUER` | *(unset)* | The OpenID Connect issuer. All three OIDC variables are required together or not at all. |
+| `OIDC_ISSUER` | *(unset)* | The OpenID Connect issuer. Required with `OIDC_SIGNING_KEY`, `OIDC_SIGNING_KEY_ID` and `OIDC_LOGIN_UI_URL` — all four together, or none of them. |
 | `OIDC_SIGNING_KEY` | *(unset)* | PEM-encoded RSA private key, ≥ 2048 bits. PKCS#1 and PKCS#8 both load. |
 | `OIDC_SIGNING_KEY_ID` | *(unset)* | The `kid` published in the JWKS and signed into every token. 1-64 characters of `A-Z a-z 0-9 . _ -`. |
+| `OIDC_LOGIN_UI_URL` | *(unset)* | **The page that asks a person for their password.** `identity` renders no HTML, so this is required and there is no default: a provider that cannot send a browser anywhere to authenticate refuses to start. Absolute, `http`/`https`, a path is fine, and **no query and no fragment** — identity merges its own parameters into the query. See [the redirect contract](#the-sign-in-interaction-and-the-login-ui). |
 | `OIDC_ALLOW_INSECURE` | `false` | Permits an `http` issuer. For `localhost` and compose stacks only. |
 | `MFA_ENCRYPTION_KEY` | *(unset)* | base64url, **exactly 32 bytes**. Seals the TOTP secret at rest. Never generated. Unset means MFA is not turned on: the management routes are absent and the login challenge is still enforced. A value of the wrong length is a startup failure. |
 | `MFA_ISSUER` | `cafaye identity` | The account label an authenticator app displays. A display string, not a secret; changing it does not affect any confirmed credential. |
@@ -835,7 +836,7 @@ against cafaye itself rather than configuring Google OAuth per product — and t
 JWT verification every other cafaye service already does against identity's JWKS
 becomes a standard, interoperable surface.
 
-These routes exist only when the three `OIDC_*` variables above are all set AND
+These routes exist only when the four `OIDC_*` variables above are all set AND
 `DATABASE_URL` is set. Without them they are absent, so the failure is a clear
 `404` rather than a pile of `500`s.
 
@@ -845,8 +846,8 @@ These routes exist only when the three `OIDC_*` variables above are all set AND
 | `GET /.well-known/oauth-authorization-server` | `200` | RFC 8414. The same document; the library does not register it, identity does. |
 | `GET /.well-known/jwks.json` | `200 {"keys":[…]}` | RFC 7517. One key, `use: sig`, `alg: RS256`. Public half only. |
 | `GET,POST /oidc/authorize` | `302` | The authorization endpoint. Requires PKCE with `S256`. `redirect_uri` matched **exactly**. |
-| `GET /oidc/authorize/callback` | `302` | The login page's return leg. Mints the code. |
-| `GET,POST /oidc/login/:requestId` | `200` / `302` | The sign-in page. This service's own sessions and cookie. |
+| `GET /oidc/authorize/callback` | `302` | The sign-in interaction's return leg. Mints the code. |
+| `GET,POST /oidc/login/:requestId` | `302` | The sign-in interaction. **This service renders nothing**: the GET redirects to `OIDC_LOGIN_UI_URL` and the POST completes or redirects back. Sessions, cookie and password check all stay here. |
 | `POST /oidc/token` | `200 {access_token, id_token, …}` | `grant_type=authorization_code` and nothing else. HTTP Basic client auth. |
 | `GET,POST /oidc/userinfo` | `200 {sub, email, …}` | The claims the token was granted, and only those. |
 | `/oidc/introspect`, `/oidc/revoke`, `/oidc/end-session`, `/oidc/device_authorization` | `404 not_found` | Not built, on any method — the row carries no method because there is nothing behind it to answer one. Absent from the discovery document too. |
@@ -886,6 +887,83 @@ Two decisions the manager may want to rule on, both recorded in the code:
   the packet specifies. core scopes 400 to "malformed syntax the client could not
   have known" and 422 to "semantically wrong", so this is a deliberate departure
   and it is listed under "Known gaps" in `openid/openid.yaml`.
+
+### The sign-in interaction, and the login UI
+
+**`identity` renders no HTML.** There is no view, no template and no page; the
+form a person fills in is served by `parlor` and its address is
+`OIDC_LOGIN_UI_URL`. The whole of the browser-facing frontend this service used to
+have was one `html/template` literal of about thirty lines, and this is the
+decision that removed it — the reasoning, and the two properties that had to be
+kept while removing it, are in `DECISIONS.md` **D10** and in
+`internal/oidc/loginui.go`.
+
+The flow is four moves and two of them are redirects:
+
+```
+GET  /oidc/authorize            302 -> /oidc/login/{request_id}   (this service)
+GET  /oidc/login/{request_id}   302 -> <OIDC_LOGIN_UI_URL>?…      (the login UI)
+POST /oidc/login/{request_id}   302 -> <redirect_uri>?code=…      (this service)
+                                 …or 302 back to the login UI carrying the refusal
+```
+
+**Why the extra hop rather than sending the browser straight from `/oidc/authorize`
+to the login UI.** Every question on that second hop is a question about a
+credential — is this browser signed in, did *it* start this flow, is this password
+correct, may an authorization code be minted — and an authorization decision made
+by a page on another origin is not one this service made. The hop costs one round
+trip and buys three things: no CORS anywhere (identity sends no CORS headers, and
+that is not negotiable), no credential crossing an origin boundary, and one place
+where "may this browser authenticate this request" is decided. The silent path —
+a user who already has a session going straight through with a code — is on that
+hop, and so is the login-CSRF refusal that guards it.
+
+**A deployment with an issuer and a key and no login UI refuses to start.** A
+provider that cannot send a browser anywhere to authenticate is a provider that
+publishes a working discovery document and cannot complete a single flow, which
+is worse than not being a provider because the failure is found by a user rather
+than by an operator.
+
+**What travels to the login UI.** `request_id`, `state` and `step` are always
+present; `client_name`, `login_hint`, `error`, `error_detail` and `retry_after`
+appear when they have something to say. **An absent `error` and an empty one are
+different** — a login UI that switches on `error` must not show a failure banner
+on a sign-in that is going fine. `client_name` is a row an account owner typed and
+`login_hint` is a string the client chose, so **both are untrusted text and the
+login UI must escape them**; that was a real attack when the page was here and it
+is still a real attack, one repository over.
+
+`error` is the contract and `error_detail` is a sentence for a person — the same
+split the problem envelope makes between `code` and `detail`. The codes are
+`interaction_expired`, `missing_credentials`, `invalid_credentials`,
+`challenge_rejected` and `account_locked`, and the last is the same word the JSON
+surface uses for the same lockout on purpose.
+
+**What comes back.** `POST /oidc/login/{request_id}`, form-encoded, with
+`{state, email, password}` on the first step and `{state, code}` on the second.
+That is a top-level **cross-site** POST, so the state and MFA-challenge cookies
+are `SameSite=None; Secure` for the duration of the interaction. That is a
+transport change and not a weakening: both cookies are `HttpOnly` and
+`__Host-`-prefixed, so the login UI's origin can neither read nor forge them, and
+the CSRF property is the unguessable value in a cookie the other origin cannot
+read — which is unchanged. Under `Lax` the flow would simply not work. The flow
+cookie and the session cookie stay `Lax`; nothing a login UI does needs them to be.
+
+**A refusal a login UI could render is a redirect, not a status.** A wrong
+password, an empty form, a refused code and a lockout all answer `302` back to the
+login UI with the reason, on whichever step it belongs to, with a **fresh** `state`
+so the form can be submitted again. The three that cannot be re-shown are problem
+documents: a request id that does not exist (nothing to render, nothing to post
+back), a body that will not parse, a signed-in browser with no flow cookie (the
+login-CSRF refusal, which says "this sign-in was not started here"), and a server
+error, which has a `trace_id` for an operator.
+
+**Nothing in this service answers with a document.** Not a page, and not a
+redirect body either: `http.Redirect` would write a small HTML anchor and set
+`Content-Type: text/html; charset=utf-8`, because RFC 9110 §15.4 recommends it for
+user agents that cannot follow a redirect, and this service has no such user
+agent. `internal/platform/ci` walks the router and the source on every commit and
+refuses either.
 
 ## Layout
 

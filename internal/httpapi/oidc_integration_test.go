@@ -44,11 +44,19 @@ import (
 // longer than the milliseconds a test takes, so nothing here has to sleep.
 
 const (
-	oidcTestIssuer    = "https://identity.test"
-	oidcTestKeyID     = "cafaye-test-key"
-	oidcTestRedirect  = "https://app.example.com/cb"
-	oidcTestPassword  = "correct horse battery staple"
+	oidcTestIssuer   = "https://identity.test"
+	oidcTestKeyID    = "cafaye-test-key"
+	oidcTestRedirect = "https://app.example.com/cb"
+	oidcTestPassword = "correct horse battery staple"
+	// oidcTestUserAgent is the client identity internal/auth records an attempt
+	// under, so a lockout test can tell which attempt it is looking at.
 	oidcTestUserAgent = "identity-oidc-test/1"
+	// oidcTestLoginUI is the configured login UI: a DIFFERENT ORIGIN from
+	// oidcTestIssuer, because that is the deployment this packet is about. A
+	// same-origin login UI would hide every question the interaction cookies and
+	// the escaping of client_name exist to answer, and a suite that only ever ran
+	// against a same-origin one would be green for a configuration nobody deploys.
+	oidcTestLoginUI = "https://login.example.com/sign-in/oidc"
 )
 
 // oidcFixture is the world the OIDC suite runs in.
@@ -95,7 +103,11 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 	store := oidc.NewStore(pool)
 	storage := oidc.NewStorage(store, oidc.NewProfileReader(), key, clk, db.Direct{Pool: pool}, oidc.PathLogin)
 
-	provider, err := oidc.NewProvider(oidc.Config{Issuer: oidcTestIssuer, SigningKey: key}, storage)
+	provider, err := oidc.NewProvider(oidc.Config{
+		Issuer:     oidcTestIssuer,
+		SigningKey: key,
+		LoginUIURL: oidcTestLoginUI,
+	}, storage)
 	if err != nil {
 		t.Fatalf("building the provider: %v", err)
 	}
@@ -285,27 +297,31 @@ func (f *oidcFixture) authorize(t *testing.T, client registered, challenge, stat
 	return location
 }
 
-// login drives the login page: GET the form, POST the credentials, and return
-// the redirect the browser was sent to — which is where the code is.
+// login drives the login interaction the way a browser with a form on another
+// origin would: GET the endpoint, follow the redirect to the login UI, take the
+// state out of the query it carries, and POST it back with the credentials.
+//
+// The GET is still a GET against this service and the POST is still a POST
+// against this service, because that is the whole design — the login UI is a
+// renderer, not a participant. What changed is where the state is read from, and
+// `interactionState` says why.
 func (f *oidcFixture) login(t *testing.T, loginURL, email, password string) *oidcResponse {
 	t.Helper()
 
 	f.signOut()
 
 	form := f.do(t, http.MethodGet, loginURL, "", nil)
-	if form.Code != http.StatusOK {
-		t.Fatalf("GET the login page = %d, want 200; body: %s", form.Code, form.Body)
+	redirect := mustRedirectToLoginUI(t, form)
+	if got := redirect.Query().Get(oidc.LoginParamClientName); got != "Anytalk" {
+		t.Errorf("%s = %q, want the product asking; a sign-in form that cannot name the "+
+			"application is a credential-phishing page", oidc.LoginParamClientName, got)
 	}
-	state := hiddenState(t, form.Body.String())
-	if state == "" {
-		t.Fatal("the login form carried no state field")
-	}
-	if !strings.Contains(form.Body.String(), "Anytalk") {
-		t.Errorf("the login page does not name the product asking:\n%s", form.Body)
+	if got := redirect.Query().Get(oidc.LoginParamStep); got != oidc.LoginStepPassword {
+		t.Errorf("%s = %q, want %q", oidc.LoginParamStep, got, oidc.LoginStepPassword)
 	}
 
 	post := url.Values{
-		"state":    []string{state},
+		"state":    []string{interactionState(t, form)},
 		"email":    []string{email},
 		"password": []string{password},
 	}
@@ -497,23 +513,70 @@ func basicAuth(user, password string) string {
 	return base64.StdEncoding.EncodeToString([]byte(url.QueryEscape(user) + ":" + url.QueryEscape(password)))
 }
 
-// hiddenState pulls the state value out of the rendered form. A regexp rather
-// than a parser because the form is this test's own output and a real parser
-// would be a dependency for one attribute.
-func hiddenState(t *testing.T, body string) string {
+// interactionState pulls the CSRF state out of a redirect to the login UI.
+//
+// IT READS THE `Location` AND NOT A BODY, and that is the whole of what this
+// packet changed about the test harness: the state this service mints now travels
+// in a query string to a page on another origin, and a test that parsed a
+// `<input name="state">` out of a rendered form would be testing markup that no
+// longer exists. The value is the same value — the test asserts on the CONTRAT'T,
+// and the contract moved from a hidden field to a query parameter.
+//
+// A redirect that is not a redirect, or a redirect to somewhere that carries no
+// state, is a test failure rather than an empty string, because "the page did not
+// carry a state" used to be a failure too and it should stay one.
+func interactionState(t *testing.T, rec *oidcResponse) string {
 	t.Helper()
 
-	const open = `<input type="hidden" name="state" value="`
-	start := strings.Index(body, open)
-	if start < 0 {
-		return ""
+	location := rec.Header().Get("Location")
+	if location == "" {
+		t.Fatalf("the response carried no Location; it was %d with body:\n%s", rec.Code, rec.Body)
 	}
-	rest := body[start+len(open):]
-	end := strings.Index(rest, `"`)
-	if end < 0 {
-		return ""
+	parsed, err := url.Parse(location)
+	if err != nil {
+		t.Fatalf("the redirect %q is not a URL: %v", location, err)
 	}
-	return rest[:end]
+	state := parsed.Query().Get(oidc.LoginParamState)
+	if state == "" {
+		t.Fatalf("the redirect %q carried no %q", location, oidc.LoginParamState)
+	}
+	return state
+}
+
+// interactionParams is the parsed query of a redirect to the login UI, for the
+// assertions that are about what travels rather than about one field.
+func interactionParams(t *testing.T, rec *oidcResponse) url.Values {
+	t.Helper()
+
+	location := rec.Header().Get("Location")
+	if location == "" {
+		t.Fatalf("the response carried no Location; it was %d with body:\n%s", rec.Code, rec.Body)
+	}
+	parsed, err := url.Parse(location)
+	if err != nil {
+		t.Fatalf("the redirect %q is not a URL: %v", location, err)
+	}
+	return parsed.Query()
+}
+
+// mustRedirect asserts that a response is a redirect to the login UI and returns
+// where. Every assertion about the interaction goes through it, so "is this
+// actually a redirect to the login UI" is one question answered in one place
+// rather than restated in a dozen tests.
+func mustRedirectToLoginUI(t *testing.T, rec *oidcResponse) *url.URL {
+	t.Helper()
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("= %d, want 302 to the login UI; body:\n%s", rec.Code, rec.Body)
+	}
+	parsed, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("the redirect is not a URL: %v", err)
+	}
+	if got := parsed.Scheme + "://" + parsed.Host + parsed.Path; got != oidcTestLoginUI {
+		t.Fatalf("the browser was sent to %q, want the configured login UI %q", got, oidcTestLoginUI)
+	}
+	return parsed
 }
 
 func mustJSON(t *testing.T, data []byte, into any) {

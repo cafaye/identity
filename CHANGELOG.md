@@ -6,6 +6,102 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed (packet identity-29: identity serves no HTML, and the browser belongs to parlor)
+
+**`identity` renders no views, and never did — it rendered one page, and that
+page is gone.** The inline `html/template` literal in `internal/httpapi/oidc.go`
+was the whole of this service's frontend: the password step and the TOTP
+challenge step of the OpenID Connect sign-in. It is deleted, along with
+`loginTemplate`, `renderLoginPage`, `oidcLoginPage`, `loginPageData` and
+`writeHTML`. There is no `.html`, `.tmpl` or `.gohtml` file in the repository, and
+now there is no markup in a Go string either.
+
+**It moved rather than disappearing**, because the page is the authorization
+server's user-agent interaction and OpenID Connect Core §3.1.2.1 makes
+authenticating the end user part of an AS's job. Every authorization decision
+stays here; the rendering goes to `parlor`.
+
+- **New configuration: `OIDC_LOGIN_UI_URL`**, and it is **required** whenever the
+  OIDC block is configured, with no default. A provider that cannot send a browser
+  anywhere to authenticate **refuses to start** rather than mounting a surface
+  that publishes a working discovery document and cannot complete a flow. The
+  variable is named in the refusal and in the startup log.
+- **`GET /oidc/login/{request_id}` answers `302` to the configured login UI** with
+  `request_id`, `state`, `step`, `client_name` and — on a refusal — `error`,
+  `error_detail` and `retry_after`. A user who already has a session still goes
+  straight through with a code, and a signed-in browser with no flow cookie is
+  still a `403`.
+- **`POST /oidc/login/{request_id}`** is unchanged in shape: `{state, email,
+  password}` or `{state, code}`, checked against the same `POST /v1/session` path,
+  with the same MFA branch, the same per-factor lockout and the same account
+  lockout.
+- **The 401 and 423 answers now travel instead of being rendered.** A wrong
+  password, an empty form, a refused code and a lockout are all a `302` back to
+  the login UI with the reason, on a **fresh** state, so the form can be submitted
+  again. The 423's wait is `retry_after` in whole seconds rather than a header,
+  because a browser following a redirect does not read headers.
+- **The state and MFA-challenge cookies are now `SameSite=None; Secure`**, because
+  the form is a cross-site POST. They are `HttpOnly` and `__Host-`-prefixed as
+  before, so the login UI's origin can neither read nor forge them, and the CSRF
+  property — an unguessable value in a cookie the other origin cannot read — is
+  unchanged. The flow cookie and the session cookie stay `Lax`.
+- **No response in this service names a document**, including a redirect:
+  `http.Redirect` writes a small HTML anchor body and `Content-Type: text/html`
+  because RFC 9110 §15.4 recommends it for user agents that cannot follow a
+  redirect, and this service has none.
+
+**The contract a login UI implements against** is `internal/oidc/loginui.go` and
+the `This provider renders no HTML` section of `openid/openid.yaml`. The reasoning,
+the rejected alternatives and the one security header this changed are
+[DECISIONS.md](DECISIONS.md) **D10**.
+
+`client_name` and `login_hint` are **untrusted text** in that redirect — the first
+is a row an account owner typed and the second is a string the client chose — so
+the login UI must escape both. That was a real attack when the page was here, and
+it is still one, one repository over.
+
+**BREAKING for deployments:** a process with `OIDC_ISSUER`,
+`OIDC_SIGNING_KEY` and `OIDC_SIGNING_KEY_ID` set and no `OIDC_LOGIN_UI_URL` now
+fails to start. There is no backwards-compatible default, because the page this
+change removes is the only one there was; the alternative is a boot failure versus
+a mount that answers `503` for every sign-in, and the boot failure is the honest
+one.
+
+### Fixed (found by the red proofs: a redirect with an empty body and an HTML content type)
+
+`delegateOIDC` copied the library's response headers verbatim and dropped only the
+bytes, so `GET /oidc/authorize` answered `Content-Type: text/html; charset=utf-8`
+with an **empty** body — the worst of both, because a client that believes the
+header is told to parse a document and finds nothing. It now drops `Content-Type`
+and `Content-Length` alongside the body on a redirect.
+
+### Added (three checks, so "identity serves no HTML" is a claim and not a sentence)
+
+`internal/platform/ci` — the package that guards the gate — now holds the rule:
+
+- no `.html`, `.htm`, `.tmpl`, `.gohtml` or `.tpl` file is committed;
+- no Go file carries a markup string literal or imports `html/template`, with four
+  named allowances each carrying its reason, and **a stale allowance is a
+  failure** — an allowance is a claim about the tree, and a claim nobody re-checks
+  becomes a permission that outlives its reason;
+- no response anywhere on the router answers with a `Content-Type` that names a
+  document, or with a body on a redirect.
+
+The markup check parses the syntax tree rather than grepping, and that is a
+measured change rather than a preference: the first version grepped and went red
+on five lines of prose this same change had written explaining the rule. A comment
+cannot serve a response; a string literal can.
+
+### Fixed (`go mod tidy` was not a no-op on master, which AGENTS.md says it is)
+
+`go.opentelemetry.io/otel/exporters/otlp/otlptrace` was marked `// indirect` while
+being a direct dependency of `internal/telemetry`, so `go mod tidy` wanted to
+move it. Found while checking this packet's own gate and **pre-existing on
+master** — the same edit is produced by tidying a clean checkout. CI's lockfile
+guard runs `go mod download`, not `tidy`, so nothing caught it.
+
+### Added (packet identity-28: the tenancy surface is in a document, and D1 is decided)
+
 ### Added (packet identity-28: the tenancy surface is in a document, and D1 is decided)
 
 Ten operations the router has served since the accounts packet are now in
