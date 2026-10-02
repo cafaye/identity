@@ -138,7 +138,11 @@ const accountColumns = `id, name, slug, personal, created_at, updated_at`
 
 const membershipColumns = `account_id, user_id, role, created_at, updated_at`
 
-const invitationColumns = `id, account_id, email, role, token_digest, expires_at, accepted_at, invited_by, created_at, updated_at`
+// revoked_at is in this list, and its absence was identity-30's bug: the
+// redemption path read a row, saw AcceptedAt nil and not expired, and redeemed a
+// token an admin had already withdrawn — because the column that records the
+// withdrawal was not one this statement could return.
+const invitationColumns = `id, account_id, email, role, token_digest, expires_at, accepted_at, revoked_at, invited_by, created_at, updated_at`
 
 // membersSelectList is the accounts column list qualified with the `a` alias plus
 // the membership's own three columns, for the two statements that join
@@ -461,8 +465,18 @@ func (s *Store) CreateInvitation(ctx context.Context, q db.Querier, n NewInvitat
 //
 // A miss is ErrInvitationNotFound and covers a wrong token, an unknown token and
 // a malformed one identically. The caller then decides whether the row it found
-// has expired or was already used — that distinction needs a row, and a caller
-// with no row learns nothing either way.
+// has expired, was already used, or was revoked — that distinction needs a row,
+// and a caller with no row learns nothing either way.
+//
+// A REVOKED INVITATION IS STILL RETURNED, deliberately, and the caller must
+// check RevokedAt before treating the row as redeemable. Filtering
+// `revoked_at IS NULL` here would be the shorter fix and the wrong one: it would
+// make "withdrawn" indistinguishable from "never existed" to the *account's own
+// admin surface*, which is the one caller entitled to the difference, and it
+// would hide the withdrawal from the audit trail rather than from an attacker.
+// The public answer is still uniform — `Accept` turns a revoked invitation into
+// ErrInvitationNotFound, which is the 404 the contract already promises — but it
+// is uniform because the service decides, not because the row was hidden.
 func (s *Store) InvitationByToken(ctx context.Context, q db.Querier, digest string) (Invitation, error) {
 	if digest == "" {
 		return Invitation{}, ErrInvitationNotFound
@@ -488,6 +502,25 @@ func (s *Store) InvitationByToken(ctx context.Context, q db.Querier, digest stri
 // acceptance time. That is the whole reason this is not a plain UPDATE — an
 // unconditional one would let two concurrent redemptions both report success and
 // produce two memberships, or one membership and two "accepted" answers.
+//
+// IT ALSO REQUIRES revoked_at IS NULL, and that clause is the one that was
+// missing. Everything above this line is a *race* guard: two redemptions of one
+// live token. This one is a *revocation* guard, and no amount of checking in the
+// caller can replace it, because the caller read the row before an admin could
+// have withdrawn it. The window between InvitationByToken and this statement is
+// a transaction, not a fiction: a revocation landing inside it would otherwise
+// be silently overwritten by the redemption, and the admin who pressed the button
+// would be told it worked.
+//
+// This is the second half of an invariant migration 00013 states as already
+// closed. That comment says RevokePendingInvitation "already makes the two
+// mutually exclusive by requiring accepted_at IS NULL, and that is the one place
+// it can be enforced atomically" — which protects in one direction only. It
+// stops a *revocation* from landing on a redeemed invitation. It never stopped a
+// *redemption* from landing on a revoked one. The migration file is left alone,
+// because it is applied and editing an applied migration is a silent no-op for
+// every database that has already run it, but the invariant it describes is half
+// a sentence short of the truth and the other half is right here.
 func (s *Store) MarkInvitationAccepted(ctx context.Context, q db.Querier, invitationID id.UUID, at time.Time) error {
 	if invitationID.IsZero() {
 		return ErrInvitationNotFound
@@ -495,14 +528,32 @@ func (s *Store) MarkInvitationAccepted(ctx context.Context, q db.Querier, invita
 
 	tag, err := q.Exec(ctx,
 		`UPDATE account_invitations SET accepted_at = $2, updated_at = now()
-		 WHERE id = $1 AND accepted_at IS NULL`,
+		 WHERE id = $1 AND accepted_at IS NULL AND revoked_at IS NULL`,
 		invitationID, at)
 	if err != nil {
 		return fmt.Errorf("marking an invitation accepted: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		// Either the invitation is gone or somebody else got there first. Both
-		// mean this redemption did not happen.
+		// Zero rows now has three causes and they answer differently, so it is
+		// worth the primary-key lookup to tell them apart: the row is gone,
+		// somebody else redeemed it first, or an admin withdrew it while this
+		// transaction was open. Collapsing the third into the first two would
+		// answer 410 "already accepted" for an invitation nobody accepted.
+		var revoked bool
+		row := q.QueryRow(ctx,
+			`SELECT revoked_at IS NOT NULL FROM account_invitations WHERE id = $1`,
+			invitationID)
+		if err := row.Scan(&revoked); err != nil {
+			if errors.Is(err, errNoRows) {
+				// Gone. The same answer as a redemption that lost the race, and
+				// the service maps both to the same status.
+				return ErrInvitationUsed
+			}
+			return fmt.Errorf("distinguishing a failed acceptance: %w", err)
+		}
+		if revoked {
+			return ErrInvitationRevoked
+		}
 		return ErrInvitationUsed
 	}
 	return nil
@@ -631,7 +682,8 @@ func scanMembership(row interface{ Scan(...any) error }) (Membership, error) {
 func scanInvitation(row interface{ Scan(...any) error }) (Invitation, error) {
 	var inv Invitation
 	err := row.Scan(&inv.ID, &inv.AccountID, &inv.Email, &inv.Role, &inv.TokenDigest,
-		&inv.ExpiresAt, &inv.AcceptedAt, &inv.InvitedBy, &inv.CreatedAt, &inv.UpdatedAt)
+		&inv.ExpiresAt, &inv.AcceptedAt, &inv.RevokedAt, &inv.InvitedBy,
+		&inv.CreatedAt, &inv.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, errNoRows) {
 			return Invitation{}, errNoRows

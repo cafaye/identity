@@ -6,6 +6,84 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed (packet identity-30: a revoked invitation no longer redeems)
+
+**A revoked invitation was a working credential.** An account's admin could
+withdraw an invitation — "we sent it to the wrong list, revoke it and send it
+again" — and the token in the withdrawn link still created the membership, still
+marked the invitation accepted, and still emitted `member.accepted`. Measured
+against a real Postgres before the fix: `Accepting a revoked invitation = <nil>`
+followed by `a refused redemption left 1 membership row(s) behind`.
+
+The cause was three omissions of the same column. `revoked_at` was not in
+`invitationColumns`, so `Invitation` had no field to check; `Accept` checked
+`AcceptedAt` and the expiry and nothing else; and `MarkInvitationAccepted`'s
+conditional UPDATE required only `accepted_at IS NULL`, which stops two
+redemptions racing each other and does nothing about a revocation.
+
+- **The fix has an in-memory half and an atomic one, and both are load-bearing
+  for a different reason.** `Accept` refuses a row whose `RevokedAt` is set, and
+  `MarkInvitationAccepted` additionally requires `revoked_at IS NULL`. The first
+  answers immediately and costs nothing; the second is the one that cannot be
+  checked anywhere else, because the caller read the row *before* an admin could
+  have withdrawn it, and that gap is a transaction rather than a fiction. With
+  only the second in place the revocation still cannot be overwritten; with only
+  the first, a revocation landing mid-transaction is silently lost and the admin
+  who pressed the button is told it worked.
+- **`MarkInvitationAccepted` now distinguishes three reasons for updating zero
+  rows**, with one primary-key lookup, because they answer differently: the row
+  is gone, somebody else redeemed it first (`ErrInvitationUsed` → 410), or an
+  admin withdrew it while the transaction was open (`ErrInvitationRevoked`). The
+  service maps that last one to `ErrInvitationNotFound` → **404**.
+- **404 is the status the contract already promised and the code did not
+  implement.** `openapi/v1.yaml`, on this route, says: "An invitation an admin
+  revoked is also 404 — it is not redeemable and there is nothing to redeem." The
+  handler has no `ErrInvitationRevoked` case of its own, and deliberately: one
+  place decides what a withdrawn token looks like from outside, so a second one
+  cannot disagree later. A distinct status would also tell whoever holds a stolen
+  token that the invitation was once real, which is the one thing an enumeration
+  of tokens is trying to extract.
+- **`InvitationByToken` still returns a revoked row, and that is on purpose.**
+  Filtering `revoked_at IS NULL` in the SELECT is the shorter fix and the wrong
+  one: it would make "withdrawn" indistinguishable from "never existed" to the
+  account's *own admin surface*, which is the one caller entitled to the
+  difference, and would hide the withdrawal from the audit trail rather than from
+  an attacker.
+- **Migration 00013's comment states a half-true invariant and is left alone.**
+  It says `RevokePendingInvitation` "already makes the two mutually exclusive by
+  requiring accepted_at IS NULL, and that is the one place it can be enforced
+  atomically" — true in one direction only. It stops a *revocation* from landing
+  on a redeemed invitation; it never stopped a *redemption* from landing on a
+  revoked one. Editing an applied migration is a silent no-op for every database
+  that already ran it, so the correction lives on `MarkInvitationAccepted`, where
+  the second half of the invariant actually is.
+- **Tests, and the proof that they are tests.** `TestAcceptIsRefusedAfterRevocation`
+  asserts three things, the third being that **no membership row was written** — a
+  refusal that returned the right error while leaving the write behind would pass
+  the first two and still be a bypass.
+  `TestMarkInvitationAcceptedRefusesARevokedRow` asserts the store-level clause
+  and reads the row back to prove it neither stamped `accepted_at` nor undid the
+  withdrawal. `TestAcceptInvitationAnswersTheDocumentedStatuses` covers all four
+  statuses `openapi/v1.yaml` documents for this route, which had **no** coverage
+  at all before — the route had a happy path and a contract.
+
+**Verified by reverting the fix, not by reading the diff.** With the three source
+files back at `828df16` and the new tests in place:
+
+```
+--- FAIL: TestAcceptIsRefusedAfterRevocation
+    Accepting a revoked invitation = <nil>, want ErrInvitationNotFound
+    a refused redemption left 1 membership row(s) behind
+--- FAIL: TestMarkInvitationAcceptedRefusesARevokedRow
+    MarkInvitationAccepted on a revoked row = <nil>, want ErrInvitationRevoked
+```
+
+An intermediate measurement worth recording: **removing only the in-memory check
+left both tests green.** The atomic clause alone is sufficient for correctness,
+which is a fact about the design rather than about the tests — and the reason the
+in-memory check is kept is that it fails closed without a database round trip,
+and reads as what it is to the next person.
+
 ### Changed (packet identity-29: identity serves no HTML, and the browser belongs to parlor)
 
 **`identity` renders no views, and never did — it rendered one page, and that

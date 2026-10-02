@@ -295,9 +295,16 @@ type Invitation struct {
 	// "never accepted" and "accepted at the epoch" are different answers and only
 	// one of them is true.
 	AcceptedAt *time.Time
-	InvitedBy  id.UUID
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// RevokedAt is nil until an admin withdraws the invitation, and this field is
+	// the whole reason the redemption path was broken until identity-30: a
+	// revoked invitation is deliberately still a row — kept so the audit trail can
+	// say "withdrawn" rather than "never existed" — which means a lookup that
+	// found the row has never been evidence that the token works. A pointer for
+	// the same reason as AcceptedAt.
+	RevokedAt *time.Time
+	InvitedBy id.UUID
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Slugify turns a human name into a storable slug.
