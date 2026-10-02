@@ -1,0 +1,102 @@
+version: 1
+service: identity
+
+# PROBE FILE — NOT A DECLARATION, AND NOT NAMED tenancy.yml ON PURPOSE.
+#
+# identity-isolation-01 needed to know what core's checker says about a service
+# that HAS adopted kit's substrate, so the handoff could carry a measured blocker
+# rather than a predicted one. It measured this file's own contents, sitting at the
+# repository root under the name `tenancy.yml`, and the answer is in
+# HANDOFF-identity-isolation.md §"the blocker, measured".
+#
+# It is parked here instead so it cannot redden the fleet's gate: core's tenancy
+# check reads exactly `tenancy.yml` at the repository root, so a probe that sits
+# there failing 13 assertions is a permanent red for every service in the fleet.
+#
+# TO REPRODUCE THE MEASUREMENT:
+#
+#     cp tenancy.probe.yml tenancy.yml
+#     /Users/kaka/Code/any/moon/cafaye/core/harness/bin/tenancy-check .
+#     rm tenancy.yml
+#
+# Expect 13 failures and 1 warning, of which SEVEN are false negatives: the
+# database has row-level security enabled and FORCED on all five tables with all
+# twenty policies present, which pg_catalog and internal/tenancy both confirm at
+# run time, and core's scanner reports every one of them as absent because
+# `cafaye.protect_table` writes its DDL through `execute format(...)`.
+#
+# It enumerates one entry point with deliberately wrong line numbers, which is
+# what produces the scope-lost and denial-missing findings. Those six are the
+# probe working: they are what a real declaration has to get right, and they are
+# the reason writing the real file is more than an hour's work.
+accountScoped: true
+
+scope:
+  key: account_id
+  sources:
+    - migrations
+
+rls:
+  databaseEnforced: true
+  identity: cafaye.current_account_id()
+  sources:
+    - migrations
+  tables:
+    - table: account_audit_log
+      forced: true
+      policies:
+        - name: account_audit_log_cafaye_select
+          command: select
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 218
+        - name: account_audit_log_cafaye_insert
+          command: insert
+          clause: with check
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 218
+        - name: account_audit_log_cafaye_update
+          command: update
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 218
+        - name: account_audit_log_cafaye_delete
+          command: delete
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 218
+
+entryPoints:
+  - id: audit-log-list
+    operation: select
+    subject: account_audit_log
+    enforced:
+      mechanism: query-filter
+      file: internal/admin/store.go
+      line: 1
+    negative:
+      asserts: absent
+      cases:
+        - id: no-identity
+          asserts: absent
+          expects: nil
+          file: internal/tenancy/tenancy_test.go
+          line: 1
+        - id: other-account
+          asserts: absent
+          expects: nil
+          file: internal/tenancy/tenancy_test.go
+          line: 1
+        - id: own-account
+          asserts: present
+          expects: target
+          file: internal/tenancy/tenancy_test.go
+          line: 1

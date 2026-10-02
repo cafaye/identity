@@ -241,7 +241,25 @@ func TestTenancyIdentityOwnsItsFiveTables(t *testing.T) {
 		// The sweep is the question "is this service isolated?", and it answers for
 		// every table rather than the first, because a caller that gets rows can
 		// print them all.
-		rows, err := conn.Query(ctx, `select table_schema, table_name, why from cafaye.unprotected_tables()`)
+		//
+		// SCOPED TO public, and this is not a narrowing to make the assertion pass.
+		// `go test ./...` runs packages in parallel and internal/platform/dbtest
+		// gives every package that needs an empty database a PRIVATE schema named
+		// test_<hex>, built with LIKE ... INCLUDING ALL. LIKE does not copy
+		// row-level security, so every one of those clones carries an account_id
+		// column and no policies — and the sweep reports them, which is correct and
+		// is exactly what kit's README says it is for ("temporary tables are NOT
+		// excluded, and that is deliberate... a temp table with an account_id
+		// column and no policies is genuinely unprotected, it is exactly the shape
+		// a service's test fixture has").
+		//
+		// Measured before this was scoped, running the whole suite: 21 rows, every
+		// one of them another package's fixture schema. identity's own five tables
+		// are in `public`, and that is the schema this assertion is about.
+		rows, err := conn.Query(ctx, `
+			select table_schema, table_name, why
+			  from cafaye.unprotected_tables()
+			 where table_schema = 'public'`)
 		if err != nil {
 			t.Fatalf("running the sweep: %v", err)
 		}
@@ -258,7 +276,8 @@ func TestTenancyIdentityOwnsItsFiveTables(t *testing.T) {
 			t.Fatalf("iterate the sweep: %v", err)
 		}
 		if len(unprotected) > 0 {
-			t.Errorf("cafaye.unprotected_tables() found %d account-scoped table(s) with no boundary:\n  %s",
+			t.Errorf("cafaye.unprotected_tables() found %d account-scoped table(s) in public with "+
+				"no boundary - an account-scoped table that no policy covers:\n  %s",
 				len(unprotected), strings.Join(unprotected, "\n  "))
 		}
 	})
