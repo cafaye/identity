@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,17 +20,17 @@ import (
 	"github.com/cafaye/identity/internal/platform/id"
 )
 
-// THE OIDC LOGIN PAGE AND THE SECOND FACTOR.
+// THE OIDC LOGIN INTERACTION AND THE SECOND FACTOR.
 //
-// This page is a LOGIN, so the packet's central rule applies to it exactly as it
+// This is a LOGIN, so the packet's central rule applies to it exactly as it
 // applies to POST /v1/session: a correct password must not complete an
-// authorization request for an account with a second factor. A page that quietly
-// completed the flow would be the worst bug this service could have — invisible,
-// affecting every MFA user of every product, and MFA off in practice while on in
-// the database.
+// authorization request for an account with a second factor. A handler that
+// quietly completed the flow would be the worst bug this service could have —
+// invisible, affecting every MFA user of every product, and MFA off in practice
+// while on in the database.
 //
 // So most of what follows asserts what does NOT happen on the password step: no
-// code minted, no session cookie, no redirect.
+// code minted, no session cookie, and the step the browser is sent to.
 //
 // THE CLOCK IS THE FAKE ONE HERE AND THE SYSTEM ONE in oidc_integration_test.go,
 // deliberately and for the reason that file's header states: an id_token's expiry
@@ -38,6 +39,9 @@ import (
 // timing is about a code that is valid for thirty seconds and a lock that lasts
 // fifteen minutes — neither of which a test can wait for and both of which a fake
 // clock states exactly.
+//
+// THE LOGIN UI IS A DIFFERENT ORIGIN here, as it is in every other fixture in this
+// package, and that is the point of the whole packet.
 
 // oidcMFAFixture is a registered relying party, a user, and a login page, with the
 // whole MFA surface mounted.
@@ -67,7 +71,11 @@ func newOIDCMFAFixture(t *testing.T, withMFA bool) *oidcMFAFixture {
 	store := oidc.NewStore(pool)
 	storage := oidc.NewStorage(store, oidc.NewProfileReader(), key, clock.System{},
 		db.Direct{Pool: pool}, oidc.PathLogin)
-	provider, err := oidc.NewProvider(oidc.Config{Issuer: oidcTestIssuer, SigningKey: key}, storage)
+	provider, err := oidc.NewProvider(oidc.Config{
+		Issuer:     oidcTestIssuer,
+		SigningKey: key,
+		LoginUIURL: oidcTestLoginUI,
+	}, storage)
 	if err != nil {
 		t.Fatalf("building the provider: %v", err)
 	}
@@ -174,16 +182,16 @@ func (f *oidcMFAFixture) send(t *testing.T, method, target, body string, form ur
 	return rec
 }
 
-// loginPage opens the login form and drops the session cookie, so the form is
-// rendered rather than skipped. A browser on this page is signed out, or they would
-// not be here.
+// loginPage opens the login interaction and drops the session cookie, so the
+// browser is sent to the login UI rather than through the silent path. A browser
+// on this step is signed out, or they would not be here.
 func (f *oidcMFAFixture) loginPage(t *testing.T) *httptest.ResponseRecorder {
 	t.Helper()
 	delete(f.jar.cookies, SessionCookieName)
 	return f.send(t, http.MethodGet, oidc.PathLogin+"/"+f.requestID, "", nil)
 }
 
-// submit posts a form to the login page with the cookies the GET set.
+// submit posts a form to the login endpoint with the cookies the GET set.
 func (f *oidcMFAFixture) submit(t *testing.T, form url.Values) *httptest.ResponseRecorder {
 	t.Helper()
 	return f.send(t, http.MethodPost, oidc.PathLogin+"/"+f.requestID, "", form)
@@ -196,36 +204,58 @@ func (f *oidcMFAFixture) signIn(t *testing.T) *httptest.ResponseRecorder {
 
 	page := f.loginPage(t)
 	form := url.Values{
-		"state":    {stateFromForm(t, page)},
+		"state":    {stateFromRedirect(t, page)},
 		"email":    {f.email},
 		"password": {oidcTestPassword},
 	}
 	return f.submit(t, form)
 }
 
-// presentCode is the challenge step, with the state the challenge form re-minted.
-func (f *oidcMFAFixture) presentCode(t *testing.T, fromChallengeForm *httptest.ResponseRecorder, code string) *httptest.ResponseRecorder {
+// presentCode is the challenge step, with the state the challenge redirect
+// re-minted.
+func (f *oidcMFAFixture) presentCode(t *testing.T, fromChallengeStep *httptest.ResponseRecorder, code string) *httptest.ResponseRecorder {
 	t.Helper()
-	return f.submit(t, url.Values{"state": {stateFromForm(t, fromChallengeForm)}, "code": {code}})
+	return f.submit(t, url.Values{"state": {stateFromRedirect(t, fromChallengeStep)}, "code": {code}})
 }
 
 func (f *oidcMFAFixture) advance(d time.Duration) { f.clock.Advance(d) }
 
-// stateFromForm pulls the sealed state out of a rendered page, which is the only
-// place it appears.
-func stateFromForm(t *testing.T, rec *httptest.ResponseRecorder) string {
+// stateFromRedirect pulls the sealed state out of a redirect to the login UI,
+// which is the only place it appears now.
+func stateFromRedirect(t *testing.T, rec *httptest.ResponseRecorder) string {
 	t.Helper()
-	const marker = `name="state" value="`
-	idx := strings.Index(rec.Body.String(), marker)
-	if idx < 0 {
-		t.Fatalf("the page carries no state field:\n%s", rec.Body)
+
+	location := rec.Header().Get("Location")
+	if location == "" {
+		t.Fatalf("the response carried no Location; it was %d with body:\n%s", rec.Code, rec.Body)
 	}
-	rest := rec.Body.String()[idx+len(marker):]
-	end := strings.Index(rest, `"`)
-	if end < 0 {
-		t.Fatalf("the state field is unterminated:\n%s", rec.Body)
+	parsed, err := url.Parse(location)
+	if err != nil {
+		t.Fatalf("the redirect %q is not a URL: %v", location, err)
 	}
-	return rest[:end]
+	state := parsed.Query().Get(oidc.LoginParamState)
+	if state == "" {
+		t.Fatalf("the redirect %q carried no %q", location, oidc.LoginParamState)
+	}
+	return state
+}
+
+// redirectQuery is the parsed query of a redirect, for the step assertions.
+func redirectQuery(t *testing.T, rec *httptest.ResponseRecorder) url.Values {
+	t.Helper()
+
+	location := rec.Header().Get("Location")
+	if location == "" {
+		t.Fatalf("the response carried no Location; it was %d with body:\n%s", rec.Code, rec.Body)
+	}
+	parsed, err := url.Parse(location)
+	if err != nil {
+		t.Fatalf("the redirect %q is not a URL: %v", location, err)
+	}
+	if got := parsed.Scheme + "://" + parsed.Host + parsed.Path; got != oidcTestLoginUI {
+		t.Fatalf("the browser was sent to %q, want the configured login UI %q", got, oidcTestLoginUI)
+	}
+	return parsed.Query()
 }
 
 // seedAuthRequest stores one authorization request, the way /oidc/authorize does, so
@@ -262,43 +292,64 @@ func seedAuthRequest(t *testing.T, pool *pgxpool.Pool, store *oidc.Store, client
 // the password step
 // ---------------------------------------------------------------------------
 
-// TestTheOIDCLoginPageChallengesAnMFAUser is the composition: the password step
-// renders a code form, mints no code, and sets no session.
-func TestTheOIDCLoginPageChallengesAnMFAUser(t *testing.T) {
+// TestTheOIDCLoginInteractionChallengesAnMFAUser is the composition: the password
+// step sends the browser to the CODE step, mints no code, and sets no session.
+//
+// THE `step` PARAMETER IS THE ASSERTION HERE, and it is worth saying why it is
+// load-bearing rather than a detail. Before this packet the page rendered a code
+// box and the test looked for `name="code"` in the body. Now there is no body, and
+// the only thing that tells the login UI to render the code box instead of the
+// password box is that parameter — so a handler that got the password right and
+// then said `step=password` would pass every other test in this file and produce a
+// sign-in that asks for the password forever.
+func TestTheOIDCLoginInteractionChallengesAnMFAUser(t *testing.T) {
 	f := newOIDCMFAFixture(t, true)
 
 	rec := f.signIn(t)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("the password step = %d, want 200 (the challenge form); body:\n%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("the password step = %d, want 302 to the login UI; body:\n%s", rec.Code, rec.Body)
 	}
-	body := rec.Body.String()
-	if !strings.Contains(body, `name="code"`) {
-		t.Errorf("the password step did not render a code field:\n%s", body)
+	query := redirectQuery(t, rec)
+	if got := query.Get(oidc.LoginParamStep); got != oidc.LoginStepChallenge {
+		t.Errorf("%s = %q, want %q; a login UI rendering the password box again is a "+
+			"sign-in that can never be finished", oidc.LoginParamStep, got, oidc.LoginStepChallenge)
 	}
-	if strings.Contains(body, `name="password"`) {
-		t.Errorf("the password step still asks for a password after the password was accepted:\n%s", body)
+	if got := query.Get(oidc.LoginParamError); got != "" {
+		t.Errorf("the password step reported %s = %q; a correct password is not a failure",
+			oidc.LoginParamError, got)
 	}
 	if cookie := cookieNamed(rec, SessionCookieName); cookie != nil && cookie.Value != "" {
 		t.Error("the password step set a session cookie for an account with a second factor")
 	}
-	if rec.Code >= 300 && rec.Code < 400 {
-		t.Errorf("the password step redirected (Location: %q), which means an authorization code was minted",
+	// Not a redirect to the PRODUCT either. A code on the Location would mean the
+	// flow completed, and this is the assertion that a correct password does not
+	// complete it.
+	if strings.Contains(rec.Header().Get("Location"), oidcTestRedirect) {
+		t.Errorf("the password step redirected to the product (%q), which means an "+
+			"authorization code was minted for an account with a second factor",
 			rec.Header().Get("Location"))
 	}
-	// The challenge has to survive to the next request, or the page cannot be
-	// finished at all.
-	if cookie := cookieNamed(rec, "__Host-oidc-mfa-"+f.requestID); cookie == nil || cookie.Value == "" {
-		t.Errorf("the password step kept no challenge cookie; cookies: %v", rec.Result().Cookies())
+	// The challenge has to survive to the next request, or the interaction cannot
+	// be finished at all. It is a cookie rather than something in the query, and
+	// oidcInteractionSameSite is why that is still true across a cross-site POST.
+	challenge := cookieNamed(rec, OIDCChallengeCookiePrefix+f.requestID)
+	if challenge == nil || challenge.Value == "" {
+		t.Errorf("the password step kept no challenge cookie; cookies: %v", cookieNames(rec.Result().Cookies()))
+	} else if challenge.SameSite != http.SameSiteNoneMode {
+		t.Errorf("the challenge cookie is SameSite=%v; the code form is a cross-site POST "+
+			"and a Lax cookie is not sent on one", challenge.SameSite)
 	}
 	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
 		t.Errorf("Cache-Control = %q, want no-store", got)
 	}
 }
 
-// TestTheOIDCLoginPageSignsInAnAccountWithNoSecondFactor is the compatibility half:
-// a user with no MFA gets exactly the behaviour the page had before this packet.
-func TestTheOIDCLoginPageSignsInAnAccountWithNoSecondFactor(t *testing.T) {
+// TestTheOIDCLoginInteractionSignsInAnAccountWithNoSecondFactor is the
+// compatibility half: a user with no MFA gets exactly the behaviour the page had
+// before this packet, and the redirect goes to the PRODUCT rather than to the
+// login UI.
+func TestTheOIDCLoginInteractionSignsInAnAccountWithNoSecondFactor(t *testing.T) {
 	f := newOIDCMFAFixture(t, false)
 
 	rec := f.signIn(t)
@@ -368,87 +419,168 @@ func TestTheOIDCChallengeStepAcceptsARecoveryCode(t *testing.T) {
 }
 
 // TestTheOIDCChallengeStepRefusesAWrongCode says the same thing whatever went
-// wrong, so the page is not an oracle for which part was right.
+// wrong, so the interaction is not an oracle for which part was right.
+//
+// THE ASSERTION IS THE STEP, and it is the same assertion the page's own markup
+// used to give: a refused code sends the browser back to the CODE step, so the
+// user can type the next one. A handler that answered `step=password` here would
+// be refused in a way the user cannot retry.
 func TestTheOIDCChallengeStepRefusesAWrongCode(t *testing.T) {
 	f := newOIDCMFAFixture(t, true)
-	challengeForm := f.signIn(t)
+	challengeStep := f.signIn(t)
 
-	rec := f.presentCode(t, challengeForm, "000000")
+	rec := f.presentCode(t, challengeStep, "000000")
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("a wrong code = %d, want 401; body:\n%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("a wrong code = %d, want 302 back to the login UI; body:\n%s", rec.Code, rec.Body)
 	}
-	if !strings.Contains(rec.Body.String(), `name="code"`) {
-		t.Errorf("a wrong code did not re-render the code form:\n%s", rec.Body)
+	query := redirectQuery(t, rec)
+	if got := query.Get(oidc.LoginParamStep); got != oidc.LoginStepChallenge {
+		t.Errorf("%s = %q, want %q: a refused code has to send the user back to the code "+
+			"box, not the password box", oidc.LoginParamStep, got, oidc.LoginStepChallenge)
+	}
+	if got := query.Get(oidc.LoginParamError); got != oidc.LoginErrorChallengeRejected {
+		t.Errorf("%s = %q, want %q", oidc.LoginParamError, got, oidc.LoginErrorChallengeRejected)
+	}
+	if query.Get(oidc.LoginParamErrorDetail) == "" {
+		t.Error("the refusal carried no sentence; the user is told a code failed and not why")
 	}
 	if cookie := cookieNamed(rec, SessionCookieName); cookie != nil && cookie.Value != "" {
 		t.Error("a wrong code set a session cookie")
 	}
-	if rec.Code >= 300 && rec.Code < 400 {
-		t.Error("a wrong code redirected, which means an authorization code was minted")
+	// THE CHALLENGE SURVIVES, and the assertion is the SECOND attempt rather than
+	// the presence of a cookie on this response, because that is the direction that
+	// matters: a challenge spent per attempt would reset internal/mfa's per-factor
+	// counter on every try, the lockout would never trip, and a six-digit code
+	// would be guessable at the rate of the HTTP round trip.
+	//
+	// It is a wrong code again rather than a right one, so the assertion is not
+	// circular: were the challenge gone, the second POST would be answered
+	// `interaction_expired` on the PASSWORD step and this would be a redirect with
+	// no code on it.
+	second := f.presentCode(t, rec, "000000")
+	if second.Code != http.StatusFound {
+		t.Fatalf("a second wrong code = %d, want 302 back to the login UI; body:\n%s",
+			second.Code, second.Body)
+	}
+	again := redirectQuery(t, second)
+	if got := again.Get(oidc.LoginParamError); got != oidc.LoginErrorChallengeRejected {
+		t.Errorf("the second wrong code answered %s = %q, want %q; the first one spent the "+
+			"challenge, which resets the per-factor lockout on every attempt",
+			oidc.LoginParamError, got, oidc.LoginErrorChallengeRejected)
+	}
+	if got := again.Get(oidc.LoginParamStep); got != oidc.LoginStepChallenge {
+		t.Errorf("the second wrong code landed on %s = %q, want %q", oidc.LoginParamStep,
+			got, oidc.LoginStepChallenge)
+	}
+	if strings.Contains(rec.Header().Get("Location"), oidcTestRedirect) {
+		t.Errorf("a wrong code redirected to the product, which means an authorization code "+
+			"was minted: %s", rec.Header().Get("Location"))
 	}
 }
 
 // TestTheOIDCChallengeStepRefusesAReplay: the same protection the JSON surface has,
-// through the page.
+// through the interaction.
 func TestTheOIDCChallengeStepRefusesAReplay(t *testing.T) {
 	f := newOIDCMFAFixture(t, true)
 
-	challengeForm := f.signIn(t)
+	challengeStep := f.signIn(t)
 	f.advance(mfa.Period + time.Second)
 	captured := mustTOTPCode(t, f.secret, f.clock.Now())
 
-	if rec := f.presentCode(t, challengeForm, captured); rec.Code < 300 || rec.Code >= 400 {
+	if rec := f.presentCode(t, challengeStep, captured); rec.Code < 300 || rec.Code >= 400 {
 		t.Fatalf("the first use = %d, want a redirect; body:\n%s", rec.Code, rec.Body)
 	}
 
 	// A fresh login, then the same code.
 	second := f.signIn(t)
 	rec := f.presentCode(t, second, captured)
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("a replayed code = %d, want 401; body:\n%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusFound {
+		t.Errorf("a replayed code = %d, want 302 back to the login UI; body:\n%s", rec.Code, rec.Body)
 	}
-	if rec.Code >= 300 && rec.Code < 400 {
-		t.Error("a replayed code redirected, which means an authorization code was minted")
+	query := redirectQuery(t, rec)
+	if got := query.Get(oidc.LoginParamError); got != oidc.LoginErrorChallengeRejected {
+		t.Errorf("%s = %q, want %q", oidc.LoginParamError, got, oidc.LoginErrorChallengeRejected)
+	}
+	if strings.Contains(rec.Header().Get("Location"), oidcTestRedirect) {
+		t.Error("a replayed code redirected to the product, which means an authorization " +
+			"code was minted")
 	}
 }
 
-// TestTheOIDCChallengeStepWithoutAChallengeIs401: a POST with a code and no cookie is
-// not a login, it is a guess.
-func TestTheOIDCChallengeStepWithoutAChallengeIs401(t *testing.T) {
+// TestTheOIDCChallengeStepWithoutAChallengeGoesBackToThePasswordStep: a POST with a
+// code and no cookie is not a login, it is a guess — and the answer is the
+// password step, because there is no challenge left to answer.
+func TestTheOIDCChallengeStepWithoutAChallengeGoesBackToThePasswordStep(t *testing.T) {
 	f := newOIDCMFAFixture(t, true)
 	// A FRESH GET for a valid sealed state, and then the challenge cookie is thrown
 	// away — which is a browser that opened the form and lost the challenge, and is
 	// the case worth testing. Using a stale state instead would be answered by the
 	// CSRF check first, which is a different test with a different answer.
 	page := f.loginPage(t)
-	delete(f.jar.cookies, "__Host-oidc-mfa-"+f.requestID)
+	delete(f.jar.cookies, OIDCChallengeCookiePrefix+f.requestID)
 
-	rec := f.submit(t, url.Values{"state": {stateFromForm(t, page)}, "code": {"123456"}})
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("a code with no challenge = %d, want 401; body:\n%s", rec.Code, rec.Body)
+	rec := f.submit(t, url.Values{"state": {stateFromRedirect(t, page)}, "code": {"123456"}})
+	if rec.Code != http.StatusFound {
+		t.Fatalf("a code with no challenge = %d, want 302 back to the login UI; body:\n%s", rec.Code, rec.Body)
+	}
+	query := redirectQuery(t, rec)
+	if got := query.Get(oidc.LoginParamError); got != oidc.LoginErrorInteractionExpired {
+		t.Errorf("%s = %q, want %q", oidc.LoginParamError, got, oidc.LoginErrorInteractionExpired)
+	}
+	// The PASSWORD step, and this is the assertion worth having: a challenge that
+	// is gone cannot be answered, so sending the user back to a code box would be a
+	// sign-in that can never complete.
+	if got := query.Get(oidc.LoginParamStep); got != oidc.LoginStepPassword {
+		t.Errorf("%s = %q, want %q", oidc.LoginParamStep, got, oidc.LoginStepPassword)
 	}
 }
 
-// TestTheOIDCChallengeStepLockoutIs423 is the per-factor lockout seen from a page,
-// which is where a user actually meets it.
-func TestTheOIDCChallengeStepLockoutIs423(t *testing.T) {
+// TestTheOIDCChallengeStepLockoutCarriesItsWaitToTheLoginUI is the per-factor
+// lockout seen from the sign-in form, which is where a user actually meets it — and
+// the `retry_after` is the whole point of the assertion.
+//
+// THE 423 BECAME A 302 CARRYING A NUMBER, and the reason is that a browser
+// following a redirect does not read a `Retry-After` header. Before this packet the
+// wait was rendered into the page as "Too many attempts. Try again in 15m."; now it
+// has to cross an origin boundary as data, and a lockout whose wait the UI cannot
+// see is a lockout the user experiences as a frozen page that will keep failing.
+func TestTheOIDCChallengeStepLockoutCarriesItsWaitToTheLoginUI(t *testing.T) {
 	f := newOIDCMFAFixture(t, true)
 
 	for range 5 {
-		form := f.signIn(t)
-		if rec := f.presentCode(t, form, "000000"); rec.Code != http.StatusUnauthorized {
-			t.Fatalf("a wrong code = %d, want 401", rec.Code)
+		step := f.signIn(t)
+		if rec := f.presentCode(t, step, "000000"); rec.Code != http.StatusFound {
+			t.Fatalf("a wrong code = %d, want 302 back to the login UI", rec.Code)
 		}
 	}
 
-	form := f.signIn(t)
-	rec := f.presentCode(t, form, "000000")
-	if rec.Code != http.StatusLocked {
-		t.Fatalf("the attempt past the threshold = %d, want 423; body:\n%s", rec.Code, rec.Body)
+	step := f.signIn(t)
+	rec := f.presentCode(t, step, "000000")
+	if rec.Code != http.StatusFound {
+		t.Fatalf("the attempt past the threshold = %d, want 302 back to the login UI; body:\n%s",
+			rec.Code, rec.Body)
 	}
-	if !strings.Contains(rec.Body.String(), "Too many attempts") {
-		t.Errorf("the 423 does not say what happened:\n%s", rec.Body)
+	query := redirectQuery(t, rec)
+	if got := query.Get(oidc.LoginParamError); got != oidc.LoginErrorAccountLocked {
+		t.Errorf("%s = %q, want %q", oidc.LoginParamError, got, oidc.LoginErrorAccountLocked)
+	}
+	if got := query.Get(oidc.LoginParamStep); got != oidc.LoginStepChallenge {
+		t.Errorf("%s = %q, want %q; the lockout is on the second factor, so the user is "+
+			"still on the code step", oidc.LoginParamStep, got, oidc.LoginStepChallenge)
+	}
+	if query.Get(oidc.LoginParamErrorDetail) == "" {
+		t.Error("the lockout carried no sentence")
+	}
+	// THE WAIT. Absent, this is a lockout the user experiences as a page that will
+	// keep failing, and it is the one piece of the old 423 that could not simply
+	// disappear.
+	wait := query.Get(oidc.LoginParamRetryAfter)
+	if wait == "" {
+		t.Errorf("the lockout carried no %s; the user is not told how long to wait",
+			oidc.LoginParamRetryAfter)
+	} else if seconds, err := strconv.Atoi(wait); err != nil || seconds <= 0 {
+		t.Errorf("%s = %q, want a positive whole number of seconds", oidc.LoginParamRetryAfter, wait)
 	}
 	if cookie := cookieNamed(rec, SessionCookieName); cookie != nil && cookie.Value != "" {
 		t.Error("a locked second factor produced a session")

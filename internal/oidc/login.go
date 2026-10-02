@@ -22,18 +22,24 @@ import (
 // spelling of it would be a second answer to where the redirect goes.
 const PathAuthorizeCallback = PathAuthorize + "/callback"
 
-// LoginBanner is what the login page renders before anybody has typed anything.
+// LoginBanner is what the login UI needs to render a step, before anybody has
+// typed anything.
 //
-// The product's name is the load-bearing field. A login page that cannot say
+// The product's name is the load-bearing field. A login form that cannot say
 // which application is asking for a password is the setup for a credential
-// phishing page hosted on this service's own domain, and the `client_id` cannot
-// do the job: it is 43 characters of base64url chosen for entropy, so displaying
-// it tells a user nothing they could recognise or check against the product they
-// meant to sign in to.
+// phishing page, and the `client_id` cannot do the job: it is 43 characters of
+// base64url chosen for entropy, so displaying it tells a user nothing they could
+// recognise or check against the product they meant to sign in to.
+//
+// IT TRAVELS IN THE REDIRECT NOW, not in a page this service renders, and that
+// is why the comment above the field says the login UI must escape it: see
+// loginui.go. A page on this service's own origin could escape it by
+// construction, and a page on somebody else's cannot be escaped here.
 type LoginBanner struct {
 	// RequestID names the authorization request this login completes.
 	RequestID string
-	// ClientName is the registration's display name.
+	// ClientName is the registration's display name. UNTRUSTED TEXT: it is
+	// whatever an account owner typed into a registration.
 	ClientName string
 	// LoginHint is the `login_hint` the client sent, if any. It pre-fills the
 	// form and is never trusted: it is a string a third party chose, and the
@@ -41,7 +47,7 @@ type LoginBanner struct {
 	LoginHint string
 }
 
-// LoginBanner returns what the login page needs for a request id.
+// LoginBanner returns what the login UI needs for a request id.
 //
 // An unknown or expired id is ErrAuthRequestNotFound, and the handler answers 404
 // with it. The id arrived in a URL, so the two cases — never existed, and

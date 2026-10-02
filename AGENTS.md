@@ -185,8 +185,54 @@ parse a problem document, and interop with one is the entire point of the
 surface. The same reason there are two OpenAPI documents: core puts every path
 under one `/v1` prefix and RFC 8414 fixes discovery at
 `/.well-known/openid-configuration`. A handler under `/oidc/*` that reaches for
-`problemFor` is a bug unless it is the login page or one of the four
-pre-checks.
+`problemFor` is a bug unless it is the sign-in interaction's four unre-showable
+refusals or one of the four pre-checks.
+
+**`identity` renders no HTML, and that is a rule with three checks behind it.**
+There is no view, no template and no page in this repository. The sign-in form is
+served by `parlor`; `OIDC_LOGIN_UI_URL` says where, it is required, and a provider
+without it refuses to start. OpenID Connect Core §3.1.2.1 makes authenticating the
+end user part of an authorization server's job, so this is a rule about *where the
+page lives*, not about whether there is one — a deployment that removes the page
+without replacing it has an AS that cannot log a human in. The whole of the
+argument is [DECISIONS.md](DECISIONS.md) D10; the contract is
+`internal/oidc/loginui.go`, and the reasoning about the four security properties
+that had to survive the move is in `internal/httpapi/oidc.go`'s interaction
+section header.
+
+Three things follow, and each is a check rather than a preference:
+
+  * **The login hop stays on this origin.** `protocolClient.LoginURL` returns
+    `PathLogin + "/" + requestID`, never the configured address, and the handler
+    on that path is where "is this browser signed in, did *it* start this flow"
+    is decided. Pointing `LoginURL` straight at the login UI would move an
+    authorization decision to a page on another origin, and would make the
+    login-CSRF refusal a decision made somewhere else. `oidc_browser_binding_test.go`
+    is the file that holds that line, and it survived the move of the form out on
+    purpose.
+  * **A refusal the login UI could render is a `302`, not a status.** A wrong
+    password, an empty form, a refused code and a lockout all redirect back
+    carrying `error`, `error_detail` and — for a lockout — `retry_after`, on a
+    FRESH `state`. The four that cannot be re-shown are problem documents: no
+    request id, no parseable body, no flow cookie, or a server error. Silently
+    dropping a failure message is the defect this rule exists to prevent; so is
+    moving a `retry_after` into a header, because a browser following a redirect
+    does not read headers.
+  * **`http.Redirect` is wrong here and the reason is not taste.** It writes a
+    one-line HTML anchor body and `Content-Type: text/html; charset=utf-8`,
+    because RFC 9110 §15.4 recommends it for a user agent that cannot follow a
+    redirect, and this service has no such user agent. `oidcRedirect` and
+    `delegateOIDC` write the status and the headers themselves, and
+    `TestTheLoginRedirectCarriesNoBodyAndTheTwoHeadersThatEarnedTheirPlace` and
+    `TestTheAuthorizeRedirectCarriesNoBody` hold them to that — the second one
+    exists because `delegateOIDC` was copying the library's headers and answering
+    an empty body with an HTML content type.
+
+`client_name` and `login_hint` are **untrusted text** in that redirect: the first
+is a row an account owner typed and the second is a string the client chose, and
+the login UI must escape both. `TestLoginRedirectEscapesWhatTravelsInIt` holds this
+side of it. Do not add an `html/template` import to "just render the error" — the
+error is carried as data, and the caller of that code is another repository.
 
 **A protocol decision the library already makes is delegated, not restated.**
 `internal/oidc` implements `op.Storage` and `op.Client` and owns the data; it does

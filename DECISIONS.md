@@ -27,6 +27,7 @@ and its entry here is deleted; the number is never reused.**
 | [D6](#d6-the-generated-client-commits-a-dependency-that-md6-said-it-would-not) | the generated client commits a runtime dependency, which MD6 said it would not — and it takes the coverage floor | RULED, with MD6's stated REASON corrected: the client ships here, generated, and the dependency is paid for |
 | [D8](#d8-one-link-template-for-four-messages-and-what-the-deployment-inherits) | one link template served all four messages — so a verification mail's button opened the password-reset screen. What does the template a deployment already set now MEAN? | RULED: it is the DEFAULT for every purpose with no template of its own, so nothing breaks at boot, and a purpose with neither is refused by name at startup |
 | [D9](#d9-registration-publishes-that-an-address-is-taken-and-that-is-the-last-one) | `POST /v1/users` answers `409` for a taken address, so an unauthenticated caller can discover whether anybody has an account here. Is that disclosure accepted, or does registration change shape? | RULED for now: it is accepted, and it is named. Closing it is a decision about products, not about identity |
+| [D10](#d10-identity-renders-no-html-and-the-browser-belongs-to-parlor) | `identity` must not have its own views — the frontend belongs to `parlor`. But the page *is* the AS's user-agent interaction, and OpenID Connect Core §3.1.2.1 makes that part of the provider's job. Does the page move, and if so, what crosses the boundary and what does not? | RULED: it moves. identity keeps every authorization decision and hands the browser to a configured login UI. The contract is published in `internal/oidc/loginui.go` and `openid/openid.yaml` |
 
 ## D1: twelve served operations are in no document
 
@@ -976,3 +977,177 @@ under those prefixes is red until somebody has answered the question for it.
 `POST /v1/introspections` answers **yes on purpose** and says so in a test, because
 resolving a presented token is what an introspection endpoint is for; its protection is
 the credential the caller must present.
+
+## D10: identity renders no HTML, and the browser belongs to parlor
+
+**THE OWNER'S RULE** is that `identity` must not have its own views — all frontend
+is handled by `parlor`. `identity` violated it in exactly one place and it was easy
+to find: `internal/httpapi/oidc.go` carried an inline `html/template` literal of
+about thirty lines, the password step and the TOTP challenge step, rendered by
+`writeHTML`. There were no `.html`, `.tmpl` or `.gohtml` files anywhere in the
+repository, so that one literal was the whole of the frontend surface.
+
+**AND THE OBVIOUS MOVE IS THE WRONG ONE**, which is why this is a decision rather
+than a deletion. The page is not a settings screen. It is the OpenID Connect
+authorization server's **user-agent interaction** — the form a person fills in
+during an authorization-code flow — and OpenID Connect Core §3.1.2.1 makes
+authenticating the end user part of the AS's job while §3.1.2.6 is about the
+credentials themselves. **A provider that removes the page without replacing it is
+an authorization server that cannot log a human in**, and it would still publish a
+working discovery document saying that it can. So the page moves, and the work is
+in what crosses the boundary.
+
+**RULED: the decision stays here, the rendering does not.**
+
+| Stays in `identity` | Goes to the login UI |
+|---|---|
+| is this browser signed in, and did *it* start this flow | which form to render, and how it looks |
+| is this password correct, is the account locked | the product's name, as **untrusted text** |
+| the MFA challenge, and its per-factor lockout | autocomplete, inputmode, focus, everything a keyboard and a screen reader need |
+| the `__Host-session` cookie | nothing that is a credential |
+| minting the authorization code | — |
+| every refusal's `code`, and the sentence attached to it | how to *word* a refusal it has been given |
+
+### Why the browser takes the extra hop, rather than `/oidc/authorize` redirecting straight to the login UI
+
+The library asks the client implementation for a login URL, and
+`protocolClient.LoginURL` could have returned the configured address directly —
+one redirect fewer, and the obvious implementation. It returns
+`PathLogin + "/" + requestID` instead, and that hop buys three things:
+
+1. **Every question on it is a question about a credential.** Is this browser
+   signed in, did *it* start this flow, is this password correct, may a code be
+   minted. An authorization decision made by a page on another origin is not a
+   decision this service made.
+2. **No CORS, anywhere.** A login UI that has to ask identity a question about the
+   browser's session would need `Access-Control-Allow-Origin` on identity, and the
+   packet that forbids `Access-Control-Allow-Origin: *` still stands. The hop
+   removes the question rather than answering it across a boundary.
+3. **The login-CSRF refusal has one place to live.** D5's defence is a flow cookie
+   set at `/oidc/authorize` and required before any completion. On a hop owned by
+   this service that check is a top-level GET answered by a handler in the same
+   repository as the cookie. On the login UI's origin it would be a decision made
+   somewhere else, or not made at all.
+
+The silent path — a user who already has a session going straight through with a
+code, which is what makes signing in to a second product not require typing the
+same password twice — is on that hop, and so is the `403` that refuses a signed-in
+browser arriving with no flow cookie.
+
+### Why `OIDC_LOGIN_UI_URL` is required and has no default
+
+A default would have to be an address compiled into this binary, naming a service
+that shares no module and no release train with it. A compiled-in default that is
+wrong is wrong in every deployment at once, and a deployment that has to override
+it has to know it exists. So there is no default, and a block with an issuer, a key
+and no login UI **refuses to start** — a startup failure and not a degraded mode,
+for the reason the OIDC and courier blocks already are one: a provider that mounts
+and cannot complete a flow is worse than one that does not mount, because the
+failure is discovered by a user at a product rather than by an operator at boot.
+
+This breaks every deployment that boots today, and unlike [D8](#d8-one-link-template-for-four-messages-and-what-the-deployment-inherits)
+there is no backwards-compatible spelling of it: the page this change removes is
+the only one there was. That is accepted rather than papered over, because the
+alternative — a default that silently points at a form nobody wrote, or a mount
+that answers `503` — is strictly worse than a boot failure. The variable is named
+in the refusal, in the startup log line, and in the README's configuration table.
+
+### The two cookies became `SameSite=None`, and the argument
+
+The form is now a top-level cross-site POST from the login UI's origin to this
+one. A `SameSite=Lax` cookie is not sent on a cross-site POST, so the state cookie
+would not arrive and **every sign-in would be refused at the CSRF check**. This is
+not a subtle degradation; it is a login form that cannot be submitted.
+
+What it costs is a transport relaxation and not a binding one. `SameSite` governs
+*when* a cookie is sent; the property the state defends is that its value is
+unguessable and unreadable by any other origin, and that is `__Host-` (no
+`Domain`, so a subdomain takeover cannot write it) plus `HttpOnly` plus 32 bytes
+of `crypto/rand`. A request from an attacker's page now carries the cookie and
+cannot know what is in it, so `oauth.VerifyState` fails for every value the
+attacker chose — the same outcome `Lax` produced, by a different route. The flow
+cookie and the session cookie stay `Lax`, because neither is ever read on a
+cross-site POST: the flow cookie is read on a top-level GET (the one case `Lax`
+still permits) and the session cookie is only ever *set* on a top-level response.
+
+`TestTheInteractionCookiesAreNoneAndTheFlowAndSessionCookiesAreNot` holds all
+four, because a change to any one of them is invisible until a sign-in breaks.
+
+### A refusal a login UI could render is a redirect, not a status
+
+The `401` and the `423` used to be rendered into the page with an `Error` string.
+Silently dropping them would land a user on a blank form with no idea why their
+password failed, so they **travel**:
+
+    <OIDC_LOGIN_UI_URL>?request_id=…&state=…&step=…&error=…&error_detail=…&retry_after=…
+
+`error` is the contract and `error_detail` is a sentence for a person — the same
+split the problem envelope makes between `code` and `detail`, which is why the
+codes overlap the problem codes where they mean the same thing
+(`account_locked` is the same word, on purpose). The 423's wait travels as
+`retry_after` in whole seconds rather than in a `Retry-After` header, because **a
+browser following a `302` does not read headers** and a lockout the UI cannot
+render as a wait is a lockout the user experiences as a frozen page.
+
+The dividing line is whether the refusal can be re-shown. Four cannot, and are
+problem documents: a request id that does not exist (nothing to render, nothing
+to post back), a body that will not parse, a signed-in browser with no flow cookie
+(the D5 refusal, which must say "this sign-in was not started here"), and a server
+error (whose reader is an operator with the log, and `trace_id` is what they need).
+
+**The alternative that was rejected** is carrying only a `code` and letting the UI
+write its own sentence. It is a worse fit for this fleet than it looks: every
+refusal in this service is already one sentence for every way it can fail — see
+D9 and the challenge-step refusal, which deliberately does not say whether a code
+was mistyped, replayed or expired — and duplicating those sentences in a second
+repository is the defect `identity-26` and `identity-27` exist to prevent. Carrying
+both means the sentence has one home and the code has one home, and the UI can
+override the wording without the override being load-bearing.
+
+### What the login UI must do, which this repository cannot check
+
+`client_name` and `login_hint` are **untrusted text**. `client_name` is whatever an
+account owner typed into a registration and `login_hint` is whatever the client
+sent; both are percent-encoded here, and the login UI must escape them again on
+render. That was a real attack when the page was here — a registration called
+`<script>…</script>` ran a script on the login page for *every product* — and it is
+still a real attack, one repository over. Nothing in this repository can assert
+that the far side escapes, so the requirement is written into `openid/openid.yaml`
+and into `internal/oidc/loginui.go` where the escaping argument lives, and
+`TestLoginRedirectEscapesWhatTravelsInIt` holds this side of it.
+
+### The claim is checked, not asserted
+
+"Identity serves no HTML" is the kind of claim that decays, so it is three tests in
+`internal/platform/ci` — the package that guards the gate itself:
+
+- no `.html`, `.htm`, `.tmpl`, `.gohtml` or `.tpl` file is committed;
+- no Go file carries a markup string literal or imports `html/template`, with four
+  named allowances, each with its reason, and a **stale allowance is a failure**;
+- no response anywhere on the router answers with a `Content-Type` that names a
+  document, or with a body on a redirect.
+
+The third exists because of the mistake this packet was most likely to make, and
+it is worth naming: **`http.Redirect` is correct Go and it writes HTML.** It writes
+a one-line anchor body and `Content-Type: text/html; charset=utf-8`, because
+RFC 9110 §15.4 recommends it for a user agent that cannot follow a redirect. So
+`oidcRedirect` and `delegateOIDC` both write the status and the headers
+themselves, and the first red proof here was `oidcRedirect` replaced with
+`http.Redirect` — which the tests caught with a 210-byte anchor and a
+`Content-Type` header, and which then caught a *second* leak: `delegateOIDC` was
+copying the library's headers verbatim, so `/oidc/authorize` answered
+`Content-Type: text/html; charset=utf-8` with an empty body until it dropped
+`Content-Type` and `Content-Length` alongside the bytes.
+
+### What was NOT changed, deliberately
+
+- **No CORS headers.** Orthogonal to this packet; the prohibition stands.
+- **`PathLogin` is still this service's**, and `protocolClient.LoginURL` is still
+  the address the library redirects to. That is the hop.
+- **The password check, the MFA branch, the challenge token, the per-factor
+  lockout and the account lockout** all go through the same `internal/auth` calls
+  `POST /v1/session` makes. One credential store, one password check, one counter.
+- **The client-facing protocol is untouched.** `/oidc/authorize` still answers
+  `302`, the flow still ends at a `302` to the client's `redirect_uri` with a
+  `code`, and no discovery metadata changed. A browser flow is a browser flow and
+  the number of fields in a form is not part of the protocol.

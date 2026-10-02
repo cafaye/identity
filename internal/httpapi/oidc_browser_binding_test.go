@@ -10,7 +10,7 @@ package httpapi
 // with a session for the same user" is that the id happens to be unguessable.
 //
 // So an attacker who can get a signed-in user's browser to navigate to a login
-// URL THEY chose — a link in chat, a page they control, an <img>, anything that
+// URL THEY chose — a link in chat, a page they control, an image, anything that
 // issues a top-level GET — has that user's browser complete the attacker's
 // authorization request. The attacker registered the client, the attacker holds
 // the client secret, the attacker holds the PKCE verifier, and the redirect
@@ -27,17 +27,30 @@ package httpapi
 //
 // THE FIX is that the browser which is about to be redirected into the flow must
 // be able to prove it is the one the flow was handed to. The same
-// `__Host-`-prefixed, per-request-id cookie the password form already uses is
-// that proof: set it when the login page is rendered OR at the authorize step,
-// and require it before any completion — including the silent one.
+// `__Host-`-prefixed, per-request-id cookie the interaction already uses is that
+// proof: set it when the login step begins OR at the authorize step, and require
+// it before any completion — including the silent one.
 //
 // NO SECRET IS PRINTED. The fixture mints a real client secret and real codes;
 // nothing here renders one. Assertions are on status codes, on the presence of a
 // `code`, and on the `sub` of a verified token.
+//
+// # THIS FILE SURVIVED THE MOVE OF THE FORM OUT, AND THE REASON MATTERS
+//
+// The obvious worry is that a login form on another origin makes the attack
+// easier: the attacker's page is not even needed, the victim is simply sent to a
+// page that asks for a password. It does not, and the test below is the proof —
+// the answer to the attacker's link is still a 403 for a signed-in browser, because
+// the flow cookie is a `SameSite=Lax` cookie and a top-level GET is the ONE case
+// Lax still permits, and because a Lax cookie is a cookie the attacker's origin
+// cannot WRITE. The two interaction cookies did have to become `SameSite=None` to
+// survive the cross-site POST (see oidcInteractionSameSite), and they are not the
+// ones this defence rests on.
 
 import (
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/cafaye/identity/internal/oidc"
@@ -96,18 +109,24 @@ func hasPrefixPath(got, prefix string) bool {
 // start it.
 //
 // THE ASSERTION. The victim's browser holds a live session and NOTHING ELSE —
-// no state cookie for this request id, because the victim's browser never
-// rendered the login page for it. It follows the attacker's login URL.
+// no flow cookie, because the victim's browser never began this flow. It follows
+// the attacker's login URL.
 //
 // Today that is answered with a 302 carrying a `code` to the attacker's
-// registered redirect_uri. The fix answers it with something that is not a code:
-// either the login form (so the victim authenticates for a flow they did not
-// start, and the attacker's client sees the account the victim chose to sign
-// in with) or a refusal.
+// registered redirect_uri. The fix answers it with something that is not a code.
 //
-// What is NOT asserted here is that the attack then succeeds end-to-end; that is
-// the follow-up test below. This one asserts the narrower and more fundamental
-// property: a completion happens without proof the browser started the flow.
+// THE TWO HONEST ANSWERS ARE NOW SPELLED OUT rather than logged, because the
+// third one this test used to tolerate is gone and its disappearance is worth
+// asserting: with a form on another origin, "200 with a form" is no longer a
+// possible answer, and a handler that rendered a page would be a violation of the
+// thing this packet is about as well as a security defect. So:
+//
+//	403                    a problem document: this browser cannot prove it started
+//	                        this flow. THE EXPECTED ANSWER for a signed-in browser.
+//	302 to the login UI    the victim is signed OUT, so there is nothing to
+//	                        complete silently and the interaction has to start.
+//	302 to the product     the silent path, which requires a flow cookie this
+//	                        browser does not have. NEVER acceptable.
 func TestAnAuthorizationRequestIsNotSpendableByABrowserThatDidNotStartIt(t *testing.T) {
 	t.Parallel()
 
@@ -124,28 +143,37 @@ func TestAnAuthorizationRequestIsNotSpendableByABrowserThatDidNotStartIt(t *test
 
 	// The VICTIM's browser. `f.jar` already holds a live session for the same
 	// user the fixture registered (newOIDCFixture signs them in), and it holds no
-	// state cookie for this request id, because this browser never rendered the
-	// page for it. The attacker's jar is discarded entirely.
+	// flow cookie, because this browser never began this flow. The attacker's jar
+	// is discarded entirely.
 	_ = f.attackerJar
 
 	rec := f.do(t, http.MethodGet, attackerLoginURL, "", nil)
 
-	if rec.Code == http.StatusFound {
-		if code := mustCodeIfPresent(rec.Header().Get("Location")); code != "" {
-			t.Fatalf("a browser that never started this flow completed it: GET %s answered %d "+
-				"carrying an authorization code to %s. The victim's session signed an "+
-				"authorization request whose client, secret, PKCE verifier and redirect_uri "+
-				"all belong to whoever sent them this link",
-				attackerLoginURL, rec.Code, oidcTestRedirect)
-		}
+	if code := mustCodeIfPresent(rec.Header().Get("Location")); code != "" {
+		t.Fatalf("a browser that never started this flow completed it: GET %s answered %d "+
+			"carrying an authorization code to %s. The victim's session signed an "+
+			"authorization request whose client, secret, PKCE verifier and redirect_uri "+
+			"all belong to whoever sent them this link",
+			attackerLoginURL, rec.Code, oidcTestRedirect)
+	}
+	if strings.Contains(rec.Header().Get("Location"), oidcTestRedirect) {
+		t.Fatalf("the victim's browser was handed to the attacker's redirect_uri: %s",
+			rec.Header().Get("Location"))
 	}
 
-	// Whatever the answer is, it must not be a completed flow handed to a
-	// redirect_uri the requester did not start the flow towards. The two honest
-	// answers are the login form (200) and a problem document.
-	if rec.Code != http.StatusOK && rec.Code != http.StatusFound {
-		t.Logf("the request was refused with %d, which is a safe answer for a browser that "+
-			"cannot prove it started this flow", rec.Code)
+	switch {
+	case rec.Code == http.StatusForbidden:
+		// The expected answer, and the one the flow cookie buys.
+	case rec.Code == http.StatusFound:
+		redirect := mustRedirectToLoginUI(t, rec)
+		if redirect.Query().Get(oidc.LoginParamRequestID) != requestIDOf(t, attackerLoginURL) {
+			t.Errorf("the redirect names %q rather than the request in the URL; a login UI "+
+				"that posts back the wrong id would complete a different request",
+				redirect.Query().Get(oidc.LoginParamRequestID))
+		}
+	default:
+		t.Errorf("the victim's browser got %d, want 403 or a redirect to the login UI; "+
+			"body:\n%s", rec.Code, rec.Body)
 	}
 }
 
@@ -243,10 +271,7 @@ func TestAnAttackerExchangesACodeTheVictimsBrowserMintedForThem(t *testing.T) {
 	req.Header.Set("Cookie", jar.header())
 	rec := newResponse(serveRecorder(f.handler, req))
 
-	code := ""
-	if rec.Code == http.StatusFound {
-		code = mustCodeIfPresent(rec.Header().Get("Location"))
-	}
+	code := mustCodeIfPresent(rec.Header().Get("Location"))
 
 	// THE ATTACK IS REFUSED, and a refusal is a PASS rather than a skip. A skip
 	// here would report "I could not demonstrate the bug" on exactly the code

@@ -173,10 +173,16 @@ func (c protocolClient) GrantTypes() []oidc.GrantType {
 // LoginURL is where the browser goes to authenticate.
 //
 // This is the one place the protocol hands control to something that is not the
-// protocol, and it is this service's own login page — the same sessions, the
-// same cookie, the same password check as POST /v1/session. A separate sign-in
-// for OIDC would be a second credential store, which is the thing a security
-// boundary is not allowed to have.
+// protocol, and it is this service's OWN endpoint — the same sessions, the same
+// cookie, the same password check as POST /v1/session. A separate sign-in for
+// OIDC would be a second credential store, which is the thing a security boundary
+// is not allowed to have.
+//
+// IT IS NOT THE LOGIN UI, and it is not compiled in, and that is the decision
+// loginui.go exists to state. The library calls this the moment a flow needs a
+// person, and the answer is always an address on this origin; whether a page
+// renders here is not this method's business and is not anybody's, because this
+// service renders no HTML. Provider.LoginRedirect is the second hop.
 func (c protocolClient) LoginURL(requestID string) string {
 	return c.loginBase + "/" + requestID
 }
