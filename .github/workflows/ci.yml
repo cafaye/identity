@@ -980,6 +980,7 @@ jobs:
             echo "| \`go.mod\`, \`go.sum\` | no diff after the gate | lockfile |"
             echo "| coverage | ${COVERAGE_FAIL_UNDER}% floor over every statement \`coverage-exclusions\` does not exclude | coverage |"
             echo "| \`MFA_ENCRYPTION_KEY\` | ephemeral per run, masked, printed nowhere | boot |"
+            echo "| the image build | \`publish.yml\` calls kit at the one resolvable path, grants \`packages: write\`, says \`push: true\`, carries no build of its own, and no \`pull_request\` reaches it | 6 checks, all proven able to fail | \`internal/platform/ci/publish_test.go\` |"
             echo
             echo "Floors are decrease detectors, not targets: green means nothing was"
             echo "deleted, skipped or excluded since these numbers were measured."

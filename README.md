@@ -1595,6 +1595,41 @@ docker build -t identity .
 docker run --rm -p 8080:8080 identity
 ```
 
+### Who builds it in CI
+
+`.github/workflows/publish.yml`, on every push to `master` and on demand:
+
+```yaml
+jobs:
+  image:
+    uses: cafaye/kit/.github/workflows/image.reusable.yml@master
+    with:
+      push: true
+```
+
+That is a **caller**, not a copy. The build lives in kit and is shared by every
+service in the fleet, so a fix to how an image is built reaches here on kit's
+next push with no pull request against this repository.
+
+Before this file existed, `config/deploy.yml` named an image and `kamal deploy`
+pulled it, and **nothing in this repository produced it** — the `docker build`
+above was the whole story, on one person's machine. A deploy config naming an
+image nothing produces is a document, not a plan.
+
+Three things worth knowing:
+
+- **The image name is not written here.** The reusable workflow derives it from
+  `github.repository` and lowercases it, because `ghcr.io/Cafaye/Identity` 404s
+  on a registry that requires lowercase paths.
+- **`packages: write` is granted here**, because a reusable workflow can request
+  a permission but cannot grant itself one. The missing line shows up at the push
+  as a 401, which reads like a bad password rather than like the missing line.
+- **Tags are `sha-<commit>`, `master`, and `latest`** — no semver. Cutting a
+  release is a decision, not a side effect of a merge.
+
+A pull request does not trigger it: only `master` holds deployable commits, and a
+PR build would run untrusted code against a registry write.
+
 ## Not built yet
 
 Everything below is a later packet, and none of it is stubbed to look finished: the

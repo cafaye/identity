@@ -6,6 +6,64 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added (packet identity-32: the image `config/deploy.yml` deploys is now built by a pipeline)
+
+**Nothing in this repository built the image the deploy config names.**
+`config/deploy.yml` says `image: <%= org %>/<%= repo %>` with
+`registry.server: ghcr.io`, and `kamal deploy` pulls that image. Before this
+packet the only build was the `docker build -t identity .` in the README, run by
+hand on one machine — while CI stayed green throughout. A green CI and an unbuilt
+image are not in tension; they are just both true, which is exactly what makes the
+gap easy to miss. A deploy config describing a deploy nothing produces is a
+document, not a plan.
+
+- **`.github/workflows/publish.yml` calls kit, and does not copy the build.**
+  The build lives at `cafaye/kit/.github/workflows/image.reusable.yml@master` and
+  is shared across the fleet, so a fix to how an image is built lands here on
+  kit's next push with no pull request against this repository. A copy would be a
+  second pipeline to maintain and diverge — the same failure `ci.yml` is already
+  written to avoid for the test half.
+
+- **It runs on `master` pushes and `workflow_dispatch`, never on
+  `pull_request`.** Only master holds deployable commits, so a branch build would
+  publish images nobody deploys; and a PR build would run untrusted code — the
+  Dockerfile, whatever a contributor changed — against a registry write. kit's
+  reusable workflow refuses to publish on a pull request regardless of what a
+  caller asks, so this is belt and braces: the guard is in both places because a
+  caller written later should not have to remember.
+
+- **`packages: write` is granted by the caller.** A reusable workflow can
+  *request* a permission but cannot grant itself one, so this line is the
+  caller's job and there is no way to get it from the other repository. Without
+  it the push fails with a 401, which reads like a bad password rather than like
+  the missing line it actually is.
+
+- **The image name is derived, not passed.** The reusable workflow builds it from
+  `github.repository` and lowercases it — `ghcr.io/Cafaye/Identity` 404s, because
+  the registry requires lowercase paths. A name spelled at the call site would be
+  a second place to get that rule wrong and a second spelling of a fact
+  `deploy.yml` already states.
+
+- **Tags are `sha-<commit>`, `master`, and `latest`. No semver.** Releasing is a
+  decision; a workflow that cut a version tag on every merge would make "which
+  version is on the host" unanswerable.
+
+- **`internal/platform/ci/publish_test.go` checks the file, because nothing else
+  could.** It never runs on a pull request, so a mistake in it cannot be caught
+  by the mistake being noticed — only by a check, or by a deploy failing to find
+  an image. Six claims, each of which fails silently when it stops being true:
+  the file exists; it calls kit at the one path GitHub can resolve, exactly once;
+  it carries no `docker/build-push-action@` of its own; it grants
+  `packages: write`; it says `push: true` (which defaults to false, so a caller
+  that stops saying it builds an image and pushes nothing); and no
+  `pull_request` trigger reaches it.
+
+  Each is proven able to fail — delete the file, misspell the path, add a second
+  kit call, inline a build step, downgrade the permission, add the trigger, set
+  `push: false` — and a comment *naming* `docker/build-push-action@` is proven
+  **not** to fail it, because a check that punishes the warning it wants written
+  is a check that gets deleted.
+
 ### Fixed (packet identity-31: `bin/migrate` applied every migration and then undid it)
 
 **`bin/migrate` was a no-op that reported success.** It handed each migration to
