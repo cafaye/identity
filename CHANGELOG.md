@@ -6,6 +6,79 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed (packet identity-31: `bin/migrate` applied every migration and then undid it)
+
+**`bin/migrate` was a no-op that reported success.** It handed each migration to
+`psql --file`, so psql ran the whole file — the `Up` section *and* the `Down`
+section — and every table a migration created was dropped again in the same call.
+Exit status zero. The script printed `migrations applied`. A developer running
+`bin/dev` got an empty database and no error, and the next statement they ran
+failed with `relation "users" does not exist`.
+
+Measured on a fresh Postgres with nothing else applied, feeding it
+`00002_users.sql` alone:
+
+```
+CREATE TABLE
+CREATE INDEX
+DROP TABLE
+exit=0
+```
+
+- **The header asserted the opposite, and that is how it survived.** It said the
+  "`-- +goose Up` and `-- +goose Down` annotations … are comments, so a plain
+  `psql -f` runs exactly the Up section and ignores the Down one". The
+  annotations *are* comments — that is the entire defect. psql has no idea they
+  are annotations, so it runs both halves. A comment asserting a property of a
+  tool it never checks is a comment that survives only because nobody ran the
+  thing it describes.
+- **CI never saw it, because CI runs `goose`, which honours the annotations.** The
+  broken path was the fallback that exists for a machine without goose — the one
+  a developer is actually running, and the one no automation touches.
+- **The Up section is now extracted before psql sees anything**, by a new
+  `bin/migration-up-section`. Extraction stops at `-- +goose Down` and never
+  looks for `-- +goose Up`, so a migration with no Down section still applies
+  forward instead of producing an empty file and a silent no-op. The marker is
+  matched as `^--[[:space:]]*\+goose[[:space:]]+Down`, anchored at the start of a
+  line so a mention of it inside a comment is not a cut.
+- **It is a separate script so the test can reach it without a database.** An
+  inline `awk … | psql` inside the loop is only testable against a real Postgres
+  with a real `psql` present, and a test that skips when those are missing
+  verifies nothing in the one environment a developer runs in.
+- **The loop test puts a stub `psql` first on PATH and reads what it was handed**,
+  so the assertion is about `bin/migrate` as a developer runs it rather than about
+  a function beside it. Asserting on the extractor alone would pass with
+  `bin/migrate` never calling it, which is precisely the regression that broke
+  this once: a correct extractor, never invoked. There is a control in each
+  direction — no `DROP TABLE` may reach psql, and `CREATE TABLE users` and two
+  others must, so a "fix" that sent nothing cannot pass.
+- **`TestEveryMigrationForwardsItsUpSectionIntact` checks all fifteen files**, for
+  "no `DROP TABLE`" rather than for the word `DROP`, because
+  `00013_account_invitation_revocation.sql` legitimately drops an index inside its
+  own Up section — an index predicate cannot be altered, so it is
+  DROP-then-CREATE — and a rule banning the word would have been wrong.
+
+**Verified by reverting `bin/migrate` to `--file` with the tests in place:** the
+test goes red and names the mechanism, printing every `psql` invocation as
+`--file …/migrations/0000N_….sql` followed by an empty stdin.
+
+**And verified end-to-end on a real database, which is what the Go test
+deliberately does not need.** Two empty Postgres containers, the same fifteen
+migrations, the same command, one script with `--file` and one with the Up
+section extracted:
+
+| | tables left in `public` | exit | last line |
+| --- | --- | --- | --- |
+| `bin/migrate` before | **0** | 0 | `migrations applied` |
+| `bin/migrate` after | **17** | 0 | `migrations applied` |
+
+The after-run's 17 tables are `users`, `sessions`, `accounts`, `account_users`,
+`account_invitations`, `connected_accounts`, `api_keys`, `outbox_events`,
+`account_audit_log`, `oidc_*`, `mfa_*` and `recovery_tokens` — the full schema.
+The before-run left the database exactly as it found it while telling the
+operator it had worked, which is the failure this is worth a packet for: there
+was nothing to notice.
+
 ### Fixed (packet identity-30: a revoked invitation no longer redeems)
 
 **A revoked invitation was a working credential.** An account's admin could
