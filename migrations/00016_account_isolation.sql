@@ -18,9 +18,23 @@
 -- returns NULL rather than raising when no account has been set.
 --
 -- THE FIVE CALLS AT THE BOTTOM ARE THE WHOLE OF WHAT THIS MIGRATION DECIDES, and
--- `cafaye.protect_table` is the ONLY entry point: there is no `protect_table_lite`, and
--- there is no way to ask it for a policy without FORCE, because a template that offers
--- the weaker version is a template the weaker version gets chosen from.
+-- `cafaye.protect_table` is the ONLY entry point FOR AN ORDINARILY SCOPED TABLE:
+-- there is no `protect_table_lite`, and there is no way to ask it for a policy without
+-- FORCE, because a template that offers the weaker version is a template the weaker
+-- version gets chosen from.
+--
+-- There is exactly ONE second entry point, `cafaye.protect_credential_table(table,
+-- digest_column)`, and ONE table uses it. It protects a table exactly as `protect_table`
+-- does — it CALLS it, so there is no second copy of ENABLE/FORCE to drift — and then
+-- adds a fifth `for select` policy whose qualifier is the digest the caller presented.
+-- It exists because of a fact about THIS service's authentication, measured on this
+-- cluster and written down at the foot of this header: the lookup that turns a presented
+-- scoped token into a key has no account to predicate on, because the account is what
+-- the lookup is FOR. `protect_table` alone made every scoped token read zero rows, and
+-- `ByDigest` maps that to ErrNotFound, so the HTTP layer answered 401 for every valid
+-- machine credential in the fleet. The mechanism, and the four answers it rejected (a
+-- BYPASSRLS role, a SECURITY DEFINER function, dropping FORCE, leaving the table
+-- unprotected), are kit's decision MD24 and the reasoning is in the substrate itself.
 --
 -- WHY THESE FIVE TABLES, and the method, stated rather than assumed. The list was
 -- derived by grepping `account_id` across `migrations/` and then reading each
@@ -55,8 +69,18 @@
 -- every policy, so the owner's reads are ACCOUNT-SCOPED rather than absent, which is
 -- the only version of "the owner may read" that is not "the owner may read
 -- everything". A migration that has to read or backfill one of these five tables sets
--- the identity first (`select cafaye.begin_account(…)`) or goes through a SECURITY
--- DEFINER function. It fails loudly and immediately, which is the good direction.
+-- the identity first (`select cafaye.begin_account(…)`), and that is the WHOLE answer.
+--
+-- There was a second suggestion here and it was WRONG: "or goes through a SECURITY
+-- DEFINER function". FORCE ROW LEVEL SECURITY applies to the DEFINER as well as to the
+-- invoker, so a SECURITY DEFINER reader of a forced table reads zero rows too, and a
+-- migration written to that advice fails SILENTLY rather than loudly. Measured on the
+-- real cluster while kit decided MD24. The substrate's own README now says the identity
+-- is the whole answer, and this header says it too rather than leaving the false version
+-- where the next reader of this file finds it. `api_keys` has one further step: a
+-- migration that reads it has no account to begin AS, so it opens the row with
+-- `cafaye.begin_credential(<the digest it is looking for>)` — the resolution seam, and
+-- the same transaction-local GUC as the account one.
 --
 -- NO MIGRATION AFTER THIS ONE NEEDS TO KNOW. `cafaye.protect_table` is idempotent —
 -- it drops and recreates its policies and uses `create … if not exists` for the index
@@ -249,6 +273,260 @@ begin
 end
 $caf$;
 
+-- ===========================================================================
+-- CREDENTIAL RESOLUTION — the one query whose subject the boundary does not
+-- know yet. Read this before changing anything below; MD24 is the decision and
+-- its cost, and DECISIONS.md is where the alternatives are recorded as dead.
+-- ===========================================================================
+--
+-- THE PROBLEM, IN ONE SENTENCE. A scoped token, an invitation token and a
+-- client id all resolve by "find the row by an unguessable value and learn the
+-- account from it", and the account is WHAT THE QUERY IS FOR — so a query with
+-- no identity cannot be scoped by an identity it has not computed yet. Measured
+-- by `identity` against its real protected `api_keys` table, as the OWNER:
+--
+--     no identity (the state a token request is in)      0 rows
+--     identity = the credential's own account            1 row
+--     identity = another tenant's identity               0 rows
+--
+-- The first line is the finding, and it is the quietest one available: the token
+-- does not resolve, `ErrNoRows` becomes "not found", and the HTTP layer answers
+-- 401. Every machine credential, refused as though it did not exist.
+--
+-- WHY NOT THE OTHER THREE ANSWERS. Each is measured or read rather than
+-- assumed, and each is written down in `DECISIONS.md` (MD24):
+--
+--   * A `BYPASSRLS` role — Supabase's answer, and right for Supabase's
+--     topology: `service_role` is `nologin noinherit bypassrls` granted only to
+--     `authenticator`, and what bounds it is who may assume it plus its object
+--     grants. kit has one per-request role and no separate service layer, so a
+--     bypass role here is a bypass over the WHOLE DATABASE held by the role
+--     every request already authenticates as.
+--   * A `SECURITY DEFINER` function — does not work under FORCE. FORCE applies
+--     to the definer, and only BYPASSRLS skips RLS; no service role has one.
+--   * Dropping FORCE — MD23's measurement: 1 row with, 3 without, on the one
+--     table holding every machine credential.
+--
+-- WHAT IS HERE INSTEAD. One extra `for select` policy, whose qualifier is the
+-- value the CALLER PRESENTED, read from a transaction-local GUC:
+--
+--     using (token_digest = (select cafaye.current_credential_digest()))
+--
+-- The predicate is in the POLICY and not only in the caller's query, and that is
+-- the whole design rather than a detail. RLS policies combine permissively, so a
+-- policy that said merely "a credential session may select this table" would hand
+-- the caller a table-wide SELECT and let it browse every key in the database
+-- with the one query this mechanism exists to prevent. Because the policy
+-- carries the same predicate the query carries, the honest semantics are:
+--
+--     A resolution session may read exactly the credential row whose digest it
+--     presented, and nothing else in the database.
+--
+-- `select * from api_keys` inside one of these sessions returns THAT row, not
+-- the table. `isolation.sql` asserts it as `credential/resolution-cannot-browse`
+-- and asserts the other half — that the mechanism did not become a general
+-- bypass — as `credential/resolution-does-not-open-another-table`.
+--
+-- WHAT IT CANNOT DO, all five, so nobody has to find them:
+--
+--   1. It cannot tell a secret from a label. It widens a read to the row whose
+--      value you presented, and whether that value is unguessable is the
+--      SERVICE's knowledge. `oidc_clients.client_id` is an identifier, not a
+--      secret, and this is the wrong mechanism for it. The invariant that keeps
+--      the mechanism from becoming a general bypass is exactly that one: you can
+--      only widen a read to a row you could already name.
+--   2. It cannot write. `for select`, so every write policy still demands an
+--      account identity: a resolution session cannot mint a credential.
+--   3. It does not open any other table. It is a policy on a named table, and
+--      `account_users` still reads zero rows in a resolution session.
+--   4. It is transaction-local, like `begin_account/1`, and that is not tidiness
+--      — the six drivers hold pools, and a session-level digest survives the
+--      pool and hands one resolution's credential to the next connection.
+--   5. It is not audited at runtime. The GUC leaves nothing behind; what IS
+--      auditable is the SCOPE, and `credential_tables()` below is the one query
+--      that answers "which tables in this database can be read with no account".
+--      A claim this file cannot honour would be a comment pretending to be a
+--      control, so it is not made.
+--
+-- TWO SEAMS, NOT ONE. `begin_credential/1` is a second transaction-local GUC and
+-- the cost of that is real and is why the substrate has no third. It is set in
+-- exactly one function, so a service has exactly one place that writes it.
+
+-- The digest the session is resolving. NULL when none is set, and the NULL is
+-- load-bearing for the same reason `current_account_id()`'s is: with no digest
+-- set, `token_digest = NULL` is never true, so a table carrying only a resolve
+-- policy plus an account policy reads nothing at all rather than raising. A
+-- credential table is still fully protected without a digest — this policy only
+-- ever ADDS the one row whose digest is present.
+create or replace function cafaye.current_credential_digest()
+returns text
+language plpgsql
+stable
+as $caf$
+declare
+  raw text;
+begin
+  -- `missing_ok = true` makes an unset GUC NULL rather than an error; the second
+  -- case is Postgres treating an unregistered dotted placeholder as set-to-empty.
+  raw := current_setting('cafaye.credential_digest', true);
+  if raw is null or raw = '' then
+    return null;
+  end if;
+  return raw;
+end
+$caf$;
+
+-- OPEN THE RESOLUTION, ONCE, TRANSACTION-LOCAL. The twin of `begin_account/1`,
+-- and a NULL argument clears rather than failing, for the same reason.
+--
+-- THE CALLER PASSES THE VALUE IT ALREADY COMPUTED. A service hashes the token it
+-- was handed — that hash is how it was going to query the table anyway — and
+-- hands the digest to Postgres as the statement that scopes the read. Postgres
+-- does not learn the secret, does not learn how it was derived, and gains no
+-- ability to compute one: it is given a string it will compare against a column.
+create or replace function cafaye.begin_credential(p_digest text)
+returns void
+language plpgsql
+as $caf$
+begin
+  if p_digest is null then
+    perform set_config('cafaye.credential_digest', '', true);
+    return;
+  end if;
+  perform set_config('cafaye.credential_digest', p_digest, true);
+end
+$caf$;
+
+-- PROTECT ONE CREDENTIAL TABLE. The one call a credential table's migration
+-- makes, and it is ONE call: it protects the table exactly as `protect_table`
+-- does — same four policies, same ENABLE, same FORCE, same index on
+-- `account_id` — and then adds the fifth. There is no `protect_credential_table`
+-- that only adds the resolve policy to a table somebody forgot to protect,
+-- because a substrate with two entry points for one table is a substrate where
+-- the one nobody reads is the one that ships.
+--
+--   select cafaye.protect_credential_table('api_keys', 'token_digest');
+--
+-- The digest column is named in the migration and nowhere else, and naming it
+-- IS the declaration: it is the column whose value a caller must already hold to
+-- resolve a credential on this table, and the README says what makes a value
+-- suitable (it has to be unguessable, or this mechanism is the wrong one).
+create or replace function cafaye.protect_credential_table(
+  p_table regclass,
+  p_digest_column text,
+  p_login_role text default null
+)
+returns void
+language plpgsql
+as $caf$
+declare
+  login_role text := coalesce(p_login_role, current_user || '_app');
+  base text;
+  qual text;
+begin
+  -- 0. THE COLUMN NAME IS A BARE IDENTIFIER. `%I` quotes it, so this is not
+  --    about injection; it is about a typo becoming a policy nobody notices,
+  --    which is the failure a database-boundary file exists to make loud.
+  if p_digest_column is null
+     or p_digest_column !~ '^[A-Za-z_][A-Za-z0-9_$]*$' then
+    raise exception 'cafaye.protect_credential_table(%, %): the digest column must be one bare column name, and % is not one.', p_table, coalesce(p_digest_column, '<null>'), coalesce(p_digest_column, 'null')
+      using errcode = 'undefined_column',
+            hint = 'The second argument is the column a caller presents to resolve a credential on this table — `token_digest` for a hashed API key, `token` for a hashed invitation. It is a column of this table and nothing else.';
+  end if;
+
+  -- 1. AND IT EXISTS, before `protect_table` runs, so a misspelt column does not
+  --    half-install a table.
+  if not exists (
+    select 1 from pg_attribute
+    where attrelid = p_table and attname = p_digest_column and not attisdropped
+  ) then
+    raise exception 'cafaye.protect_credential_table(%, %): the table has no % column.', p_table, login_role, p_digest_column
+      using errcode = 'undefined_column',
+            hint = 'A credential table resolves by the column a caller presents. Name the one this table has; if it has none, this table is not resolved by an unguessable value and does not want this mechanism.';
+  end if;
+
+  -- 2. THE SAME PROTECTION AS EVERY OTHER ACCOUNT-SCOPED TABLE. This calls the
+  --    other function rather than repeating it, so a fix to one is a fix to both
+  --    and there is no second copy of ENABLE/FORCE to drift.
+  perform cafaye.protect_table(p_table, p_login_role);
+
+  base := (select c.relname from pg_class c where c.oid = p_table::regclass::oid);
+
+  -- 3. THE INDEX ON THE DIGEST COLUMN, for the reason `protect_table` creates one
+  --    on `account_id`: a policy is a filter on every candidate row, and this one
+  --    filters on the column the resolution query is keyed by.
+  execute format('create index if not exists %I on %s (%I)',
+                 base || '_cafaye_' || p_digest_column || '_idx', p_table, p_digest_column);
+
+  -- 4. ONE POLICY, FOR ONE COMMAND, FOR THE TWO NAMED ROLES, WITH THE PREDICATE
+  --    THE CALLER'S OWN QUERY CARRIES.
+  --
+  --    `for select` and nothing else is what makes item 2 of "what it cannot do"
+  --    true: there is no `insert`/`update`/`delete` counterpart, so a resolution
+  --    session meets the ordinary account policies on the write side and a NULL
+  --    identity there is `42501`.
+  --
+  --    The `(select ...)` wrapping is the same InitPlan discipline as every other
+  --    policy in this file, for the same measured reason: `tests/tenancy_test.sh`
+  --    measures 1 call wrapped against 5 bare on five rows, on every run.
+  qual := format('%I = (select cafaye.current_credential_digest())', p_digest_column);
+
+  --    DROP before CREATE, so a re-run converges and a corrected qualifier cannot
+  --    survive one.
+  execute format('drop policy if exists %I on %s', base || '_cafaye_resolve', p_table);
+  execute format('create policy %I on %s for select to %I, %I using (%s)',
+                 base || '_cafaye_resolve', p_table, current_user, login_role, qual);
+
+  -- 5. USAGE on `cafaye`, for the same reason `protect_table` grants it: without
+  --    it the login role cannot resolve `cafaye.begin_credential/1` and every
+  --    resolution fails with `permission denied for schema cafaye`.
+  if to_regnamespace('cafaye') is not null then
+    execute format('grant usage on schema cafaye to %I', login_role);
+  end if;
+end
+$caf$;
+
+-- WHICH TABLES CAN BE READ WITHOUT AN ACCOUNT. The audit for item 5 above: one
+-- query, and not a code search.
+--
+-- It reads the POLICIES rather than a list, for the reason the sweep reads
+-- `pg_class`: a table this function could only know about because
+-- `protect_credential_table` created it would be satisfied by a mechanism that
+-- records nothing. The policy name and the rendered qualifier are both required,
+-- so a hand-written policy that merely mentions the digest does not appear here
+-- and a policy named like this one with a different qualifier does not either.
+--
+-- It answers the SCOPE question and only that one. It cannot answer "who
+-- resolved what", and this file does not pretend otherwise: the digest is
+-- transaction-local and gone by the time anything could look at it.
+-- ONE CAPTURE GROUP, AROUND THE COLUMN AND NOTHING ELSE. `pg_get_expr` is a
+-- pretty-printer, so the qualifier this file writes renders back as
+-- `(token_digest = ( SELECT cafaye.current_credential_digest() AS …))` — its own
+-- capitalisation, spacing and alias. A regexp written against the SQL executed
+-- rather than against what the catalog prints matches nothing here, and an audit
+-- query that returns an empty column forever looks exactly like an audit query
+-- that found nothing.
+create or replace function cafaye.credential_tables()
+returns table (table_schema text, table_name text, digest_column text)
+language sql
+stable
+as $caf$
+  select n.nspname::text,
+         c.relname::text,
+         (regexp_match(
+            lower(coalesce(pg_get_expr(p.polqual, p.polrelid), '')),
+            '^ *\(?([a-z_][a-z0-9_$]*) = \( *select cafaye\.current_credential_digest\(\)'
+          ))[1]::text
+    from pg_policy p
+    join pg_class c on c.oid = p.polrelid
+    join pg_namespace n on n.oid = c.relnamespace
+   where p.polname like '%!_cafaye!_resolve' escape '!'
+     and p.polcmd = 'r'
+     and lower(coalesce(pg_get_expr(p.polqual, p.polrelid), ''))
+         like '%cafaye.current_credential_digest()%'
+   order by n.nspname, c.relname
+$caf$;
+
 -- PROTECT ONE ACCOUNT-SCOPED TABLE. The only thing a migration calls.
 --
 --   select cafaye.protect_table('assets');                 -- the owner's role
@@ -380,7 +658,8 @@ begin
 end
 $caf$;
 
--- SWEEP: every account-scoped table in this database, protected or not.
+-- SWEEP: every account-scoped table in the schemas THIS SUBSTRATE OWNS,
+-- protected or not.
 --
 -- Returns one row per table that is NOT, so a caller can report all of them
 -- rather than the first. It returns rather than raising because a caller that
@@ -392,22 +671,78 @@ $caf$;
 -- `account_id` column and no policies appears here on the next run, which is the
 -- moment before it matters.
 --
+-- THE SCOPE IS THE SCHEMAS THE SUBSTRATE WAS APPLIED IN, and that is the whole
+-- difference between this function and a scan of every table in the database.
+-- The property being asserted is "every account-scoped table THE SERVICE
+-- INSTALLED is protected", and its input is the set of tables the substrate was
+-- applied to — a whole-database scan is one way to compute that set, and it is
+-- the way that breaks every adopter.
+--
+-- MEASURED, on identity: its test helper builds a private fixture schema per
+-- test by cloning tables with `LIKE … INCLUDING ALL`, and `LIKE` does not copy
+-- row-level security. Each fixture therefore carries an `account_id` column and
+-- no policies. A whole-database sweep named every one of them, so a correct
+-- database produced a red proof — and the count moved with how many neighbouring
+-- tests were mid-flight (5 on one run, 21 on the next), which is what says it
+-- was a reach rather than a defect. A sweep that cannot stay green on a correct
+-- database is a sweep nobody reads, and one that goes red for somebody else's
+-- fixtures is a sweep an adopter has to work around, which is worse.
+--
+-- THE SCOPE IS DERIVED, NOT RECORDED, and the difference is the reason an
+-- adopter needs no migration to get the fix. There is no registry table, because
+-- a registry would have to be created by the NEW substrate and every database
+-- that has applied the OLD one does not have it — so the fix would only arrive
+-- with a migration, and the proofs it is meant to repair are the thing that
+-- decides whether the migration is needed. Instead the scope is read back out of
+-- what the substrate ALREADY wrote: `protect_table` names its policies
+-- `<table>_cafaye_<command>` and creates an index beside them, so every schema
+-- the substrate was applied in is discoverable from the catalog, with nothing
+-- new to install and nothing to remember to update.
+--
 -- Extension-owned tables are excluded (`pg_depend.deptype = 'e'`): pgvector,
 -- PostGIS and friends ship their own tables with their own grants, and reporting
 -- a table this substrate cannot protect would train the reader to ignore the
--- sweep. `cafaye` is excluded because it holds functions, not rows.
+-- sweep.
 --
--- TEMPORARY TABLES ARE NOT EXCLUDED, and that is deliberate. `pg_temp%` would be
--- the tidier-looking predicate, and it is the one that would have hidden this
--- file's own control: a temp table with an account_id column and no policies is
--- genuinely unprotected, it is exactly the shape a service's test fixture has,
--- and the definition the fleet agreed on is "has an account_id column" with no
--- exceptions a reader has to remember.
+-- TEMPORARY TABLES ARE NOT EXCLUDED, and that is deliberate. A temp table with an
+-- `account_id` column and no policies is genuinely unprotected, it is exactly
+-- the shape a service's test fixture has, and `isolation.sql` plants one on
+-- purpose as its sweep's control. It is safe to INCLUDE this file's own session's
+-- temporary schema for the reason a fixture schema is not: temporary objects are
+-- per-session, so no other session — not another test, not another service — can
+-- put a table in scope by creating one. `pg_temp` is the alias; the real schema
+-- is named `pg_temp_N`, which is why this is a prefix test and not an equality.
 create or replace function cafaye.unprotected_tables()
 returns table (table_schema text, table_name text, why text)
 language sql
 stable
 as $caf$
+  with scoped(nspname) as (
+    -- (1) The substrate's own schema. It holds functions rather than rows, so
+    --     this contributes nothing today; it is here so that a table added to
+    --     `cafaye` later cannot be quietly unowned by the exclusion this query
+    --     used to carry.
+    select 'cafaye'::name
+    -- (2) This session's temporary schema, where `isolation.sql` plants its
+    --     control table. Per-session, so it can never carry another session's.
+    union
+    select n.nspname
+      from pg_namespace n
+     where n.nspname = 'pg_temp' or left(n.nspname, 8) = 'pg_temp_'
+    -- (3) Every schema the substrate was applied IN, read back from the policies
+    --     `protect_table` wrote. A schema qualifies when it holds at least one
+    --     table this substrate protected, which is what makes the scope the
+    --     service's own tables rather than a list somebody maintains: a new
+    --     account-scoped table added NEXT MONTH to a schema already in scope is
+    --     named on the next run, with nothing having been updated anywhere.
+    union
+    select n.nspname
+      from pg_namespace n
+      join pg_class c on c.relnamespace = n.oid
+      join pg_policy p on p.polrelid = c.oid
+     where c.relkind = 'r'
+       and p.polname ~ '_cafaye_(select|insert|update|delete)$'
+  )
   select n.nspname::text,
          c.relname::text,
          case
@@ -421,7 +756,7 @@ as $caf$
   left join pg_depend d on d.objid = c.oid and d.deptype = 'e'
   where c.relkind = 'r'
     and d.objid is null
-    and n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast', 'cafaye')
+    and n.nspname in (select s.nspname from scoped s)
     and exists (
       select 1 from pg_attribute a
       where a.attrelid = c.oid and a.attname = 'account_id' and not a.attisdropped
@@ -472,6 +807,16 @@ $caf$;
 --     misses a service that spells it `tenant_id` and protects it by hand. A
 --     service with no account-scoped tables at all is the honest zero, and
 --     core's `tenancy.honest-zero` finding is what says so out loud.
+--
+--   * That a SCHEMA the substrate was never applied to holds no account-scoped
+--     table. The sweep's scope is the schemas it protected, plus its own and
+--     `pg_temp`, so customer rows kept in a schema no `protect_table` call ever
+--     named are outside it. That is the trade, and it is a deliberate one: the
+--     alternative reports every other session's test fixture, which is how a
+--     correct database ends up with a red proof and how an adopter ends up
+--     carrying a workaround for a bug that was upstream. A service whose account
+--     tables span schemas the substrate has not met is a service that has not
+--     protected them, and `protect_table` is one call per table.
 -- ---------------------------------------------------------------------------
 -- +goose StatementEnd
 
@@ -509,14 +854,60 @@ select cafaye.protect_table('account_users');
 
 -- AN INVITATION ADDRESSED INTO AN ACCOUNT. Its unique index is already the
 -- account_id-leading partial index 00007 built for exactly this query.
+--
+-- `account_invitations.token_digest` is a secret in the same sense `api_keys.token_digest`
+-- is — a 256-bit random value whose only stored form is a hash — so
+-- `protect_credential_table('account_invitations', 'token_digest')` WOULD be the right
+-- call here, and it is NOT made yet. The mechanism is one call in a migration and one
+-- `cafaye.begin_credential` in the Go path, and taking the first without the second
+-- breaks redemption the same way this migration just fixed api_keys: the lookup would
+-- read zero rows and every invitation would be refused. They are ONE change and this
+-- migration does not make half of it; the exact call and the exact call site are in
+-- HANDOFF-identity-isolation.md.
 select cafaye.protect_table('account_invitations');
 
 -- THE SERVICE'S OWN CREDENTIAL FOR AN ACCOUNT. Read another account's and you hold a
--- bearer token for it, so this is the row whose isolation matters most.
-select cafaye.protect_table('api_keys');
+-- bearer token for it, so this is the row whose isolation matters most — AND the one
+-- table of the five that is resolved by a secret rather than by an account.
+--
+-- WHY THIS CALL IS NOT `protect_table`, which is the sentence this migration exists to
+-- record. `apikeys.ByDigest` runs `SELECT … FROM api_keys k JOIN account_users au ON …
+-- WHERE k.token_digest = $1`, with no `account_id` predicate and none it could carry:
+-- the account is what the query is FOR, so a per-request identity cannot scope it. With
+-- this table protected the ordinary way that query read ZERO rows for a request with no
+-- identity — the state every scoped-token request is in — and ErrNotFound became 401.
+-- Every machine credential in the fleet, refused as though it had never existed.
+--
+-- `protect_credential_table` adds one `for select` policy whose USING clause is
+-- `token_digest = (select cafaye.current_credential_digest())`, so the POLICY carries
+-- the same predicate the caller's own query carries. The honest semantics, which is
+-- NARROWER than "reads nothing" and not one bit wider: a resolution session may read
+-- exactly the row whose digest it presented, in either role, and cannot write at all —
+-- there is no insert/update/delete counterpart, so a resolution session meets the
+-- ordinary account policies on the write side and a NULL identity there is 42501.
+--
+-- `token_digest` is the correct second argument, and naming it IS the declaration: the
+-- value a caller must already hold to resolve a row here is a 256-bit secret, hashed by
+-- `Digest` before any query runs, and Postgres never sees the token. The mechanism cannot
+-- tell a secret from a label, which is why the OTHER two lookups in this service do not
+-- get this call — see `oidc_clients` below, where the presented value is a public
+-- identifier and the mechanism is the wrong tool by construction.
+select cafaye.protect_credential_table('api_keys', 'token_digest');
 
 -- A CLIENT'S CREDENTIALS. `client_secret_hash` in somebody else's row is the same
 -- disclosure as the row above.
+--
+-- DELIBERATELY `protect_table` AND NOT `protect_credential_table`, and the reason is the
+-- mechanism's own first limitation rather than a preference. The OIDC lookup is by
+-- `client_id`, which travels in the authorization URL and is therefore a PUBLIC
+-- IDENTIFIER, and `protect_credential_table` widens a read to the row whose value the
+-- caller presented — so on `client_id` it hands every anonymous requester one row of
+-- another tenant's client. It cannot tell a secret from a label and this is a label. The
+-- honest answers are (a) resolve on `client_secret` at the token endpoint, where the
+-- value is genuinely unguessable, and (b) treat the authorization endpoint's `client_id`
+-- lookup as a different problem this mechanism does not answer. Neither is this
+-- migration's to guess at, and guessing would be applying the mechanism exactly where it
+-- has been measured not to belong.
 select cafaye.protect_table('oidc_clients');
 
 -- THE AUDIT TRAIL. Immutable by trigger, so it is also the one table where a
@@ -527,8 +918,8 @@ select cafaye.protect_table('account_audit_log');
 
 -- UNDO THE BOUNDARY AND NOTHING ELSE. These five tables and their columns are what
 -- 00006, 00007, 00009, 00011 and 00012 created; this migration changed nothing about
--- any of them, so it owns only the policies, the index `protect_table` added, and the
--- schema it created.
+-- any of them, so it owns only the policies, the SIX indexes the substrate added, and
+-- the schema it created.
 --
 -- `disable row level security` BEFORE `drop policy`, and the order is not tidiness: a
 -- table with policies and no RLS enabled hides every row from everybody, so dropping
@@ -566,6 +957,12 @@ drop policy if exists api_keys_cafaye_select          on api_keys;
 drop policy if exists api_keys_cafaye_insert          on api_keys;
 drop policy if exists api_keys_cafaye_update          on api_keys;
 drop policy if exists api_keys_cafaye_delete          on api_keys;
+-- The fifth one: the resolve policy `protect_credential_table` adds. It is named here
+-- rather than left to the `cascade` because `cafaye.credential_tables()` READS THE
+-- POLICIES, so a policy that outlived its table's RLS would keep answering "this table
+-- can be read with no account" on a database where it no longer can — an audit query
+-- that has gone stale is worse than no audit query.
+drop policy if exists api_keys_cafaye_resolve         on api_keys;
 drop policy if exists account_audit_log_cafaye_select on account_audit_log;
 drop policy if exists account_audit_log_cafaye_insert on account_audit_log;
 drop policy if exists account_audit_log_cafaye_update on account_audit_log;
@@ -578,6 +975,7 @@ drop index if exists account_users_cafaye_account_id_idx;
 drop index if exists account_invitations_cafaye_account_id_idx;
 drop index if exists oidc_clients_cafaye_account_id_idx;
 drop index if exists api_keys_cafaye_account_id_idx;
+drop index if exists api_keys_cafaye_token_digest_idx;
 drop index if exists account_audit_log_cafaye_account_id_idx;
 
 -- `cascade` because the functions live in the schema and the schema is what is being
