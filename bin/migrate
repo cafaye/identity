@@ -13,14 +13,44 @@
 # deliberately not a module dependency, so nothing in go.sum moves when it changes
 # (migrations/README.md). It is the right tool for a developer applying migrations by
 # hand. This file exists so `bin/dev` has something to call on a machine where goose
-# is not installed, and it applies the SAME files in the SAME order with the same
-# annotations honoured — `-- +goose Up` and `-- +goose Down` are comments, so a plain
-# `psql -f` runs exactly the Up section and ignores the Down one, which is what a
-# forward-only apply wants.
+# is not installed, and it applies the SAME files in the SAME order.
+#
+# WHY THE DOWN SECTION IS CUT OUT RATHER THAN RELIED ON NOT BEING THERE.
+#
+# This header used to claim that "`-- +goose Up` and `-- +goose Down` are
+# comments, so a plain `psql -f` runs exactly the Up section and ignores the Down
+# one". That is false, and it was the whole bug (identity-31). The annotations ARE
+# comments, and that is the problem: psql has no idea they are annotations, so it
+# runs the Down section too. Measured against a fresh Postgres with 00002_users.sql
+# and nothing else applied:
+#
+#     CREATE TABLE
+#     CREATE INDEX
+#     DROP TABLE
+#     exit=0
+#
+# Every table created, then dropped, in one call. The exit status was zero and the
+# script printed "migrations applied", because nothing failed — it applied a
+# migration and its exact inverse, in order, successfully. A developer running
+# `bin/dev` got an empty database and no error. CI never saw it, because CI runs
+# `goose`, which honours the annotations; the broken path was the fallback nobody
+# runs in CI, which is the worst place for a bug to live and the most likely place
+# for one.
+#
+# So the Up section is EXTRACTED before psql sees the file, by the awk below.
+# The Down marker is where extraction stops, and the Up marker is not consulted:
+# a migration that forgot its `-- +goose Down` should still forward-apply, and a
+# migration that forgot its `-- +goose Up` should still apply rather than quietly
+# do nothing.
+#
+# WHY THE EXTRACTION IS ITS OWN SCRIPT rather than an inline `awk | psql`. Because
+# `TestMigrateFeedsPsqlTheUpSectionAndNotTheDownOne` runs it, and that test is the
+# reason this cannot regress. An inline pipeline is untestable without a database
+# and a skipped test is worse than none.
 #
 # NO `set -e` AROUND THE LOOP. A migration that fails must stop the run, and
-# psql's own exit status does that; the loop's status is the last command's, which
-# is the migration that failed. `set -e` would stop at the first non-zero without
+# psql's own exit status does that; the loop's status is the last command to
+# run, which is the migration that failed. `set -e` would stop at the first non-zero without
 # saying which file, and the filename IS the useful part of the message.
 #
 # IDEMPOTENT, because `bin/dev` is. Applying an already-applied migration file is
@@ -47,7 +77,10 @@ for migration in "$ROOT"/migrations/*.sql; do
   [ -e "$migration" ] || continue
   name="$(basename "$migration")"
   printf 'applying %s\n' "$name"
-  if ! psql "$DATABASE_URL" --quiet --variable ON_ERROR_STOP=1 --file "$migration"; then
+  # Not `--file "$migration"`. The file carries its own Down section and psql
+  # would run that too; see the header. The Up section arrives on stdin.
+  if ! "$ROOT/bin/migration-up-section" "$migration" \
+    | psql "$DATABASE_URL" --quiet --variable ON_ERROR_STOP=1; then
     echo "bin/migrate: $name failed; the database is at whatever the previous file left it" >&2
     echo "bin/migrate: fix it by hand, or use 'goose -dir migrations postgres \$DATABASE_URL up'" >&2
     exit 1

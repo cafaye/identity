@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+#
+# Print the UP section of one migration, on stdout, for psql to run.
+#
+# WHY THIS EXISTS. `bin/migrate` used to hand each file to `psql --file`, on the
+# strength of a comment claiming that `-- +goose Up` and `-- +goose Down` are
+# just comments and so a plain psql run applies the Up section and ignores the
+# Down one. That is false — the annotations ARE comments, which is exactly why
+# psql runs both halves. Every migration was applied and then reverted in the
+# same call, exiting zero and printing "migrations applied". See bin/migrate's
+# header, and identity-31 in CHANGELOG.md.
+#
+# WHY IT IS A SEPARATE FILE. So it can be tested without a database. The test is
+# `TestMigrateFeedsPsqlTheUpSectionAndNotTheDownOne` in
+# internal/platform/ci/migrate_test.go, and it is the reason this cannot regress.
+# An inline `awk … | psql` in the loop would need a real Postgres and a real
+# psql to have any coverage at all, and a test that skips when those are missing
+# is a test that verifies nothing in the exact environment a developer runs in.
+#
+# THE RULE, AND WHY IT IS THE DOWN MARKER AND NOT THE UP ONE.
+#
+# Extraction stops at `-- +goose Down` and never looks for `-- +goose Up`.
+# Stopping at the Down marker means a migration whose Down section is missing —
+# which the README treats as legitimate for a forward-only migration — still
+# applies forward, instead of producing an empty file and a silent no-op.
+#
+# WHY IT IS awk AND NOT sed. sed ranges are inclusive at both ends and would
+# print the Down marker itself into the middle of the stream, where a statement
+# splitter would have to cope with a comment that matters. awk exits at the
+# marker and never emits it.
+#
+# PASSES EVERYTHING BEFORE THE DOWN MARKER, INCLUDING THE HEADER. The header is
+# comments and costs nothing, and keeping it means a failure reported by psql
+# quotes the same text a reader of the file sees.
+#
+# NO `set -e`: this script has one job and awk is it. A pipeline failure is
+# reported by the caller, which knows the filename and can say it.
+
+set -uo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: bin/migration-up-section <migration.sql>" >&2
+  exit 2
+fi
+
+migration="$1"
+if [ ! -r "$migration" ]; then
+  echo "bin/migration-up-section: $migration is not readable" >&2
+  exit 2
+fi
+
+# `^--[[:space:]]*\+goose[[:space:]]+Down` rather than a literal `-- +goose Down`:
+# the annotations are hand-written across fifteen files and the spacing in them
+# is exactly the kind of thing that drifts. Anchored at the start of the line so
+# a mention of the marker inside a comment or a string is not a cut.
+awk '/^--[[:space:]]*\+goose[[:space:]]+Down/ { exit } { print }' "$migration"
