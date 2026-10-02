@@ -1,0 +1,83 @@
+# The assertion set, by name. The list a service's own test must come back with.
+#
+# WHY THIS FILE EXISTS RATHER THAN A NUMBER IN EACH OF THE SIX DRIVERS.
+#
+# `templates/database/tenancy/isolation.sql` is the assertion set, and every one
+# of kit's six drivers runs it and reads back a table of rows. A driver that
+# asserts "no red rows" is satisfied by an isolation.sql that ran three
+# assertions instead of twenty-four, because the driver never asked whether the
+# other twenty-one came back. That is the exact failure this repository's
+# `--only` filter documents — a check that agrees with a filter that excludes
+# everything is not a passing check — and it is why the completeness assertion is
+# a LIST rather than a COUNT. A count of 24 is compatible with 24 of the wrong
+# 24; a set of names is not.
+#
+# So every driver reads this file, compares the names it got against the names
+# here, and fails on a difference in EITHER direction. One list, six drivers, and
+# no place for a driver to have its own idea of what the proof covers.
+#
+# WHAT KEEP'S THESE IN STEP. `tests/validate.sh` reads this file and
+# `isolation.sql` and asserts the two agree, both ways: every name here is
+# constructed in the script, and every assertion the script constructs is here.
+# A name added to the script without being listed here is a red gate, not a
+# silently-unasserted assertion — which is the whole reason this file is not a
+# comment in a driver.
+#
+# THE FOUR THAT ARE THE SHAPE, if you are reading one line rather than
+# twenty-four. The packet's three denials and one allowance:
+#
+#   login/no-identity-reads-no-rows                  no identity reads nothing
+#   login/another-tenants-rows-read-as-none         another tenant's valid token
+#   login/own-rows-are-visible                       its own token reads its rows
+#   login/own-identity-reads-only-its-own-rows       and not the other tenant's
+#
+# ...and the same five with `owner/` where the name is, which is the half that
+# `FORCE ROW LEVEL SECURITY` buys and the half no denial on behalf of a login
+# role can detect.
+#
+# THE THREE THAT ARE NOT DENIALS, and are here for the same reason every control
+# is here: a proof that cannot be shown to fail is not known to be load-bearing.
+#
+#   sweep/names-an-unprotected-table      the sweep reports a real finding
+#   sweep/the-only-finding-is-the-control and ONLY the one this file planted
+#   policies/written-for-the-init-plan   the policies are written wrapped, which
+#                                        no denial can detect because both forms
+#                                        return identical rows
+
+# --- the spine: three denials and one allowance, as the login role ------------
+login/no-identity-reads-no-rows
+login/another-tenants-rows-read-as-none
+login/own-rows-are-visible
+login/own-identity-reads-only-its-own-rows
+login/another-identity-reads-only-its-own-rows
+
+# --- the same five, as the owner. This is what FORCE buys --------------------
+owner/no-identity-reads-no-rows
+owner/another-tenants-rows-read-as-none
+owner/own-rows-are-visible
+owner/own-identity-reads-only-its-own-rows
+owner/another-identity-reads-only-its-own-rows
+
+# --- the write side. Matched-zero-rows denials, each paired with a read --------
+login/update-of-another-tenants-row-affects-no-rows
+login/delete-of-another-tenants-row-affects-no-rows
+login/denied-writes-left-the-other-tenants-rows-intact
+login/own-rows-survive-its-own-writes
+
+# --- the writes that RAISE rather than match nothing -------------------------
+login/insert-into-another-tenants-account-is-refused
+login/insert-into-its-own-account-is-allowed
+
+# --- the login role owns nothing, which no catalog reports --------------------
+login-role/is-not-the-table-owner
+login-role/cannot-disable-row-level-security
+login-role/cannot-drop-a-policy
+
+# --- how the policies are WRITTEN, which no denial can see -------------------
+policies/name-the-roles
+policies/written-for-the-init-plan
+
+# --- the sweep, and the control that makes its empty result mean something ----
+sweep/names-an-unprotected-table
+sweep/every-account-scoped-table-is-protected
+sweep/the-only-finding-is-the-control
