@@ -46,14 +46,24 @@ scope:
   # account — `api_keys` by `token_digest`, `oidc_clients` by `client_id` — and
   # because the statements that DO carry `where account_id` put the verb and the
   # predicate more than four lines apart (all six are listed and classified above
-  # `entryPoints`). The credential half is a measured production limitation rather
-  # than a gap in this list: it is pinned by
+  # `entryPoints`). The credential half WAS a measured production limitation
+  # rather than a gap in this list: it is pinned by
   # `internal/tenancy/credential_lookup_test.go` and written up in
   # `moon/logs/REPORT-identity-isolation-02.md` §3. Naming the two files is what
   # makes it checkable — the day somebody adds `and account_id = $2` to either
   # lookup, or rewrites one of those six as a single line, this checker goes red
   # naming the statement, which is the moment the fix lands and nobody has to
   # remember to come back here.
+  #
+  # identity-isolation-04 CHANGED THE `api_keys` HALF, and the paragraph above is
+  # now history rather than a live claim: that lookup is no longer a limitation,
+  # because it resolves by the presented digest under a policy of its own — see
+  # `rls.tables[api_keys]` and
+  # `TestTenancyACredentialResolvesByTheDigestTheCallerPresentedAndNothingElse`.
+  # The `oidc_clients` half still stands, and it is a finding for core rather than
+  # a gap in this list: `client_id` is a public identifier in the authorization
+  # URL, so it is the wrong table for a mechanism that widens a read to the row
+  # whose value the caller presented.
   #
   # WHAT IS DELIBERATELY NOT HERE, named so it cannot be mistaken for an
   # oversight: `internal/accounts/store.go`, which holds this service's other five
@@ -110,28 +120,28 @@ rls:
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 508
+            line: 853
         - name: account_users_cafaye_insert
           command: insert
           clause: with check
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 508
+            line: 853
         - name: account_users_cafaye_update
           command: update
           clause: using
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 508
+            line: 853
         - name: account_users_cafaye_delete
           command: delete
           clause: using
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 508
+            line: 853
     - table: account_invitations
       forced: true
       policies:
@@ -141,28 +151,51 @@ rls:
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 512
+            line: 867
         - name: account_invitations_cafaye_insert
           command: insert
           clause: with check
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 512
+            line: 867
         - name: account_invitations_cafaye_update
           command: update
           clause: using
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 512
+            line: 867
         - name: account_invitations_cafaye_delete
           command: delete
           clause: using
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 512
+            line: 867
+    # FIVE POLICIES, NOT FOUR, and the fifth is not an account policy at all. 00016
+    # calls `cafaye.protect_credential_table('api_keys', 'token_digest')`, which
+    # CALLS `protect_table` — so the four account policies below are byte-for-byte the
+    # ones every other protected table has — and then adds one `for select` policy
+    # whose USING clause is `token_digest = (select cafaye.current_credential_digest())`.
+    #
+    # WHY IT IS DECLARED RATHER THAN LEFT OUT. It is a policy on a declared protected
+    # table, in the roles the table's other policies name, and a declaration that
+    # listed four of the five would be a list that cannot be walked in either
+    # direction — the omission is invisible to the reader and to the checker alike.
+    #
+    # CORE CANNOT SEE ANY OF THE FIVE, AND `tenancy-check` SAYS SO. Its recogniser is
+    # `^select (cafaye.)?protect_table\(\s*'(table)'` — a literal table name as the
+    # FIRST argument — and this table's call is
+    # `protect_credential_table('api_keys', 'token_digest')`. So the checker reports
+    # `rls-not-enabled`, `rls-owner-bypass` and four `rls-policy-absent` against a
+    # table whose `relrowsecurity` and `relforcerowsecurity` are both true and whose
+    # five policies exist. That is a FALSE RED in core's scanner, measured in
+    # moon/logs/REPORT-identity-isolation-04.md §4, and the fix is core's: widen
+    # `_PROTECT_TABLE` to `protect_(?:credential_)?table`. The alternative — deleting
+    # this table from `rls.tables` to make the checker quiet — would declare that
+    # Postgres does not protect the one table holding every machine credential, which
+    # is the lie this file exists to be unable to tell.
     - table: api_keys
       forced: true
       policies:
@@ -172,28 +205,38 @@ rls:
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 516
+            line: 895
         - name: api_keys_cafaye_insert
           command: insert
           clause: with check
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 516
+            line: 895
         - name: api_keys_cafaye_update
           command: update
           clause: using
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 516
+            line: 895
         - name: api_keys_cafaye_delete
           command: delete
           clause: using
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 516
+            line: 895
+        # The resolve policy. Its predicate is the digest the CALLER PRESENTED, not the
+        # account, so `clause: using` with the other four is the honest reading and the
+        # declaration does not pretend this row is account-scoped.
+        - name: api_keys_cafaye_resolve
+          command: select
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 895
     - table: oidc_clients
       forced: true
       policies:
@@ -203,28 +246,28 @@ rls:
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 520
+            line: 911
         - name: oidc_clients_cafaye_insert
           command: insert
           clause: with check
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 520
+            line: 911
         - name: oidc_clients_cafaye_update
           command: update
           clause: using
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 520
+            line: 911
         - name: oidc_clients_cafaye_delete
           command: delete
           clause: using
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 520
+            line: 911
     - table: account_audit_log
       forced: true
       policies:
@@ -234,28 +277,28 @@ rls:
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 524
+            line: 915
         - name: account_audit_log_cafaye_insert
           command: insert
           clause: with check
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 524
+            line: 915
         - name: account_audit_log_cafaye_update
           command: update
           clause: using
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 524
+            line: 915
         - name: account_audit_log_cafaye_delete
           command: delete
           clause: using
           roles: [identity, identity_app]
           constrained:
             file: migrations/00016_account_isolation.sql
-            line: 524
+            line: 915
 
 # `tenancy.enumeration-partial` NAMES ELEVEN SITES IN `scope.sources` THAT IT
 # COULD NOT ATTRIBUTE, and the finding says the author must read them and confirm

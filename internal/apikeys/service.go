@@ -508,8 +508,10 @@ func (s *Service) Introspect(ctx context.Context, token string, now time.Time) (
 // way, that query read zero rows for a request with no identity set, which is the
 // state every scoped-token request is in before it has resolved anything, and
 // ErrNotFound became 401 for every valid machine credential in the fleet. Measured,
-// not recalled: see the characterisation that used to pin it,
-// TestTenancyACredentialLookupReadZeroRowsBeforeMD24AndThisIsItsReplacement.
+// not recalled: it was pinned by a characterisation test that asserted the 401 as
+// a green, `TestTenancyACredentialLookupHasNoIdentityToRunUnder`, and is now
+// asserted as a property by
+// TestTenancyACredentialResolvesByTheDigestTheCallerPresentedAndNothingElse.
 //
 // The transaction is transaction-local, so after it commits the digest is gone and
 // the connection is an ordinary no-identity session until `requireAccountRole` sets
