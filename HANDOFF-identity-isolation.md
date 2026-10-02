@@ -156,7 +156,11 @@ the database, and other packages' `dbtest.Schema` fixture schemas — cloned wit
 whole-database sweep (`expected "1"`, `actual "21"`). **Kit's fix has merged**
 (`0e1d4c1`, "scope the sweep to the schemas the substrate was applied in") and
 identity's 00016 now carries kit's current substrate, so the sweep is scoped.
-The whole-suite run at the bottom of this file is the measurement.
+
+`internal/tenancy` is `ok 1.683s` and then `ok 0.976s` in **two consecutive**
+whole-suite runs — which is the number of runs that matters here, because the
+failure it replaced was intermittent and depended on how many neighbours happened
+to be mid-test.
 
 ### 3.C `TestTheCoverageExclusionIsOnlyGeneratedCode` — PRE-EXISTING, UNRELATED
 
@@ -253,6 +257,9 @@ $ TEST_DATABASE_URL=… go test ./... -count=1
   23 packages ok, ONE failure and it is §3.C: the coverage-exclusion declaration.
   internal/tenancy  ok  1.683s     ← §3.B: the sweep race is GONE
   internal/httpapi  ok  66.649s    (66 seconds beside thirteen other packages)
+  EXIT=1
+  …re-run, because the failure it replaced was intermittent:
+  internal/tenancy  ok  0.976s     ← same single failure, second run
   EXIT=1
 ```
 
