@@ -624,6 +624,24 @@ wrong. `internal/platform/ci` is what keeps the two honest: it asserts that the
 workflow really runs `bin/prime`, that the migrations really run before it, that
 the toolchain pin matches `go.mod`, and that no secret is written down.
 
+**`.github/workflows/publish.yml` is a second workflow and it is not a second
+gate.** It builds and pushes the image `config/deploy.yml` deploys, and it never
+runs on a pull request — so a mistake in it cannot be caught by the mistake being
+noticed, only by a check. `internal/platform/ci/publish_test.go` is that check:
+the file exists, it calls `cafaye/kit/.github/workflows/image.reusable.yml@master`
+at the one path GitHub can resolve, it carries no `docker/build-push-action@` of
+its own, it grants `packages: write`, it says `push: true`, and no
+`pull_request` trigger reaches it.
+
+- **Do not inline a build step into `publish.yml`.** The build is kit's, shared,
+  so a fix to how an image is built lands here on kit's next push. Naming the
+  action in a comment is fine and the check allows it; depending on it is the
+  thing being prevented.
+- **`packages: write` is the caller's to grant.** A reusable workflow can request
+  a permission but cannot grant itself one, and the missing line shows up at the
+  push as a 401, which reads like a bad password rather than like the missing
+  line it is.
+
 ## Adding an endpoint
 
 1. `internal/httpapi/` — the handler, the route, and JSON through `writeJSON`.

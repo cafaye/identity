@@ -1,0 +1,90 @@
+---
+# identity — the image cafaye identity runs, built on every push to master.
+#
+# This workflow is a CALLER, not a copy. The build itself lives at
+# cafaye/kit/.github/workflows/image.reusable.yml@master and is shared by every
+# service in the fleet, so a fix to how an image is built reaches here on the
+# next push with no pull request against this repository. Copying the steps
+# instead would give this repository its own image pipeline to maintain and
+# diverge, which is the failure `ci.yml` has already been written to avoid for
+# the test half of the same problem.
+#
+# WHY THIS FILE EXISTS AT ALL. `config/deploy.yml` says
+#
+#     image: <%= org %>/<%= repo %>
+#     registry:
+#       server: <%= registry %>          # ghcr.io
+#
+# and `kamal deploy` pulls that image. Before identity-32 nothing in this
+# repository produced it — the Dockerfile could be built by hand and CI could
+# prove the tree, but the artifact the deploy config names had no pipeline
+# behind it, so the only way it existed was one person running `docker build` on
+# one machine. A deploy config describing a deploy nothing produces is a
+# document, not a plan.
+#
+# A DISTROLESS BINARY, AND WHAT THAT COSTS HERE. This image is CGO_ENABLED=0 and
+# distroless/static, built in two stages with the toolchain in the builder and
+# nothing but the binary in the runtime. That is the kit Go template's shape and
+# it is not negotiable, but it does mean the build is slower than a node build
+# and the runtime layer is small — which is why the cache matters more here, and
+# why `cache-to: type=gha` is left at the reusable workflow's default rather
+# than tuned per service. A caller that tuned it would be a second place to be
+# wrong about a setting that is already shared.
+#
+# THE ONE PERMISSION, AND WHO GRANTS IT. `packages: write` is granted HERE,
+# by the caller. A reusable workflow can request a permission but cannot grant
+# itself one, and a caller that omits this line gets a read-only token and a
+# 401 at the push — which reads like a wrong password rather than like the
+# missing line it actually is.
+#
+# WHY master ONLY, AND NOT pull_request. Two reasons, and the second is the one
+# that bites. Master is where a deployable commit lives, so building on a branch
+# would publish images nobody deploys. And a `pull_request` build would run
+# untrusted code — the Dockerfile, whatever a contributor changed — against a
+# registry write. The reusable workflow also refuses to publish when
+# `github.event_name` is `pull_request` regardless of what this file asks for,
+# so the guard is in both places deliberately: this one because a reader should
+# be able to see it here, and that one because a caller written later should not
+# have to remember.
+#
+# NO TAG IS CHOSEN HERE. The reusable workflow derives the image name from
+# `github.repository` and tags it `sha-<commit>`, `<branch>`, and `latest`. A
+# name chosen at the call site would be a second spelling of the same fact and
+# the two would eventually disagree.
+name: publish
+
+on:
+  push:
+    branches: [master]
+  # A re-push after a runner flake, or a rebuild of an old commit, without
+  # needing an empty commit. Explicit rather than inferred so the trigger list
+  # reads as a list of the things that publish.
+  workflow_dispatch:
+
+# Declared at the top as well as in the caller block below. The reusable
+# workflow's own ceiling is `contents: read` + `packages: write`, and this is
+# what actually grants it. Two places rather than one because a reader looking
+# for why the push fails should find the answer without reading another
+# repository.
+permissions:
+  contents: read
+  packages: write
+
+# Same rule `ci.yml` uses: a second push to master makes the first one's image
+# irrelevant, so it is cancelled rather than waited out. Without this, two
+# pushes in quick succession can race, and the second run — cancelled
+# mid-push — can leave `latest` naming the first run's image.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: image
+    uses: cafaye/kit/.github/workflows/image.reusable.yml@master
+    with:
+      # Everything else is a default: `.`, `./Dockerfile`, both platforms,
+      # the Actions cache. This repository has a Dockerfile at the conventional
+      # path and a context at the root, so naming them here would be a second
+      # place to be wrong about the same fact.
+      push: true
