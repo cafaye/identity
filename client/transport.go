@@ -35,7 +35,7 @@ package client
 // regeneration gate's blast radius visible instead of spread across twenty call
 // sites.
 //
-// The thirty-one methods below are the document's thirty-one `operationId`s, in
+// The forty-one methods below are the document's forty-one `operationId`s, in
 // the document's order, with the generated parameter types. The compile-time
 // assertion at the bottom is what proves the generated `*generated.Client` still
 // satisfies it, so a mismatch is a build failure rather than a runtime surprise.
@@ -76,6 +76,16 @@ type Transport interface {
 	RequestEmailChange(ctx context.Context, body generated.RequestEmailChangeJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	ConfirmEmailChangeCurrentAddress(ctx context.Context, body generated.ConfirmEmailChangeCurrentAddressJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	ConfirmEmailChangeNewAddress(ctx context.Context, body generated.ConfirmEmailChangeNewAddressJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	CreateAccount(ctx context.Context, body generated.CreateAccountJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	ListAccounts(ctx context.Context, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	GetAccount(ctx context.Context, accountId openapiTypes.UUID, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	RenameAccount(ctx context.Context, accountId openapiTypes.UUID, body generated.RenameAccountJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	DeleteAccount(ctx context.Context, accountId openapiTypes.UUID, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	ListMembers(ctx context.Context, accountId openapiTypes.UUID, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	InviteMember(ctx context.Context, accountId openapiTypes.UUID, body generated.InviteMemberJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	ChangeMemberRole(ctx context.Context, accountId openapiTypes.UUID, userId openapiTypes.UUID, body generated.ChangeMemberRoleJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	RemoveMember(ctx context.Context, accountId openapiTypes.UUID, userId openapiTypes.UUID, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	AcceptInvitation(ctx context.Context, body generated.AcceptInvitationJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	RegisterOIDCClient(ctx context.Context, accountId openapiTypes.UUID, body generated.RegisterOIDCClientJSONRequestBody, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	ListOIDCClients(ctx context.Context, accountId openapiTypes.UUID, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	GetOIDCClient(ctx context.Context, accountId openapiTypes.UUID, clientId openapiTypes.UUID, reqEditors ...generated.RequestEditorFn) (*http.Response, error)

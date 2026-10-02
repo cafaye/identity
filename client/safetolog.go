@@ -30,7 +30,7 @@ package client
 // of the answer, and it is worth recording because the alternative (renaming a
 // generated type, or wrapping every one of them) is worse.
 //
-// A wrapping struct per generated type would mean twenty new exported types a caller
+// A wrapping struct per generated type would mean dozens of new exported types a caller
 // has to remember to use, and a caller who forgets has exactly the leak they were
 // trying to avoid. So there is one function, one name, and the test above asserts
 // it works on the three worst cases.
@@ -61,7 +61,7 @@ import (
 // ordinary.
 //
 // It is a function taking `any` rather than twenty typed entry points, because a
-// caller holding a value should not have to know which of the twenty shapes it is.
+// caller holding a value should not have to know which of the generated shapes it is.
 //
 // ## THE LIMIT OF THIS ONE, AND WHICH OF THE TWO TO REACH FOR
 //

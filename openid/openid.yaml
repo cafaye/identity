@@ -391,6 +391,110 @@ paths:
                 instance: /oidc/authorize
                 code: invalid_request
                 trace_id: 0af7651916cd43dd8448eb211c80319c
+    post:
+      tags: [oidc]
+      operationId: authorizeViaPost
+      summary: Start an authorization request, by POST
+      description: |
+        **The same operation as `authorize`, delivered by POST.** OpenID Connect
+        Core §3.1.2.1 requires the authorization endpoint to accept both methods,
+        and a product behind a strict corporate proxy may have no choice; the same
+        handler answers both and `registerOIDCRoutes` mounts both for exactly that
+        reason. It is a second operation rather than a documented `get` because a
+        generated client has one method per (method, path) and a client behind
+        such a proxy needs the method the generator did not think to emit.
+
+        Every parameter is unchanged and arrives in an
+        **`application/x-www-form-urlencoded` body** instead of the query string.
+        The handler reads `r.Form`, which covers both, so the pre-checks and the
+        library see the same values whichever method delivered them.
+
+        The four pre-checks are the same four — an unknown scope or a request with
+        no `openid`, a missing or non-`S256` `code_challenge`,
+        `prompt=login`/`consent`/`select_account`, and `max_age` — and they answer
+        `application/problem+json` with code `invalid_request`, **before** anything
+        is stored and before a browser is redirected anywhere. `prompt=none` is
+        still not one of them.
+
+        **This does not relax anything about `redirect_uri`.** A `redirect_uri`
+        that is not on the registration is still rendered here as RFC 6749
+        §4.1.2.1 requires and is never redirected to, because redirecting to an
+        origin the client has not proved it registered is the same open redirect
+        with better manners — and a POST is not a less dangerous way to arrive.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [client_id, redirect_uri, response_type, scope, code_challenge, code_challenge_method]
+              properties:
+                client_id:
+                  type: string
+                redirect_uri:
+                  type: string
+                  format: uri
+                  description: Must equal a registered `redirect_uri` character for character.
+                response_type:
+                  type: string
+                  enum: [code]
+                scope:
+                  type: string
+                  description: Space-delimited. Must include `openid`.
+                  example: 'openid email profile accounts'
+                state:
+                  type: string
+                  description: The client's CSRF value. Echoed back untouched.
+                nonce:
+                  type: string
+                  description: Echoed into the ID token's `nonce` claim.
+                code_challenge:
+                  type: string
+                code_challenge_method:
+                  type: string
+                  enum: [S256]
+                prompt:
+                  type: string
+                  enum: [none]
+                  description: Only `none` is accepted. `login`, `consent` and `select_account` are 400.
+                max_age:
+                  type: integer
+                  description: Not implemented. Sending it is a 400.
+      responses:
+        '302':
+          description: |
+            To this service's login page, on a request that has been validated. The
+            browser is not sent to `redirect_uri` yet: no code exists until a user
+            has authenticated.
+          headers:
+            Location:
+              schema: { type: string, format: uri-reference }
+        '400':
+          description: |
+            Two shapes, chosen by whether the `redirect_uri` itself was acceptable.
+
+            A `redirect_uri` that is not on the registration, or a malformed
+            request, is rendered HERE as RFC 6749 §4.1.2.1 requires. The
+            pre-checks (an unknown scope, a missing or non-S256
+            `code_challenge`, `prompt=login`/`consent`/`select_account`, `max_age`)
+            are the exception and use core's problem envelope with code
+            `invalid_request`, naming the offending parameter in `detail`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/invalid_request
+                title: Invalid request
+                status: 400
+                detail: 'unknown scope "phone"; this provider implements openid email profile accounts'
+                instance: /oidc/authorize
+                code: invalid_request
+                trace_id: 0af7651916cd43dd8448eb211c80319c
 
   /oidc/authorize/callback:
     get:
@@ -529,6 +633,71 @@ paths:
         key set until its `exp` arrives.
       security:
         - accessToken: []
+      responses:
+        '200':
+          description: The claims.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserInfo'
+        '401':
+          description: No token, or one this service will not honour.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+        '403':
+          description: |
+            The token is valid but identifies nobody — it carries no `openid`
+            scope, and so there is no subject to describe.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+    post:
+      tags: [oidc]
+      operationId: userinfoViaPost
+      summary: The claims a token was granted, by POST
+      description: |
+        **The same operation as `userinfo`, with the token in the body.** OpenID
+        Connect Core §5.3.1 requires the userinfo endpoint to accept `POST` with
+        `access_token` as a form field, and the same handler answers both because
+        `registerOIDCRoutes` mounts both.
+
+        **The one difference is where the token comes from, and it is worth being
+        exact about.** The `Authorization: Bearer` header is read **first** and
+        still wins; the form body is consulted only when there is no `Authorization`
+        header at all. So this operation does not require the form — it accepts it,
+        and a client that already sends the header has nothing to change.
+
+        `access_token` is a single form field, `application/x-www-form-urlencoded`,
+        and nothing else is read from the body.
+
+        **Nothing about the claims changes.** The token still returns only what it
+        was granted, `email_verified` is still always `false`, a token for a
+        revoked registration is still refused, and the 403 for a token carrying no
+        `openid` scope still has no subject to describe. Moving the token from a
+        header to a body is a transport change and deliberately not a capability
+        change: a POST here grants nothing the GET did not.
+
+        A token in a request body is a token in a place intermediaries log more
+        eagerly than a header. The GET is the right default for a first-party
+        client; this exists because the specification requires it and a product
+        behind a proxy may have no other choice.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [access_token]
+              properties:
+                access_token:
+                  type: string
+                  description: |
+                    The access token, in the body rather than in an
+                    `Authorization` header. Ignored when the header is present.
       responses:
         '200':
           description: The claims.

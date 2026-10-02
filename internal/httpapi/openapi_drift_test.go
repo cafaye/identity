@@ -13,8 +13,15 @@ package httpapi
 //
 // This is the last of these checks in the fleet. courier, darkroom, guard, muse,
 // pantry and billing have had one since the sixth time it fired. This file is
-// the seventh, and it fires on its first run: twelve operations are served and
-// written down in no document at all. See `knownDrift` below and DECISIONS.md D1.
+// the seventh, and it fired on its first run: twelve operations were served and
+// written down in no document at all.
+//
+// It no longer does, and that is the whole of what packets identity-11 and
+// identity-28 changed about it. All twelve are documented, `knownDrift` below is
+// empty and pinned at empty, and the twelve are named in full in [DECISIONS.md
+// D1]. What they bought is the thing a check like this is actually for: a service
+// whose contract is held to its router by a test rather than by whoever remembered
+// to write the entry down.
 //
 // ## Both sides are read, and both directions are compared
 //
@@ -28,8 +35,8 @@ package httpapi
 // count comparison passes when one operation is added and another is removed,
 // which is a real and common way for a document to drift from a router; and a
 // comparison over paths alone cannot see a method, which is billing's bug and
-// which this repository already has once — see the last two entries of
-// `knownDrift`.
+// which this repository already had once — on `POST /oidc/authorize` and
+// `POST /oidc/userinfo`, both of which identity-28 documented.
 //
 // ## Both documents, not just `openapi/v1.yaml`
 //
@@ -78,8 +85,10 @@ package httpapi
 // keeps that from being where a forgotten route goes. Without it the next
 // person adds a route, forgets both, and the list quietly turns the check into
 // decoration. `TestEveryServedRouteIsDocumentedOrNamed` is that check, and
-// `TestKnownDriftIsExactlyTheRoutesItClaimsToBe` pins the list so it cannot
-// quietly become one.
+// `TestKnownDriftIsEmptyBecauseEveryServedOperationIsDocumented` pins the list at
+// the state it is actually in — which, since identity-28, is empty. The map is
+// kept rather than deleted for the reason its own comment gives: an empty map is
+// an assertion and a deleted map is an invitation.
 
 import (
 	"net/http"
@@ -100,48 +109,46 @@ const (
 
 // knownDrift is a route the router serves that NO document describes.
 //
-// ## These are bugs, and this packet is not allowed to fix them
+// ## IT IS EMPTY, AND THE EMPTY IS THE FINDING
 //
-// The ten tenancy routes below have been served since the accounts packet and
-// appear in neither `openapi/v1.yaml` nor `openid/openid.yaml` nor the README's
-// endpoint table. The two OIDC routes below are the billing bug verbatim:
-// `registerOIDCRoutes` mounts GET and POST on `/oidc/authorize` and on
-// `/oidc/userinfo` because OpenID Connect Core permits both and "a product
-// behind a strict corporate proxy may have no choice", and `openid/openid.yaml`
-// wrote down only the GET. The code says the POST is deliberate; the document
-// does not mention it.
+// It held TWELVE entries when packet `identity-09` wrote this file, and it fired
+// on its first run because of them:
 //
-// Documenting the operations is forbidden to this packet ("this packet adds a
-// check, not operations"), and calling them "not client operations" would be
-// false — the tenancy routes are in the authorization matrix and, for seven of
-// them, in `accountRouteScopes`, so they are checked for authorization and
-// unrecorded as contract surface. So they are here, under a name that says what
-// they are, and the check is what holds them visible.
+//   - the ten tenancy operations — `POST`/`GET /v1/accounts`,
+//     `GET`/`PATCH`/`DELETE /v1/accounts/{account_id}`,
+//     `GET /v1/accounts/{account_id}/members`,
+//     `POST /v1/accounts/{account_id}/invitations`,
+//     `PATCH`/`DELETE /v1/accounts/{account_id}/members/{user_id}` and
+//     `POST /v1/invitations/accept` — served since the accounts packet, gated,
+//     scope-checked and in the authorization matrix, and written down in no
+//     document at all;
+//   - `POST /oidc/authorize` and `POST /oidc/userinfo`, which
+//     `registerOIDCRoutes` mounts deliberately and `openid/openid.yaml` declared
+//     only the `GET` of. billing's bug, on this service's own protocol surface.
 //
-// The list is pinned by `TestKnownDriftIsExactlyTheRoutesItClaimsToBe`: it
-// cannot grow, because growth is how a forgotten route gets excused, and it
-// cannot be emptied, because that is somebody deleting the list instead of
-// fixing the routes. Closing D1 shrinks it, and shrinking it is the only way an
-// entry is ever removed.
-var knownDrift = map[operationKey]string{
-	// The tenancy surface. Ten operations.
-	{Method: "POST", Path: "/v1/accounts"}:                 "served since the accounts packet; in no document",
-	{Method: "GET", Path: "/v1/accounts"}:                  "served since the accounts packet; in no document",
-	{Method: "GET", Path: "/v1/accounts/{}"}:               "served since the accounts packet; in no document",
-	{Method: "PATCH", Path: "/v1/accounts/{}"}:             "served since the accounts packet; in no document",
-	{Method: "DELETE", Path: "/v1/accounts/{}"}:            "served since the accounts packet; in no document",
-	{Method: "GET", Path: "/v1/accounts/{}/members"}:       "served since the accounts packet; in no document",
-	{Method: "POST", Path: "/v1/accounts/{}/invitations"}:  "served since the accounts packet; in no document",
-	{Method: "PATCH", Path: "/v1/accounts/{}/members/{}"}:  "served since the accounts packet; in no document",
-	{Method: "DELETE", Path: "/v1/accounts/{}/members/{}"}: "served since the accounts packet; in no document",
-	{Method: "POST", Path: "/v1/invitations/accept"}:       "served since the accounts packet; in no document",
-
-	// The billing bug, already here, on the sibling document. A path registered
-	// under a second method, with only the first written down. A check that
-	// compared paths rather than (method, path) would report agreement on both.
-	{Method: "POST", Path: "/oidc/authorize"}: "openid.yaml declares GET only; the POST is deliberate in registerOIDCRoutes",
-	{Method: "POST", Path: "/oidc/userinfo"}:  "openid.yaml declares GET only; the POST is deliberate in registerOIDCRoutes",
-}
+// Packet `identity-28` closed all twelve by documenting them, and it emptied the
+// list the only way this file permits: **an entry is removed by fixing the route,
+// never by editing the list.** The count went from twelve to zero and the
+// pin below moved in the same commit as the document entries, which is what makes
+// a shrink reviewable.
+//
+// The customer-language reason, because "a list got shorter" is not a change to
+// anybody: before it, a client generated from these documents could read an
+// account's API keys and register its OIDC clients and had **no method at all** for
+// creating the account, inviting anybody into it, or accepting an invitation. A
+// product cannot onboard a tenant through the client it ships. See
+// [DECISIONS.md D1].
+//
+// ## WHY IT IS STILL HERE, EMPTY
+//
+// Because an empty map and a deleted map are different things, and the difference
+// is the whole safety property. A deleted list cannot be re-added to by a packet
+// that has an entry to put in it, and it turns `TestEveryServedRouteIsDocumentedOrNamed`
+// into a check over an unmuffled route set that a future edit could quietly
+// re-broaden. The map stays; its emptiness is asserted, its contents are checked
+// for staleness in both directions, and any addition has to name a real blocker
+// and move the pin — which is three review-visible edits rather than one.
+var knownDrift = map[operationKey]string{}
 
 // drift is the symmetric difference between what the documents declare and what
 // the router serves, split by direction.
@@ -347,57 +354,75 @@ func TestEveryDocumentedOperationIsServed(t *testing.T) {
 
 // --- the list, and what keeps it from being an escape hatch --------------------
 
-// TestKnownDriftIsExactlyTheRoutesItClaimsToBe pins the list in both
-// directions, and they are opposite on purpose.
+// TestKnownDriftIsEmptyBecauseEveryServedOperationIsDocumented is the pin, and
+// it is a pin on ZERO.
 //
-// A list that can grow IS the escape hatch this file exists to close: the next
-// undocumented route gets an entry, the suite goes green, and the check has been
-// made green by not checking. So growth fails, and so does emptying the list,
-// because a `knownDrift` with nothing in it means somebody deleted the list
-// rather than documented the routes. The only legal change is a shrink, and a
-// shrink happens by fixing a route, not by editing a list.
-func TestKnownDriftIsExactlyTheRoutesItClaimsToBe(t *testing.T) {
-	// The count this file records. Twelve: ten tenancy operations and the two
-	// OIDC POSTs.
-	//
-	// UNCHANGED BY THE ADMIN SURFACE, and the fact that it is worth a comment is
-	// the point. Packet identity-11 added three operations to this service's
-	// router and the answer was to DOCUMENT them — in openapi/v1.yaml, with
-	// operationIds and full request and response schemas — rather than to add
-	// three entries here. The pin below did not move, which is the only honest
-	// way this list can be smaller than the number of undocumented routes that
-	// were once in it.
-	//
-	// If a future packet adds an admin operation and finds itself tempted to bump
-	// this constant, the tripwire is telling the truth and the constant is the
-	// lie. Document the route.
-	const want = 12
+// ## WHAT MOVED, AND WHY ZERO IS STILL A PIN
+//
+// It was twelve. `identity-11` left it at twelve while documenting three admin
+// operations, and `identity-28` took it to zero by documenting the other twelve.
+// The two halves of the old rule — "it cannot grow" and "it cannot be emptied" —
+// are now ONE rule, and it is stronger than either:
+//
+//	**the only legal change to this map is a shrink, and a shrink happens by
+//	documenting a route.**
+//
+// The old "cannot be emptied" clause was written against a list of *known bugs*,
+// where deleting an entry could have meant deleting the memory of a gap rather
+// than closing it. That is no longer the shape: the list's own header now records
+// all twelve and the commit that closed them, so the memory survives the removal
+// and an empty map means the service is fully documented rather than that somebody
+// forgot.
+//
+// Growth is still the escape hatch this file exists to close, and it is now
+// simpler to refuse: ANY entry is a failure, whatever the count.
+//
+// ## WHY THE MESSAGE IS THE ARGUMENT
+//
+// A packet that adds a route and lands here is one second away from writing a
+// line of prose and watching the suite go green. So the failure message is the
+// whole content of the rule, and it is the same argument in the same order every
+// time: this is not an exclusion list, an entry is an admission, and an admission
+// is a claim somebody has to defend. If the route genuinely is not contract
+// surface, that is a decision to record in the document's own header and in the
+// README — which is what courier's `openapi_document_test.exs` requires of its own
+// exclusions — and it is still an entry here, with that reasoning as its reason.
+func TestKnownDriftIsEmptyBecauseEveryServedOperationIsDocumented(t *testing.T) {
+	// The count this file records. Zero, since packet identity-28.
+	const want = 0
 
 	if len(knownDrift) == want {
 		return
 	}
 
 	names := make([]string, 0, len(knownDrift))
-	for key := range knownDrift {
-		names = append(names, key.String())
+	for key, reason := range knownDrift {
+		names = append(names, key.String()+" — "+reason)
 	}
 	sort.Strings(names)
 
-	if len(knownDrift) > want {
-		t.Errorf("knownDrift has grown from %d entries to %d. A list that grows is the "+
-			"escape hatch: an undocumented route would get an entry and the suite would go "+
-			"green, which is a check that can be made green by not checking. Close "+
-			"DECISIONS.md D1 — by documenting the route, or by ruling it out of the contract "+
-			"in writing — and shrink this list with it. Never grow it to make a red go away.\n\n"+
-			"  now: %v", want, len(knownDrift), names)
-		return
-	}
-	t.Errorf("knownDrift has %d entries and this packet recorded %d. A list that shrank means "+
-		"a route stopped being served, which closes a finding, and this file's "+
-		"TestKnownDriftNamesOnlyServedRoutes should have caught it first. If a route really "+
-		"was removed, delete its entry and say so in the CHANGELOG — and re-pin the count "+
-		"here, so the shrink is a decision rather than an edit.\n\n  now: %v",
-		len(knownDrift), want, names)
+	t.Errorf("knownDrift has %d entr(ies) and this file records %d: every route the router "+
+		"serves is in openapi/v1.yaml or openid/openid.yaml.\n\n  %s\n\n"+
+		"This map is NOT an exclusion list. An exclusion list says \"this is not part of "+
+		"the contract\" and an entry in it is a claim about intent; an entry in THIS map "+
+		"says \"this is served and written down nowhere\", and an entry is an admission "+
+		"that the contract is missing an operation. Merging the two meanings is how a "+
+		"future route gets excused by being called a bug.\n\n"+
+		"Do one of the two things, and then DELETE the entry — which is the only way one "+
+		"is ever removed:\n"+
+		"  1. it is part of the public surface. Document it in openapi/v1.yaml or "+
+		"openid/openid.yaml, whichever surface it is on, with an operationId. Ten tenancy "+
+		"operations and two OIDC POSTs were closed exactly this way by packets identity-28 "+
+		"and identity-11, and the list went to zero rather than growing.\n"+
+		"  2. it is genuinely not contract surface. Record that in the document's header "+
+		"AND in the README's endpoint table, in prose a consumer reads, and put the "+
+		"reason here. Expect this test to fail either way — that is the point. A decision "+
+		"to leave a route undocumented is three review-visible edits, not one line.\n\n"+
+		"NEVER grow this list to make a red go away, and never add a prefix filter to the "+
+		"check. A filter is a guess about intent and it cannot see a method — which is how "+
+		"PUT /v1/customers/{id} went on being served in billing under a check that read "+
+		"paths only.",
+		len(knownDrift), want, strings.Join(names, "\n  "))
 }
 
 // TestKnownDriftNamesOnlyServedRoutes is the staleness guard, and it is the
@@ -513,6 +538,14 @@ func TestEveryOperationHasAnOperationIdAndNoOperationIdIsUsedTwice(t *testing.T)
 // `POST /v1/email-verifications`, so a client with a branch on that status has to
 // be rebuilt. The alternative — leaving the version at 1.5.0 and describing the
 // removal in prose — is how a client finds out from a support ticket.
+//
+// 1.7.0 is the tenancy surface: ten operations added, all of them served for
+// months and written down nowhere. It is additive in the way that matters, and it
+// is the bump that took `knownDrift` to zero — a client generated from 1.7.0 has
+// `createAccount`, `inviteMember` and `acceptInvitation`, and one generated from
+// 1.6.0 does not. The one response shape that changed (`members` entries, which
+// used to carry an empty `user_id`) is on operations that 1.6.0 did not describe,
+// so no client can be reading the old shape.
 func TestTheDocumentIsOpenAPI31AndCarriesAVersion(t *testing.T) {
 	doc, err := readOpenAPIDocument(v1Document)
 	if err != nil {
@@ -525,7 +558,7 @@ func TestTheDocumentIsOpenAPI31AndCarriesAVersion(t *testing.T) {
 			v1Document, doc.SpecVersion)
 	}
 
-	const want = "1.6.0"
+	const want = "1.7.0"
 	if doc.InfoVersion != want {
 		t.Errorf("%s declares info.version %q, not %q. core's sync rule is that the /v1 "+
 			"prefix says which contract and this says which build of it, and a non-breaking "+

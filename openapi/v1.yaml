@@ -62,7 +62,30 @@ info:
   # that renders "this address is already verified" from a 409 must ask
   # `GET /v1/email-verification` instead**, which requires a session and answers 200
   # for every signed-in account whether or not it is proved.
-  version: 1.6.0
+  # 1.7.0 IS THE TENANCY SURFACE, and it is the largest addition this document has
+  # ever had: ten operations that have been served, gated, scope-checked and in the
+  # authorization matrix since the accounts packet, and that were written down
+  # NOWHERE. They were ten of the twelve entries in `knownDrift` in
+  # internal/httpapi/openapi_drift_test.go — a list that could not be emptied by
+  # documenting them and could not grow either, which is the shape of a parked
+  # decision rather than of a small gap. DECISIONS.md D1 is what ruled on it, and
+  # the customer-language version is that a product could read an account's API
+  # keys and register its OIDC clients and had no way to MAKE the account, which
+  # is the first call of any onboarding.
+  #
+  # One behaviour change on a surface that is new in this version, stated here
+  # rather than left to be discovered: the `members` / `memberships` arrays on
+  # `getAccount` and `listMembers` used to carry an empty `user_id` and a zero
+  # `created_at` on every entry. Nothing consumed that — these operations were in
+  # no document, so no generated client had a method for either — and every entry
+  # is now the membership it claims to be.
+  #
+  # The operationIds are not new names invented here. The `bearerToken` scheme's
+  # description below has named `getAccount`, `listMembers`, `inviteMember`,
+  # `deleteAccount` and the other six in its required-scopes table since 1.4.0,
+  # because a scope that gates a route no document declared is a promise with
+  # nothing behind it. They are now the method names on every generated client.
+  version: 1.7.0
   summary: Authentication, sessions, multi-factor authentication, account recovery, accounts, tenancy, scoped API tokens, the admin surface and OIDC registrations.
   description: |
     `identity` is the cafaye platform's security boundary: it is what every other
@@ -140,7 +163,7 @@ info:
     cafaye API for managing the registrations that provider accepts:
     `/v1/accounts/{account_id}/oidc-clients`.
 
-    ## Two authorization decisions worth knowing before reading the matrix
+    ## Three authorization decisions worth knowing before reading the matrix
 
     A non-member of an account gets **404**, never 403, on every account-scoped
     route including the OIDC ones. A 403 would confirm that the account id they
@@ -151,9 +174,19 @@ info:
     Registering, reading and revoking an OIDC client are **owner-only**. Adding a
     client is adding a new way for code to arrive in a product and get a token
     back out, and "can read the member list" is not authority to widen the
-    perimeter. `identity` has no platform-admin role yet — the admin API is a
-    later packet — so the owner role is the one privilege this service already
-    has that means "may change what can enter this account".
+    perimeter. There is **no platform-admin role**: `identity` has no role above
+    `owner` on an account, and the `admin` tag is not one — it is the account
+    admin *surface*, reachable only by a scoped API token, and its whole
+    privilege boundary is one sentence: *an account admin may revoke pending
+    invitations to their own account and read that account's admin audit log.*
+    `owner` remains the one role on an account that means "may change what can
+    enter it".
+
+    **The three collection operations — `createAccount`, `listAccounts` and
+    `acceptInvitation` — take a session and refuse every scoped API token with
+    403**, and that is a decision rather than a gap in the scope table. Each
+    answers a question about the caller's whole set of accounts; a token is bound
+    to one of them. See the `tenancy` tag.
 
     ## Scoped API tokens are a third credential, not a flag on either of the others
 
@@ -206,6 +239,37 @@ tags:
       password. The absence of these routes says nothing about whether a second
       factor is still required — `POST /v1/session/mfa` rides on the sessions
       surface and answers 503 when it cannot verify a code.
+  - name: tenancy
+    description: |
+      **Accounts, memberships and invitations** — the tenancy surface, and the
+      first call of any onboarding: create an account, invite somebody into it,
+      and accept the invitation.
+
+      Three roles, weakest first. `member` may read. `admin` may also rename the
+      account, invite and remove members. `owner` may additionally change roles
+      and delete the account. A role is a property of a *membership*, so the same
+      user is an owner in one account and a member in another, and every route
+      here resolves the caller's role against **the account in the path** rather
+      than against who they are.
+
+      Two rules that are contract rather than description, because a client
+      integrating against them cannot discover them any other way:
+
+      * **A non-member gets 404, never 403.** A 403 would confirm that the account
+        id they guessed is a real account, which is a free tenant-enumeration
+        oracle on the table whose ids are the only thing standing between two
+        customers.
+      * **The account comes from the path and the owner from the session.** No
+        request body on this tag carries an `account_id` or a `user_id`, and one
+        that does is a 422. Tenancy comes from the credential, never from the
+        request.
+
+      **The three collection operations are session-only and refuse every scoped
+      API token with 403.** Each answers a question about the caller's *whole set*
+      of accounts, and a token is bound to one of them: a CI job holding a token
+      for one tenant is not entitled to an inventory of every other tenant its
+      owner belongs to. The seven account-scoped operations do accept a token, and
+      each one declares the scope it requires — see the `bearerToken` scheme.
   - name: oidc-clients
     description: |
       OpenID Connect client registrations: the credentials products present at
@@ -1637,6 +1701,766 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /v1/accounts:
+    post:
+      tags: [tenancy]
+      operationId: createAccount
+      summary: Create an account
+      description: |
+        Provisions an account and makes the caller its **owner**, in one
+        transaction. Either all three of the account row, the membership row and
+        the `identity.account.created` event exist, or none does.
+
+        **Session only.** A scoped API token is refused with 403 — a credential
+        that could enumerate or create tenants is not a credential scoped to one
+        tenant. See the `tenancy` tag for why.
+
+        **There is no `owner` field.** The owner is whoever is signed in, and there
+        is no version of this body that can put an account in somebody else's
+        hands: `account_id` and `user_id` are both absent, and a body carrying
+        either is a 422.
+
+        `slug` is **derived** from `name` — lower case, dashes, at most 63
+        characters — and is returned here. Two accounts whose names slug to the
+        same handle cannot both exist, so the second create is a **409**, and the
+        detail names the derivation so the caller can pick another name rather
+        than guess at a slug. Derivation is what makes a collision predictable
+        from the name alone; hiding it would make it a support ticket.
+
+        `personal` is always `false` on this route. The personal account is the
+        one a registration creates for its user, and it is created by the system
+        rather than by a request — which is what lets a later packet say "you
+        always have exactly one personal account" without a second table.
+
+        **`name` is trimmed, not otherwise repaired.** `"Acme  Corp"` with two
+        spaces is stored as typed: silently collapsing it would make the stored
+        name differ from what the caller chose. An all-whitespace name is `422`
+        with `required`; a name with nothing sluggable in it — `"東京"` — is
+        `422` with `invalid_format`, because a slug is NOT NULL and a name that
+        cannot produce one would otherwise be a 500.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAccountRequest'
+            examples:
+              default:
+                summary: a team account
+                value:
+                  name: Acme Corp
+      responses:
+        '201':
+          description: The account, and the caller's membership in it. `members` is absent.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+              example:
+                id: ab000000-0000-0000-0000-0000000000c1
+                name: Acme Corp
+                slug: acme-corp
+                personal: false
+                role: owner
+                created_at: '2026-09-30T12:00:00Z'
+                updated_at: '2026-09-30T12:00:00Z'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: A scoped API token was presented. This is a session surface.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: |
+            Another account already holds the slug this name derives to. `detail` says
+            how the slug is built, because the derivation is deterministic and a
+            caller that has to guess at it is a caller that retries with the wrong
+            name.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/conflict
+                title: Conflict
+                status: 409
+                detail: an account with that name already exists; its handle is the name in lower case with dashes
+                instance: /v1/accounts
+                code: conflict
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [tenancy]
+      operationId: listAccounts
+      summary: List the caller's accounts
+      description: |
+        Every account **this user** belongs to, personal account first and then by
+        name. A user with none answers `[]` and not `null`.
+
+        **Session only, and this is the operation that makes that matter most.**
+        The question is "which accounts does this human belong to", and a scoped
+        API token is bound to one of them: answering it with a token would hand a
+        CI job an inventory of every other tenant its owner is in. There is no
+        scope for it in the machine vocabulary and there is not going to be one.
+
+        Each entry carries the caller's role **in that account** — which is why
+        one user appears here as an owner of one row and a member of another, and
+        why a client rendering this list cannot use one `role` for the page.
+
+        A bare array rather than core's `data` + `page` wrapper, and the omission
+        is deliberate: a person belongs to a handful of accounts and a cursor over
+        them is a wrapper every client has to unwrap to draw a switcher. The
+        first account that belongs to a thousand tenants gets the wrapper then.
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: The caller's accounts. `[]` when there are none.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AccountSummary'
+              example:
+                - id: ab000000-0000-0000-0000-0000000000c1
+                  name: Acme Corp
+                  slug: acme-corp
+                  personal: false
+                  role: owner
+                  created_at: '2026-09-30T12:00:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: A scoped API token was presented. This is a session surface.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/accounts/{account_id}:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    get:
+      tags: [tenancy]
+      operationId: getAccount
+      summary: Read an account
+      description: |
+        One account and its members. **Minimum role: member.**
+
+        `role` is **the caller's own** role in this account, not a property of the
+        account. It is here because without it a client cannot render "you are an
+        admin" or decide whether to show a settings form, and answering that
+        otherwise costs a second round trip for a value the authorization layer
+        has already resolved.
+
+        `members` is the same array `listMembers` returns, newest first — so a
+        client that already has the account does not have to re-read it to render
+        a member panel, and a client that does not know which it needs can read
+        one request instead of two. Every entry names the user, the role and when
+        that membership was created; there is no `user_email`, because this service
+        holds an address for an account and not for a membership, and joining on
+        `GET /v1/users/{id}` is not an endpoint this service has — see Known gaps.
+
+        A **404** is the answer for a caller who is not a member, an account that
+        does not exist, and an id that is not an id this service issued. All three
+        are the same answer on purpose.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: The account, its members, and the caller's role in it.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+              example:
+                id: ab000000-0000-0000-0000-0000000000c1
+                name: Acme Corp
+                slug: acme-corp
+                personal: false
+                role: owner
+                members:
+                  - account_id: ab000000-0000-0000-0000-0000000000c1
+                    user_id: ab000000-0000-0000-0000-0000000000b1
+                    role: owner
+                    created_at: '2026-09-30T12:00:00Z'
+                  - account_id: ab000000-0000-0000-0000-0000000000c1
+                    user_id: ab000000-0000-0000-0000-0000000000b2
+                    role: member
+                    created_at: '2026-10-01T09:30:00Z'
+                created_at: '2026-09-30T12:00:00Z'
+                updated_at: '2026-10-01T09:30:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      tags: [tenancy]
+      operationId: renameAccount
+      summary: Rename an account
+      description: |
+        Changes `name` and nothing else. **Minimum role: admin**, and `accounts:write`
+        for a scoped API token.
+
+        ### The slug does not move, and that is the point
+
+        `slug` is the account's **original** handle and it is deliberately **not**
+        re-derived. A slug is what goes into logs, into invitation emails and into
+        a future hostname, and one that changed on a rename would break every link
+        already sent — the invitations above would go to a path that no longer
+        resolves. So a rename moves the human-facing name and leaves the handle
+        alone, and the response repeats the original `slug` so a client learns
+        that from the answer rather than from a support ticket.
+
+        This is also why there is **no `slug` field in the request**: a caller
+        cannot move the handle even if it wants to.
+
+        `members` is absent from the response even though the schema declares it —
+        a rename does not re-read the membership table, and `omitempty` on a field
+        that is never populated here is what makes "absent" and "empty" different
+        answers on `getAccount`.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameAccountRequest'
+            example:
+              name: Acme Corporation
+      responses:
+        '200':
+          description: The renamed account. `slug` is the original one and `members` is absent.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+              example:
+                id: ab000000-0000-0000-0000-0000000000c1
+                name: Acme Corporation
+                slug: acme-corp
+                personal: false
+                role: owner
+                created_at: '2026-09-30T12:00:00Z'
+                updated_at: '2026-10-01T09:30:00Z'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [tenancy]
+      operationId: deleteAccount
+      summary: Delete an account
+      description: |
+        Removes the account and everything scoped by it — its memberships, its
+        invitations, its API keys and its OpenID Connect registrations.
+        **Minimum role: owner**, and it is the only operation on this tag that
+        takes `accounts:delete`: a token holding `accounts:write` is already
+        refused on the role check once its owner is only an admin, and the extra
+        scope is for the owner case where the role gate alone would let it through.
+
+        **Irreversible, and it says so by asking for nothing.** There is no
+        `confirm` field on this route, for the reason `revokeAccountInvitation`
+        has none: the URL names the one thing being destroyed, and there is
+        nothing in the request that could be misread as "and everything else". A
+        bulk operation is where a `confirm` earns its place; see the `admin` tag
+        for the shape that has one.
+
+        Revoking every access token issued against a deleted registration is part
+        of what happens: a JWT is verifiable by anybody holding the published key
+        set until its `exp` arrives, so a token minted before the deletion fails
+        at `userinfo` immediately rather than fifteen minutes later.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '204':
+          description: The account and everything under it are gone. No body.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/accounts/{account_id}/members:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    get:
+      tags: [tenancy]
+      operationId: listMembers
+      summary: List an account's members
+      description: |
+        Every membership, newest first. **Minimum role: member**, and
+        `accounts:read` for a scoped API token. An account with none answers an
+        empty `memberships` array and not `null`.
+
+        A separate route from the account detail because a client that already has
+        the account does not have to re-read it to render a member list — and a
+        member list is a panel while the account is a header, so the panel is
+        re-fetched far more often than the header is.
+
+        The caller's own `role` is on the **wrapper**, beside the array, so a
+        client rendering the panel knows what to offer without a third request and
+        without scanning the list for itself.
+
+        **Every entry names its user.** An entry with no `user_id` is not a
+        membership a client can act on, because the two operations that act on one
+        — `changeMemberRole` and `removeMember` — both need that id in the path.
+        There is no `user_email` on an entry: an invitation carries an address, a
+        membership does not, and this service deliberately does not keep the two in
+        step, so an entry's identity is a user id and the address is whatever
+        `GET /v1/me` says for the caller's own session.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: The account's memberships, newest first, and the caller's own role.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberList'
+              example:
+                memberships:
+                  - account_id: ab000000-0000-0000-0000-0000000000c1
+                    user_id: ab000000-0000-0000-0000-0000000000b1
+                    role: owner
+                    created_at: '2026-09-30T12:00:00Z'
+                  - account_id: ab000000-0000-0000-0000-0000000000c1
+                    user_id: ab000000-0000-0000-0000-0000000000b2
+                    role: member
+                    created_at: '2026-10-01T09:30:00Z'
+                role: owner
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/accounts/{account_id}/invitations:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    post:
+      tags: [tenancy]
+      operationId: inviteMember
+      summary: Invite somebody to an account
+      description: |
+        Creates a **pending** membership and hands back the token that redeems it.
+        **Minimum role: admin**, and `accounts:write` for a scoped API token.
+
+        ### `token` is here and nowhere else, ever
+
+        The raw token exists exactly once, in this 201. There is no column holding
+        it — only its SHA-256 — and no operation that re-reads one, so a caller
+        that loses it invites again. That is the same rule a session token, an OIDC
+        client secret and an API token already follow, and it is stated here
+        because a client that expects a later "get the invitation" call will not
+        find one.
+
+        It is redeemable for **seven days** (`expires_at`), and the token is **not
+        bound to the address it was sent to**: possession of a 256-bit value is
+        the credential. That is what lets somebody be invited under one address
+        and sign in under another, and the consequence is that an admin can invite
+        an address they do not control and whoever clicks the link is who joins —
+        which was already true, because an admin can invite any address they like.
+
+        **There is no mail here.** This operation does not send anything; the token
+        is the delivery mechanism until invitation mail is handed to the courier
+        service, and a service that mints an invitation nobody can redeem is worse
+        than one that hands the token back once.
+
+        ### The role an admin may hand out
+
+        `role` must be `member` or `admin`. **`owner` is refused with 422 and
+        `not_invitable`**: ownership is granted, never invited, because an account
+        whose owner appears by accepting a link has an owner nobody chose. An
+        **admin may invite a member; only an owner may hand out `admin`** — the
+        privilege has to be granted by somebody who already holds it, or an admin
+        can clone themselves into a second admin who answers to nobody.
+
+        A **409** means this account already has a *pending* invitation for that
+        address. Revoked and already-accepted invitations do not block a new one,
+        so "we sent it to the wrong list, revoke it and send it again" is two
+        requests — which is the whole reason `revokeAccountInvitation` exists.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InviteMemberRequest'
+            examples:
+              aMember:
+                summary: the common case
+                value:
+                  email: new.person@example.com
+                  role: member
+              refusedRole:
+                summary: Refused — 422 naming `role`
+                value:
+                  email: new.person@example.com
+                  role: owner
+      responses:
+        '201':
+          description: The pending invitation, and its one-time token.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuedInvitation'
+              example:
+                id: ab000000-0000-0000-0000-0000000000d1
+                account_id: ab000000-0000-0000-0000-0000000000c1
+                email: new.person@example.com
+                role: member
+                token: Yk9yUW9mYkdVPW5ZbUoyT0dRb1lSdzVaRkczSWxEZ3g
+                expires_at: '2026-10-07T12:00:00Z'
+                created_at: '2026-09-30T12:00:00Z'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: This account already has a pending invitation for that address.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/accounts/{account_id}/members/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+      - $ref: '#/components/parameters/UserId'
+    patch:
+      tags: [tenancy]
+      operationId: changeMemberRole
+      summary: Change a member's role
+      description: |
+        Moves one membership to a new role. **Minimum role: owner** — an admin and
+        a member never reach this operation, because changing who may do what is
+        an owner's decision and nothing else. A scoped API token needs
+        `accounts:write`.
+
+        Two refusals are about the **target** rather than the caller, and both live
+        in the use case rather than on the route, so they hold however this is
+        reached:
+
+        * **422 `last_owner`** — the change would leave the account with no owner.
+          An account with no owner cannot be administered, renamed or deleted by
+          anybody, so it is a state the service refuses to create rather than one
+          it repairs later.
+        * **422 `last_owner`** with a different `detail` — an owner demoting
+          **themselves** when they are the only one. It is the same invariant with
+          its own name, so a client can tell "you cannot leave this account
+          ownerless" from "you cannot leave yourself ownerless".
+
+        Every role is invitable through this route, **including `owner`** — unlike
+        `inviteMember`, which cannot grant it. Granting is a decision an owner
+        makes about somebody who is already in; inviting is a decision that would
+        let an owner arrive by clicking a link.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeMemberRoleRequest'
+            examples:
+              promote:
+                summary: make somebody an admin
+                value:
+                  role: admin
+              refused:
+                summary: Refused — 422 naming `role`
+                value:
+                  role: owner
+      responses:
+        '200':
+          description: The membership, at its new role.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Membership'
+              example:
+                account_id: ab000000-0000-0000-0000-0000000000c1
+                user_id: ab000000-0000-0000-0000-0000000000b2
+                role: admin
+                created_at: '2026-10-01T09:30:00Z'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [tenancy]
+      operationId: removeMember
+      summary: Remove a member
+      description: |
+        Deletes one membership. **Minimum role: admin**, and a scoped API token
+        needs `accounts:write`.
+
+        **Two rules, and both are about the target.** Neither is on the route: the
+        route's minimum answers "may this caller remove somebody here", and these
+        answer "may they remove *this* one".
+
+        * **An admin may not remove an owner — 403.** The owner's membership is a
+          different object from an admin's and only an owner touches it.
+        * **The last owner is never removed — 422 `last_owner`.** An account with
+          no owner is an account nobody can administer.
+
+        ### Removing somebody also stops their credentials, immediately
+
+        A scoped API token's authority is re-read from the membership table on
+        every request, so the tokens this user holds stop working **on their next
+        request** with nothing to invalidate and nothing to revoke. And a
+        re-invitation does **not** bring them back: the removal also swept what
+        they held, which is the one case where a credential could otherwise
+        outlive the membership that justified it. This is why there is no
+        "revoke everything this user holds" operation on this surface — it would
+        be the mechanism for a credential to outlive its reason, and the sweep
+        already happens.
+
+        An OIDC access token is the exception and the reason this sentence is
+        here: a JWT is verifiable by anybody holding the published key set until
+        its `exp` arrives, so a token this user obtained through a product keeps
+        working for what is left of its lifetime. Removing the membership is not
+        revocation of a JWT.
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '204':
+          description: The membership is gone, and so is everything it authorized. No body.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: |
+            `last_owner` — removing this membership would leave the account with no
+            owner.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/invitations/accept:
+    post:
+      tags: [tenancy]
+      operationId: acceptInvitation
+      summary: Accept an invitation
+      description: |
+        Redeems an invitation token: creates the membership, marks the invitation
+        accepted and announces it, in one transaction. There is **no account in the
+        path** — the token names the account.
+
+        **Session only**, and the caller still has to be signed in: the membership
+        that gets created belongs to *them*, so an anonymous redemption would
+        create a membership for nobody. The token is the second credential, not
+        the only one, and this route answers 401 without a session rather than
+        minting one — sign in first, then accept.
+
+        ### Four statuses, and they are four different facts
+
+        | status | meaning | what to do |
+        |---|---|---|
+        | `404` | no invitation matches this token | it was never issued, or the address was never sent one |
+        | `410` | it expired | ask the account's admin for a new one |
+        | `410` | it was already accepted | somebody else used it, or you did |
+        | `409` | you are already a member of that account | nothing to do |
+
+        **`404` covers everything that is not a live token, and there is no way to
+        tell them apart.** A wrong token, an unknown one, a malformed one and an
+        empty one are the same answer, because a status that differed would say
+        which invitation ids exist. The `410`s are the only distinction, and they
+        are there because the caller can *act* on them: asking for a new one is the
+        next step, and "your link was already spent" is a different sentence from
+        "this invitation never existed". An invitation an admin revoked is also
+        `404` — it is not redeemable and there is nothing to redeem.
+
+        Redemption is single-use and the guarantee is **conditional**: two requests
+        carrying the same token that arrive at the same instant produce one
+        membership, not two.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcceptInvitationRequest'
+            example:
+              token: Yk9yUW9mYkdVPW5ZbUoyT0dRb1lSdzVaRkczSWxEZ3g
+      responses:
+        '200':
+          description: The membership that was created, and what it may now do.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Membership'
+              example:
+                account_id: ab000000-0000-0000-0000-0000000000c1
+                user_id: ab000000-0000-0000-0000-0000000000b2
+                role: member
+                created_at: '2026-10-01T09:30:00Z'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: A scoped API token was presented. This is a session surface.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No invitation matches that token — see the table above.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: The caller is already a member of that account.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '410':
+          description: |
+            The invitation expired, or it was already accepted. Both are "this will
+            never work again", which is what core's 410 means, and both have a next
+            step: ask for a new invitation.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /v1/accounts/{account_id}/oidc-clients:
     parameters:
       - $ref: '#/components/parameters/AccountId'
@@ -2660,6 +3484,23 @@ components:
       schema:
         type: string
         format: uuid
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      description: |
+        The member being acted on — a **user** id, from `listMembers`, and never an
+        account id. A malformed one is a 404 rather than a 422: the path is part of
+        a resource's identity, and "this is not an id this service issued" has to be
+        the same answer as "this id is one this service issued and you may not see
+        it", or the second becomes probeable by anybody who can send a request.
+
+        A user who is not a member of this account is also a 404, so a caller
+        cannot use this route to discover which users belong to an account they
+        are not in.
+      schema:
+        type: string
+        format: uuid
 
   headers:
     TraceId:
@@ -2686,6 +3527,289 @@ components:
       example: '__Host-session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
 
   schemas:
+    AccountRole:
+      type: string
+      description: |
+        A membership's authority in one account. A total order, weakest first:
+        `member` may read; `admin` may also rename the account, invite and remove
+        members; `owner` may additionally change roles and delete the account.
+
+        It is a **membership's** role and not a property of a user or of an
+        account, which is why `role` appears on `Account`, on `AccountSummary` and
+        on `Membership`: each one is the caller's or the subject's role in *that*
+        account, and a client that reads one of those fields as "the account's
+        role" is reading a thing this service does not have.
+      enum: [member, admin, owner]
+    Membership:
+      type: object
+      description: |
+        One user's membership in one account: who, where, at what authority, and
+        since when.
+
+        **`created_at` is when the MEMBERSHIP was created, not when the account
+        was.** Both rows have a `created_at` and they are different facts; on an
+        account created in June with a member added yesterday, this field says
+        yesterday.
+
+        It is what `changeMemberRole` returns and what `removeMember` acts on, and
+        it is why every entry of `listMembers` carries a `user_id`: the two
+        operations that act on a member both need that id in their path, so an
+        entry without one is not a membership anything can be done to.
+      required: [account_id, user_id, role, created_at]
+      properties:
+        account_id:
+          type: string
+          format: uuid
+          description: The account this membership is in.
+        user_id:
+          type: string
+          format: uuid
+          description: |
+            The member. A **user** id — the same value `GET /v1/me` returns for
+            that person's own session — and not an account id.
+        role:
+          $ref: '#/components/schemas/AccountRole'
+        created_at:
+          type: string
+          format: date-time
+          description: When this user joined this account.
+    MemberList:
+      type: object
+      description: |
+        An account's members, and the caller's own role beside them.
+
+        The role is on the **wrapper** rather than only inside the array so a
+        client rendering the panel knows what to offer without a third request and
+        without scanning the list for itself.
+      required: [memberships, role]
+      properties:
+        memberships:
+          type: array
+          description: Every membership, newest first. An account with none answers `[]` and not `null`.
+          items:
+            $ref: '#/components/schemas/Membership'
+        role:
+          allOf:
+            - $ref: '#/components/schemas/AccountRole'
+          description: The caller's own role in this account. Not a property of the account.
+    Account:
+      type: object
+      description: |
+        An account, and the caller's relationship to it.
+
+        **`role` is the caller's role, not the account's.** It is here because a
+        client cannot render "you are an admin" or decide whether to show a
+        settings form without it, and answering that otherwise costs a round trip
+        for a value the authorization layer has already resolved.
+
+        **`members` is present on `getAccount` and absent on `createAccount` and
+        `renameAccount`**, and the absence is doing real work: an empty list and a
+        missing one are different answers, and a rename does not re-read the
+        membership table to fill one in.
+      required: [id, name, slug, personal, role, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          maxLength: 120
+          description: What a human sees. Trimmed on the way in and not otherwise repaired.
+        slug:
+          type: string
+          maxLength: 63
+          description: |
+            The account's stable handle: `name` in lower case with dashes, derived
+            once at creation and **never re-derived**. It does not change on a
+            rename — a slug that moved would break every link already sent — so a
+            client must not derive an expected slug from a name it just sent.
+        personal:
+          type: boolean
+          description: |
+            Whether this is the account a registration created for its user.
+            Personal accounts are created by the system rather than by a request,
+            and `createAccount` always answers `false`.
+        role:
+          allOf:
+            - $ref: '#/components/schemas/AccountRole'
+          description: The caller's own role in this account.
+        members:
+          type: array
+          description: |
+            The account's memberships, newest first. Present on `getAccount` only;
+            absent on `createAccount` and `renameAccount`.
+          items:
+            $ref: '#/components/schemas/Membership'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    AccountSummary:
+      type: object
+      description: |
+        One entry of `listAccounts`. No `members` and no `updated_at`: a list is a
+        navigation aid, and one member entry per row would multiply the payload by
+        the size of every account the caller belongs to. `getAccount` is the
+        operation that carries both.
+      required: [id, name, slug, personal, role, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          maxLength: 120
+        slug:
+          type: string
+          maxLength: 63
+        personal:
+          type: boolean
+        role:
+          allOf:
+            - $ref: '#/components/schemas/AccountRole'
+          description: The caller's own role in this account.
+        created_at:
+          type: string
+          format: date-time
+    IssuedInvitation:
+      type: object
+      description: |
+        A pending invitation, and — **on creation only** — the token that redeems
+        it.
+
+        There is no operation that re-reads an invitation, and no column holding
+        the plaintext: the row keeps a SHA-256 of it and the raw value exists once,
+        here. A caller that loses the token invites again. Nothing else in this
+        document returns a field like this, and that is the pattern rather than an
+        accident — a session token, an OIDC client secret and an API token are all
+        minted once and never stored.
+
+        There is no `accepted_at` and no `revoked_at`: this is the 201 of a
+        pending invitation, and its state after that is not readable through this
+        API. What an account's pending invitations are is not exposed, deliberately
+        — a list of outstanding invitations to an account is a list of addresses
+        its members are trying to hire.
+      required: [id, account_id, email, role, token, expires_at, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The invitation's row id — the value `revokeAccountInvitation` takes.
+        account_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+          description: |
+            The address the invitation names. **It is not checked against the address
+            the recipient is signed in with**, and the token is not bound to it:
+            possession of the token is the credential. Lowercased and normalized on
+            the way in.
+        role:
+          type: string
+          enum: [member, admin]
+          description: |
+            The role this invitation grants. **`owner` is not invitable** — see
+            `inviteMember`.
+        token:
+          type: string
+          description: |
+            The one-time redemption token, returned here and nowhere else. Passed to
+            `acceptInvitation` as `{token}`.
+        expires_at:
+          type: string
+          format: date-time
+          description: When this invitation stops redeeming — seven days after it was minted.
+        created_at:
+          type: string
+          format: date-time
+    CreateAccountRequest:
+      type: object
+      description: |
+        One field, and the field it does **not** have is the point: no `owner`, no
+        `user_id`, no `slug`, no `personal`. The owner is whoever is signed in and
+        the slug is derived, so there is no version of this body that can put an
+        account in somebody else's hands or under a handle they chose.
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: |
+            The account's human-facing name. Trimmed, not otherwise repaired, and
+            refused with `422` when it is blank (`required`), longer than 120
+            characters (`too_long`), or holds nothing a slug can be derived from
+            (`invalid_format`).
+          examples: [Acme Corp]
+    RenameAccountRequest:
+      type: object
+      description: |
+        A name and nothing else. There is **no `slug`**, and its absence is the
+        design: the slug is a handle that goes into logs, emails and a future
+        hostname, and one that moved on a rename would break every link already
+        sent.
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: The new name. Same rules as on `createAccount`.
+          examples: [Acme Corporation]
+    InviteMemberRequest:
+      type: object
+      required: [email, role]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: |
+            Who to invite. Normalized before it is stored, and refused with `422`
+            and `invalid_format` when it is not an address — which is a good deal
+            more permissive than RFC 5322, deliberately: an address that a stricter
+            parser would refuse is an address a human can still receive mail at.
+          examples: [new.person@example.com]
+        role:
+          type: string
+          enum: [member, admin]
+          description: |
+            The role this invitation grants. An admin may invite `member`; only an
+            owner may hand out `admin`. `owner` is a **422 with `not_invitable`**,
+            not a 403 — nothing about the caller is wrong, they asked for a
+            well-formed thing that does not exist.
+          examples: [member]
+    ChangeMemberRoleRequest:
+      type: object
+      required: [role]
+      additionalProperties: false
+      properties:
+        role:
+          $ref: '#/components/schemas/AccountRole'
+          description: |
+            The role to move this membership to. `owner` is accepted here and
+            refused on `inviteMember`; an unknown value is a `422` naming `role`
+            with `unknown_role`, and an empty `role` is the same case — there is no
+            "unchanged" in a PATCH body.
+    AcceptInvitationRequest:
+      type: object
+      required: [token]
+      additionalProperties: false
+      properties:
+        token:
+          type: string
+          description: |
+            The token from `inviteMember`'s 201. An absent, empty or unrecognised
+            token is the same `404`, so this is not a way to probe for which
+            invitation ids exist.
+          examples: [Yk9yUW9mYkdVPW5ZbUoyT0dRb1lSdzVaRkczSWxEZ3g]
     APIKey:
       type: object
       description: |
@@ -4095,21 +5219,25 @@ components:
 # Each is a manager decision, not a local choice, and each is recorded here so it
 # cannot be discovered by a consumer instead of by a reviewer.
 #
-# 1. `Idempotency-Key` is not accepted on POST /v1/users.
+# 1. `Idempotency-Key` is not accepted on any mutating POST in this document.
 #
 #    Core's checklist says every safely-retryable mutating POST must accept it.
-#    Registration is safely retryable — a client that never saw the 201 should be
-#    able to try again — so this endpoint owes the header.
+#    That is NINE POSTs here, and the three added by the tenancy surface
+#    (`createAccount`, `inviteMember`, `acceptInvitation`) are no different in kind
+#    from the six that were already on the list — which is why they were documented
+#    without it rather than documented around it. A half-built version that accepts
+#    the header and ignores it is worse than one that does not claim it.
 #
-#    Not implemented here because it needs its own retention table, a request-body
-#    hash, the `(endpoint, principal, key)` scoping and the replay-versus-reuse
-#    409, and a half-built version that accepts the header and ignores it is worse
-#    than one that does not claim it. It is the first thing to add to this surface.
+#    Not implemented because it needs its own retention table, a request-body hash,
+#    the `(endpoint, principal, key)` scoping and the replay-versus-reuse 409.
 #
-#    POST /v1/session is a deliberate exception and always will be: a login is not
+#    `POST /v1/session` is a deliberate exception and always will be: a login is not
 #    safely repeatable, since retrying it mints a second session rather than
-#    returning the first.
-#
+#    returning the first. `POST /v1/invitations/accept` is arguably in the same
+#    class — a retry after a timeout that landed is a 410, not a second membership —
+#    and it is listed here rather than exempted, because the exemption above is a
+#    claim somebody has to make per operation and this packet did not make one.
+
 # 2. Four error codes are not in core's reserved list.
 #
 #    `account_locked` (423) is required by the brute-force lockout this packet
@@ -4140,7 +5268,7 @@ components:
 #    `validation_failed` at 400, since core's list is keyed by slug and one slug
 #    cannot carry two statuses.
 #
-# 3. `info.version` is set, and it is at 1.3.0.
+# 3. `info.version` is set, and it is at 1.7.0.
 #
 #    core's versioning section carries an open decision (D4) about whether a
 #    document version is required alongside the `/v1` path prefix, precisely

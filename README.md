@@ -172,16 +172,16 @@ service quietly listening on the wrong port.
 
 | Route | Response | Meaning |
 |---|---|---|
-| `POST /v1/accounts` | `201 {…}` | Create an account. **Not in `openapi/v1.yaml` — see the gap below.** |
-| `GET /v1/accounts` | `200 [{…}]` | The accounts this **user** belongs to. **Not in `openapi/v1.yaml` — see the gap below.** |
-| `GET /v1/accounts/:id` | `200 {…}` | One account. **Not in `openapi/v1.yaml` — see the gap below.** |
-| `PATCH /v1/accounts/:id` | `200 {…}` | Rename. **Not in `openapi/v1.yaml` — see the gap below.** |
-| `DELETE /v1/accounts/:id` | `204` | Delete, with everything under it. **Not in `openapi/v1.yaml` — see the gap below.** |
-| `GET /v1/accounts/:id/members` | `200 [{…}]` | The account's members. **Not in `openapi/v1.yaml` — see the gap below.** |
-| `POST /v1/accounts/:id/invitations` | `201 {…}` | Invite somebody. **Not in `openapi/v1.yaml` — see the gap below.** |
-| `PATCH /v1/accounts/:id/members/:userId` | `200 {…}` | Change a role. **Not in `openapi/v1.yaml` — see the gap below.** |
-| `DELETE /v1/accounts/:id/members/:userId` | `204` | Remove somebody. **Not in `openapi/v1.yaml` — see the gap below.** |
-| `POST /v1/invitations/accept` | `200 {…}` | Accept an invitation, signed in as the invited user. **Not in `openapi/v1.yaml` — see the gap below.** |
+| `POST /v1/accounts` | `201 {…}` | Create an account; the caller becomes its **owner**. Only a name — the slug is derived and `409 conflict` if it is taken. **Session only.** |
+| `GET /v1/accounts` | `200 [{…}]` | The accounts this **user** belongs to, each with the caller's role **in it**. `[]` and not `null`. **Session only.** |
+| `GET /v1/accounts/:id` | `200 {…}` | One account and its members. `404` for a non-member, never `403`. Member. |
+| `PATCH /v1/accounts/:id` | `200 {…}` | Rename. **The `slug` does not move** — a handle that changed would break every link already sent. Admin. |
+| `DELETE /v1/accounts/:id` | `204` | Delete, with everything under it. Irreversible, no `confirm` field. **Owner**, `accounts:delete`. |
+| `GET /v1/accounts/:id/members` | `200 {memberships, role}` | The account's members, newest first, plus the caller's own role. Every entry names its `user_id`. Member. |
+| `POST /v1/accounts/:id/invitations` | `201 {…, token}` | Invite somebody. `token` is returned here and never again, and **nothing is mailed**. `owner` is a 422; only an owner may invite an `admin`. Admin. |
+| `PATCH /v1/accounts/:id/members/:userId` | `200 {…}` | Change a role. `422 last_owner` rather than leaving an account unadministerable. **Owner.** |
+| `DELETE /v1/accounts/:id/members/:userId` | `204` | Remove somebody, and stop their scoped tokens on their next request. An admin may not remove an owner. Admin. |
+| `POST /v1/invitations/accept` | `200 {…}` | Accept an invitation, signed in as the invited user. `404` for anything that is not a live token, `410` for one that expired or was spent. **Session only.** |
 | `GET /healthz` | `200 {"status":"ok"}` | Liveness. Always 200 while the process serves — it never touches a dependency, so a database outage cannot get the process restarted out from under in-flight work. |
 | `GET /readyz` | `200 {"status":"ok","deps":"postgres"}` | Readiness. 200 when every dependency answers, `503 {"status":"unavailable",...}` otherwise, with each probe bounded at 2s. |
 | `POST /v1/users` | `201 {"id","email"}` | Register. `409 conflict` if the address is taken, `422 validation_failed` with `errors[]` on a bad field, `400 invalid_json` on a malformed body, `413 payload_too_large` past 4 KB. |
@@ -340,38 +340,46 @@ Every non-2xx is `application/problem+json` per core's error envelope, including
 response header, and internal failures are logged with that id rather than
 described to the caller.
 
-### **Ten rows of the table above are still bigger than the OpenAPI document, and that is a known gap**
+### **Every row of the table above is in a document, and that is what closed**
 
-The three admin rows added by this packet are **documented** — they are in
-`openapi/v1.yaml` under the `admin` tag, with operationIds, request and response
-schemas, and `info.version` is 1.4.0 because of them. `knownDrift` did not grow.
+Until packet `identity-28`, the ten tenancy rows at the top of that table were
+**served, gated, in the authorization matrix and — for seven of them — carrying a
+declared scope, and written down in no document at all.** Not in
+`openapi/v1.yaml`, not in `openid/openid.yaml`, and not in this table either. Two
+OIDC operations were in the same position: `POST /oidc/authorize` and
+`POST /oidc/userinfo` are mounted deliberately, and `openid/openid.yaml`
+declared only the `GET` on each.
 
-The ten rows marked *"Not in `openapi/v1.yaml`"* are served, gated, in the
-authorization matrix and — for seven of them — carry a declared scope, and they
-appear in **no committed document**. Neither `openapi/v1.yaml` nor
-`openid/openid.yaml` describes them, and before this packet they were not in this
-table either. Two OIDC operations are in the same position: `POST /oidc/authorize`
-and `POST /oidc/userinfo` are mounted deliberately, and `openid/openid.yaml`
-declares only the `GET` on each.
+What that cost, in the only terms that matter: **a client generated from this
+service's documents could read an account's API keys and register its OIDC
+clients, and had no method at all for creating the account, inviting anybody into
+it, or accepting an invitation.** We are selling hosted identity to a customer who
+cannot onboard a tenant through the client we ship.
 
-`internal/httpapi/openapi_drift_test.go` is the check that found this, and it holds
-the documents to the router in both directions by **method and path**. It is
-recorded as **[D1](DECISIONS.md)** and the question is open: these are contract
-surface to document, or routes to rule out of the contract in writing. Until that
-is answered, `knownDrift` in that file holds all twelve, pinned so the list can
-neither grow nor be emptied — a new undocumented route is a failing test whether
-or not anybody remembers the file.
+All twelve are documented now — the ten tenancy operations under a new `tenancy`
+tag in `openapi/v1.yaml`, the two `POST`s beside their `GET`s in
+`openid/openid.yaml` — and `openapi/v1.yaml` is at **1.7.0**. `knownDrift` in
+`internal/httpapi/openapi_drift_test.go` is **empty**, pinned at empty, and the
+twelve it held are named in full in **[D1](DECISIONS.md)** along with the ruling.
 
-What this means for a caller, plainly: **a client generated from this service's
-documents has no method for any of those twelve operations.** They work; they are
-just not in the menu. That is the gap, and it is the reason the check exists.
+**Closing it changed one response shape, and it is worth knowing about.** The
+`members` / `memberships` arrays on `GET /v1/accounts/:id` and
+`GET /v1/accounts/:id/members` used to carry an empty `user_id` and a zero
+`created_at` on every entry: `membershipResponses` filled only `role`, because
+`accounts.MemberSummary` is shaped for "which accounts does this user belong to"
+and carries no user. A member list nobody could tell apart, on the two operations
+whose whole purpose is to be acted on by `user_id`. Nothing consumed it — those
+operations were in no document, so no generated client had a method for either,
+which is also why it went unnoticed — and every entry is now the membership it
+claims to be. `TestEveryMemberInAMemberListIdentifiesItself` holds it.
 
-**Adding a route and not growing `knownDrift` is a normal operation here**, and
-the admin surface is the worked example: three new operations, three documented
-operations, a list that stayed at twelve. A packet that finds itself tempted to
-bump that count is being told the truth by the tripwire — the answer is to
-document the route, never to name it.
-
+**Adding a route is a normal operation here, and this is the second worked
+example.** Packet `identity-11` added three admin operations and documented all
+three, and the list stayed at twelve. Packet `identity-28` documented the
+remaining twelve and the list went to zero. A packet that finds itself tempted to
+add an entry is being told the truth by the tripwire — the answer is to document
+the route, or to rule it out of the contract **in writing in the document and
+here**, never to name it in a list.
 The `/v1` routes exist only when `DATABASE_URL` is set. Without it they are
 absent, so a missing database is a clear `404` rather than a pile of `500`s.
 
@@ -930,11 +938,11 @@ the one where the generator is right. Two layers, and the split is MD6's:
 
 ```
 client/generated/api.gen.go   GENERATED, COMMITTED. oapi-codegen v2.8.0 over
-                              openapi/v1.yaml: 20 typed operations and a Client
+                              openapi/v1.yaml: 41 typed operations and a Client
 client/generate.go            the //go:generate line, pinned to v2.8.0
 client/oapi-codegen.yaml      the generator's configuration
 client/transport.go           the interface the generated client satisfies
-client/client.go              the hand-written client: 20 typed methods
+client/client.go              the hand-written client: 41 typed methods
 client/credentials.go         which credential this is, and where it may be sent
 client/baseurl.go             where requests go, in a documented order
 client/errors.go              RFC 9457 problem to typed error, typed fallback
@@ -1103,7 +1111,8 @@ route list, so it is worth writing down that it happened.)
 `openapi/v1.yaml` and `openid/openid.yaml` to the router, in both directions, by
 **method and path** — never by count, because one operation added and one removed
 leaves the count alone. It is the last such check owed in the fleet, and it is the
-one that found the twelve undocumented operations described above.
+one that found the twelve undocumented operations described above — **which is why
+`knownDrift` is now empty and pinned at empty.**
 
 Four things about it are worth knowing before you touch a route:
 
@@ -1111,14 +1120,24 @@ Four things about it are worth knowing before you touch a route:
   from the path string. billing's first drift check compared paths and never
   `route.verb`, so `PUT /v1/customers/{id}` was served in a money-handling
   service with nothing written down about it — one path on each side, and the
-  comparison reported agreement. That shape is live here today.
+  comparison reported agreement. That shape was live here too, on
+  `POST /oidc/authorize` and `POST /oidc/userinfo`, and identity-28 closed it by
+  documenting the POST beside the GET rather than by narrowing the check.
 - **Both documents are read** and the union is the contract. Nine of the eleven
   `/oidc/*` and `/.well-known/*` routes are documented in the sibling document,
   so a check reading only `openapi/v1.yaml` would have had to declare all eleven
   undocumented, which is false about nine of them.
-- **There is no prefix filter.** Every route is either in a document or named,
-  and a route that is neither fails the suite. `strings.HasPrefix(path, "/v1")`
-  is a guess about intent, and it cannot see a method.
+- **There is no prefix filter, and `knownDrift` is empty.** Every route is in a
+  document; a route that is in neither fails the suite, and any entry added to
+  `knownDrift` fails a second test that names the two legitimate ways to close
+  one. `strings.HasPrefix(path, "/v1")` is a guess about intent, and it cannot
+  see a method.
+- **The check is shown biting, on the twelve it once admitted.**
+  `internal/httpapi/known_drift_test.go` takes the *real* router walk and the
+  *real* documents, removes this packet's entries, and asserts all twelve come
+  back unexplained. It is not a fixture — it is the same expression
+  `TestEveryServedRouteIsDocumentedOrNamed` evaluates, pointed at the state the
+  repository was in on 2026-09-30.
 - **The document is parsed without a YAML dependency.** `go.mod` has none and
   this adds none; the reader takes the `paths:` block by indentation, states the
   subset it understands, and raises on every way it could under-read. Two empty

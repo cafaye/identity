@@ -57,6 +57,27 @@ func (e AcceptedStatus) Valid() bool {
 	}
 }
 
+// Defines values for AccountRole.
+const (
+	AccountRoleAdmin  AccountRole = "admin"
+	AccountRoleMember AccountRole = "member"
+	AccountRoleOwner  AccountRole = "owner"
+)
+
+// Valid indicates whether the value is a known member of the AccountRole enum.
+func (e AccountRole) Valid() bool {
+	switch e {
+	case AccountRoleAdmin:
+		return true
+	case AccountRoleMember:
+		return true
+	case AccountRoleOwner:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for AuditLogEntryAction.
 const (
 	InvitationRevoked  AuditLogEntryAction = "invitation.revoked"
@@ -132,6 +153,42 @@ func (e HealthStatus) Valid() bool {
 	case HealthStatusOk:
 		return true
 	case HealthStatusUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InviteMemberRequestRole.
+const (
+	InviteMemberRequestRoleAdmin  InviteMemberRequestRole = "admin"
+	InviteMemberRequestRoleMember InviteMemberRequestRole = "member"
+)
+
+// Valid indicates whether the value is a known member of the InviteMemberRequestRole enum.
+func (e InviteMemberRequestRole) Valid() bool {
+	switch e {
+	case InviteMemberRequestRoleAdmin:
+		return true
+	case InviteMemberRequestRoleMember:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for IssuedInvitationRole.
+const (
+	IssuedInvitationRoleAdmin  IssuedInvitationRole = "admin"
+	IssuedInvitationRoleMember IssuedInvitationRole = "member"
+)
+
+// Valid indicates whether the value is a known member of the IssuedInvitationRole enum.
+func (e IssuedInvitationRole) Valid() bool {
+	switch e {
+	case IssuedInvitationRoleAdmin:
+		return true
+	case IssuedInvitationRoleMember:
 		return true
 	default:
 		return false
@@ -459,6 +516,17 @@ type APIKey struct {
 // rather than being treated as "and so anything goes".
 type APIKeyScope string
 
+// AcceptInvitationRequest defines model for AcceptInvitationRequest.
+type AcceptInvitationRequest struct {
+	// Token The token from `inviteMember`'s 201. An absent, empty or unrecognised
+	// token is the same `404`, so this is not a way to probe for which
+	// invitation ids exist.
+	//
+	//
+	// Examples: Yk9yUW9mYkdVPW5ZbUoyT0dRb1lSdzVaRkczSWxEZ3g
+	Token string `json:"token"`
+}
+
 // Accepted The body of every route that has been asked to send a message.
 //
 // **Exactly one field, with one value, ever.** That is the whole of the
@@ -474,6 +542,70 @@ type Accepted struct {
 
 // AcceptedStatus defines model for Accepted.Status.
 type AcceptedStatus string
+
+// Account An account, and the caller's relationship to it.
+//
+// **`role` is the caller's role, not the account's.** It is here because a
+// client cannot render "you are an admin" or decide whether to show a
+// settings form without it, and answering that otherwise costs a round trip
+// for a value the authorization layer has already resolved.
+//
+// **`members` is present on `getAccount` and absent on `createAccount` and
+// `renameAccount`**, and the absence is doing real work: an empty list and a
+// missing one are different answers, and a rename does not re-read the
+// membership table to fill one in.
+type Account struct {
+	CreatedAt time.Time          `json:"created_at"`
+	ID        openapi_types.UUID `json:"id"`
+
+	// Members The account's memberships, newest first. Present on `getAccount` only;
+	// absent on `createAccount` and `renameAccount`.
+	Members *[]Membership `json:"members,omitempty"`
+
+	// Name What a human sees. Trimmed on the way in and not otherwise repaired.
+	Name string `json:"name"`
+
+	// Personal Whether this is the account a registration created for its user.
+	// Personal accounts are created by the system rather than by a request,
+	// and `createAccount` always answers `false`.
+	Personal bool `json:"personal"`
+
+	// Role The caller's own role in this account.
+	Role AccountRole `json:"role"`
+
+	// Slug The account's stable handle: `name` in lower case with dashes, derived
+	// once at creation and **never re-derived**. It does not change on a
+	// rename — a slug that moved would break every link already sent — so a
+	// client must not derive an expected slug from a name it just sent.
+	Slug      string    `json:"slug"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// AccountRole A membership's authority in one account. A total order, weakest first:
+// `member` may read; `admin` may also rename the account, invite and remove
+// members; `owner` may additionally change roles and delete the account.
+//
+// It is a **membership's** role and not a property of a user or of an
+// account, which is why `role` appears on `Account`, on `AccountSummary` and
+// on `Membership`: each one is the caller's or the subject's role in *that*
+// account, and a client that reads one of those fields as "the account's
+// role" is reading a thing this service does not have.
+type AccountRole string
+
+// AccountSummary One entry of `listAccounts`. No `members` and no `updated_at`: a list is a
+// navigation aid, and one member entry per row would multiply the payload by
+// the size of every account the caller belongs to. `getAccount` is the
+// operation that carries both.
+type AccountSummary struct {
+	CreatedAt time.Time          `json:"created_at"`
+	ID        openapi_types.UUID `json:"id"`
+	Name      string             `json:"name"`
+	Personal  bool               `json:"personal"`
+
+	// Role The caller's own role in this account.
+	Role AccountRole `json:"role"`
+	Slug string      `json:"slug"`
+}
 
 // AuditLogEntry One admin action.
 //
@@ -600,6 +732,15 @@ type BulkRevocationResult struct {
 	Revoked int `json:"revoked"`
 }
 
+// ChangeMemberRoleRequest defines model for ChangeMemberRoleRequest.
+type ChangeMemberRoleRequest struct {
+	// Role The role to move this membership to. `owner` is accepted here and
+	// refused on `inviteMember`; an unknown value is a `422` naming `role`
+	// with `unknown_role`, and an empty `role` is the same case — there is no
+	// "unchanged" in a PATCH body.
+	Role AccountRole `json:"role"`
+}
+
 // CompleteSecondFactorRequest The second half of a login. `challenge` is optional here and required in
 // effect — omitting it entirely, with no challenge cookie either, is a 401.
 type CompleteSecondFactorRequest struct {
@@ -684,6 +825,21 @@ type ConfirmedEnrollmentEnabled bool
 
 // ConfirmedEnrollmentMethod defines model for ConfirmedEnrollment.Method.
 type ConfirmedEnrollmentMethod string
+
+// CreateAccountRequest One field, and the field it does **not** have is the point: no `owner`, no
+// `user_id`, no `slug`, no `personal`. The owner is whoever is signed in and
+// the slug is derived, so there is no version of this body that can put an
+// account in somebody else's hands or under a handle they chose.
+type CreateAccountRequest struct {
+	// Name The account's human-facing name. Trimmed, not otherwise repaired, and
+	// refused with `422` when it is blank (`required`), longer than 120
+	// characters (`too_long`), or holds nothing a slug can be derived from
+	// (`invalid_format`).
+	//
+	//
+	// Examples: Acme Corp
+	Name string `json:"name"`
+}
 
 // EmailChange The state of a two-sided address change.
 //
@@ -804,6 +960,35 @@ type IntrospectionResponse struct {
 	Sub *openapi_types.UUID `json:"sub,omitempty"`
 }
 
+// InviteMemberRequest defines model for InviteMemberRequest.
+type InviteMemberRequest struct {
+	// Email Who to invite. Normalized before it is stored, and refused with `422`
+	// and `invalid_format` when it is not an address — which is a good deal
+	// more permissive than RFC 5322, deliberately: an address that a stricter
+	// parser would refuse is an address a human can still receive mail at.
+	//
+	//
+	// Examples: new.person@example.com
+	Email openapi_types.Email `json:"email"`
+
+	// Role The role this invitation grants. An admin may invite `member`; only an
+	// owner may hand out `admin`. `owner` is a **422 with `not_invitable`**,
+	// not a 403 — nothing about the caller is wrong, they asked for a
+	// well-formed thing that does not exist.
+	//
+	//
+	// Examples: member
+	Role InviteMemberRequestRole `json:"role"`
+}
+
+// InviteMemberRequestRole The role this invitation grants. An admin may invite `member`; only an
+// owner may hand out `admin`. `owner` is a **422 with `not_invitable`**,
+// not a 403 — nothing about the caller is wrong, they asked for a
+// well-formed thing that does not exist.
+//
+// Examples: member
+type InviteMemberRequestRole string
+
 // IssuedAPIKey defines model for IssuedAPIKey.
 type IssuedAPIKey struct {
 	AccountID openapi_types.UUID `json:"account_id"`
@@ -856,6 +1041,50 @@ type IssuedAPIKey struct {
 	// is minted BY the caller FOR the caller's own account.
 	UserID openapi_types.UUID `json:"user_id"`
 }
+
+// IssuedInvitation A pending invitation, and — **on creation only** — the token that redeems
+// it.
+//
+// There is no operation that re-reads an invitation, and no column holding
+// the plaintext: the row keeps a SHA-256 of it and the raw value exists once,
+// here. A caller that loses the token invites again. Nothing else in this
+// document returns a field like this, and that is the pattern rather than an
+// accident — a session token, an OIDC client secret and an API token are all
+// minted once and never stored.
+//
+// There is no `accepted_at` and no `revoked_at`: this is the 201 of a
+// pending invitation, and its state after that is not readable through this
+// API. What an account's pending invitations are is not exposed, deliberately
+// — a list of outstanding invitations to an account is a list of addresses
+// its members are trying to hire.
+type IssuedInvitation struct {
+	AccountID openapi_types.UUID `json:"account_id"`
+	CreatedAt time.Time          `json:"created_at"`
+
+	// Email The address the invitation names. **It is not checked against the address
+	// the recipient is signed in with**, and the token is not bound to it:
+	// possession of the token is the credential. Lowercased and normalized on
+	// the way in.
+	Email openapi_types.Email `json:"email"`
+
+	// ExpiresAt When this invitation stops redeeming — seven days after it was minted.
+	ExpiresAt time.Time `json:"expires_at"`
+
+	// ID The invitation's row id — the value `revokeAccountInvitation` takes.
+	ID openapi_types.UUID `json:"id"`
+
+	// Role The role this invitation grants. **`owner` is not invitable** — see
+	// `inviteMember`.
+	Role IssuedInvitationRole `json:"role"`
+
+	// Token The one-time redemption token, returned here and nowhere else. Passed to
+	// `acceptInvitation` as `{token}`.
+	Token string `json:"token"`
+}
+
+// IssuedInvitationRole The role this invitation grants. **`owner` is not invitable** — see
+// `inviteMember`.
+type IssuedInvitationRole string
 
 // LoginRequest defines model for LoginRequest.
 type LoginRequest struct {
@@ -927,6 +1156,54 @@ type MFAStatus struct {
 // different answers, which is why this is `omitempty` rather than an
 // empty string.
 type MFAStatusMethod string
+
+// MemberList An account's members, and the caller's own role beside them.
+//
+// The role is on the **wrapper** rather than only inside the array so a
+// client rendering the panel knows what to offer without a third request and
+// without scanning the list for itself.
+type MemberList struct {
+	// Memberships Every membership, newest first. An account with none answers `[]` and not `null`.
+	Memberships []Membership `json:"memberships"`
+
+	// Role The caller's own role in this account. Not a property of the account.
+	Role AccountRole `json:"role"`
+}
+
+// Membership One user's membership in one account: who, where, at what authority, and
+// since when.
+//
+// **`created_at` is when the MEMBERSHIP was created, not when the account
+// was.** Both rows have a `created_at` and they are different facts; on an
+// account created in June with a member added yesterday, this field says
+// yesterday.
+//
+// It is what `changeMemberRole` returns and what `removeMember` acts on, and
+// it is why every entry of `listMembers` carries a `user_id`: the two
+// operations that act on a member both need that id in their path, so an
+// entry without one is not a membership anything can be done to.
+type Membership struct {
+	// AccountID The account this membership is in.
+	AccountID openapi_types.UUID `json:"account_id"`
+
+	// CreatedAt When this user joined this account.
+	CreatedAt time.Time `json:"created_at"`
+
+	// Role A membership's authority in one account. A total order, weakest first:
+	// `member` may read; `admin` may also rename the account, invite and remove
+	// members; `owner` may additionally change roles and delete the account.
+	//
+	// It is a **membership's** role and not a property of a user or of an
+	// account, which is why `role` appears on `Account`, on `AccountSummary` and
+	// on `Membership`: each one is the caller's or the subject's role in *that*
+	// account, and a client that reads one of those fields as "the account's
+	// role" is reading a thing this service does not have.
+	Role AccountRole `json:"role"`
+
+	// UserID The member. A **user** id — the same value `GET /v1/me` returns for
+	// that person's own session — and not an account id.
+	UserID openapi_types.UUID `json:"user_id"`
+}
 
 // MintAPIKeyRequest **The account and the user are not here.** They come from the path and the
 // session, and a body carrying `account_id` or `user_id` is a 422 — because a
@@ -1204,6 +1481,17 @@ type RegisteredOIDCClientGrantTypes string
 // RegisteredOIDCClientScopes defines model for RegisteredOIDCClient.Scopes.
 type RegisteredOIDCClientScopes string
 
+// RenameAccountRequest A name and nothing else. There is **no `slug`**, and its absence is the
+// design: the slug is a handle that goes into logs, emails and a future
+// hostname, and one that moved on a rename would break every link already
+// sent.
+type RenameAccountRequest struct {
+	// Name The new name. Same rules as on `createAccount`.
+	//
+	// Examples: Acme Corporation
+	Name string `json:"name"`
+}
+
 // RevokeAPIKeyRequest Optional in the strongest sense — a `DELETE` with no body at all is a
 // revoke, because "revoke this" with no explanation is the common request and
 // refusing it for want of a JSON document would be a 400 on a DELETE that needs
@@ -1341,6 +1629,9 @@ type VerificationStatus struct {
 // AccountID defines model for AccountId.
 type AccountID = openapi_types.UUID
 
+// UserID defines model for UserId.
+type UserID = openapi_types.UUID
+
 // BodyTooLarge The cafaye error envelope: RFC 9457 plus core's `code` and `trace_id`.
 // Every non-2xx response from this service is this shape. No service invents
 // its own error body.
@@ -1392,6 +1683,12 @@ type ListAccountAuditLogParams struct {
 	Before *string `form:"before,omitempty" json:"before,omitempty"`
 }
 
+// CreateAccountJSONRequestBody defines body for CreateAccount for application/json ContentType.
+type CreateAccountJSONRequestBody = CreateAccountRequest
+
+// RenameAccountJSONRequestBody defines body for RenameAccount for application/json ContentType.
+type RenameAccountJSONRequestBody = RenameAccountRequest
+
 // RevokeAccountInvitationsJSONRequestBody defines body for RevokeAccountInvitations for application/json ContentType.
 type RevokeAccountInvitationsJSONRequestBody = BulkInvitationRevocation
 
@@ -1400,6 +1697,12 @@ type MintAPIKeyJSONRequestBody = MintAPIKeyRequest
 
 // RevokeAPIKeyJSONRequestBody defines body for RevokeAPIKey for application/json ContentType.
 type RevokeAPIKeyJSONRequestBody = RevokeAPIKeyRequest
+
+// InviteMemberJSONRequestBody defines body for InviteMember for application/json ContentType.
+type InviteMemberJSONRequestBody = InviteMemberRequest
+
+// ChangeMemberRoleJSONRequestBody defines body for ChangeMemberRole for application/json ContentType.
+type ChangeMemberRoleJSONRequestBody = ChangeMemberRoleRequest
 
 // RegisterOIDCClientJSONRequestBody defines body for RegisterOIDCClient for application/json ContentType.
 type RegisterOIDCClientJSONRequestBody = RegisterOIDCClientRequest
@@ -1421,6 +1724,9 @@ type ConfirmEmailVerificationJSONRequestBody = RecoveryTokenRequest
 
 // IntrospectAPIKeyJSONRequestBody defines body for IntrospectAPIKey for application/json ContentType.
 type IntrospectAPIKeyJSONRequestBody = IntrospectRequest
+
+// AcceptInvitationJSONRequestBody defines body for AcceptInvitation for application/json ContentType.
+type AcceptInvitationJSONRequestBody = AcceptInvitationRequest
 
 // DisableMFAJSONRequestBody defines body for DisableMFA for application/json ContentType.
 type DisableMFAJSONRequestBody = FactorRequest
@@ -1544,6 +1850,212 @@ type ClientInterface interface {
 	//
 	// Corresponds with GET /readyz (the `Readiness` operationId).
 	Readiness(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ListAccounts List the caller's accounts
+	//
+	// Every account **this user** belongs to, personal account first and then by
+	// name. A user with none answers `[]` and not `null`.
+	//
+	// **Session only, and this is the operation that makes that matter most.**
+	// The question is "which accounts does this human belong to", and a scoped
+	// API token is bound to one of them: answering it with a token would hand a
+	// CI job an inventory of every other tenant its owner is in. There is no
+	// scope for it in the machine vocabulary and there is not going to be one.
+	//
+	// Each entry carries the caller's role **in that account** — which is why
+	// one user appears here as an owner of one row and a member of another, and
+	// why a client rendering this list cannot use one `role` for the page.
+	//
+	// A bare array rather than core's `data` + `page` wrapper, and the omission
+	// is deliberate: a person belongs to a handful of accounts and a cursor over
+	// them is a wrapper every client has to unwrap to draw a switcher. The
+	// first account that belongs to a thousand tenants gets the wrapper then.
+	//
+	// Corresponds with GET /v1/accounts (the `ListAccounts` operationId).
+	ListAccounts(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// CreateAccountWithBody Create an account
+	//
+	// Provisions an account and makes the caller its **owner**, in one
+	// transaction. Either all three of the account row, the membership row and
+	// the `identity.account.created` event exist, or none does.
+	//
+	// **Session only.** A scoped API token is refused with 403 — a credential
+	// that could enumerate or create tenants is not a credential scoped to one
+	// tenant. See the `tenancy` tag for why.
+	//
+	// **There is no `owner` field.** The owner is whoever is signed in, and there
+	// is no version of this body that can put an account in somebody else's
+	// hands: `account_id` and `user_id` are both absent, and a body carrying
+	// either is a 422.
+	//
+	// `slug` is **derived** from `name` — lower case, dashes, at most 63
+	// characters — and is returned here. Two accounts whose names slug to the
+	// same handle cannot both exist, so the second create is a **409**, and the
+	// detail names the derivation so the caller can pick another name rather
+	// than guess at a slug. Derivation is what makes a collision predictable
+	// from the name alone; hiding it would make it a support ticket.
+	//
+	// `personal` is always `false` on this route. The personal account is the
+	// one a registration creates for its user, and it is created by the system
+	// rather than by a request — which is what lets a later packet say "you
+	// always have exactly one personal account" without a second table.
+	//
+	// **`name` is trimmed, not otherwise repaired.** `"Acme  Corp"` with two
+	// spaces is stored as typed: silently collapsing it would make the stored
+	// name differ from what the caller chose. An all-whitespace name is `422`
+	// with `required`; a name with nothing sluggable in it — `"東京"` — is
+	// `422` with `invalid_format`, because a slug is NOT NULL and a name that
+	// cannot produce one would otherwise be a 500.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/accounts (the `CreateAccount` operationId).
+	CreateAccountWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// CreateAccount Create an account
+	//
+	// Provisions an account and makes the caller its **owner**, in one
+	// transaction. Either all three of the account row, the membership row and
+	// the `identity.account.created` event exist, or none does.
+	//
+	// **Session only.** A scoped API token is refused with 403 — a credential
+	// that could enumerate or create tenants is not a credential scoped to one
+	// tenant. See the `tenancy` tag for why.
+	//
+	// **There is no `owner` field.** The owner is whoever is signed in, and there
+	// is no version of this body that can put an account in somebody else's
+	// hands: `account_id` and `user_id` are both absent, and a body carrying
+	// either is a 422.
+	//
+	// `slug` is **derived** from `name` — lower case, dashes, at most 63
+	// characters — and is returned here. Two accounts whose names slug to the
+	// same handle cannot both exist, so the second create is a **409**, and the
+	// detail names the derivation so the caller can pick another name rather
+	// than guess at a slug. Derivation is what makes a collision predictable
+	// from the name alone; hiding it would make it a support ticket.
+	//
+	// `personal` is always `false` on this route. The personal account is the
+	// one a registration creates for its user, and it is created by the system
+	// rather than by a request — which is what lets a later packet say "you
+	// always have exactly one personal account" without a second table.
+	//
+	// **`name` is trimmed, not otherwise repaired.** `"Acme  Corp"` with two
+	// spaces is stored as typed: silently collapsing it would make the stored
+	// name differ from what the caller chose. An all-whitespace name is `422`
+	// with `required`; a name with nothing sluggable in it — `"東京"` — is
+	// `422` with `invalid_format`, because a slug is NOT NULL and a name that
+	// cannot produce one would otherwise be a 500.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/accounts (the `CreateAccount` operationId).
+	CreateAccount(ctx context.Context, body CreateAccountJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// DeleteAccount Delete an account
+	//
+	// Removes the account and everything scoped by it — its memberships, its
+	// invitations, its API keys and its OpenID Connect registrations.
+	// **Minimum role: owner**, and it is the only operation on this tag that
+	// takes `accounts:delete`: a token holding `accounts:write` is already
+	// refused on the role check once its owner is only an admin, and the extra
+	// scope is for the owner case where the role gate alone would let it through.
+	//
+	// **Irreversible, and it says so by asking for nothing.** There is no
+	// `confirm` field on this route, for the reason `revokeAccountInvitation`
+	// has none: the URL names the one thing being destroyed, and there is
+	// nothing in the request that could be misread as "and everything else". A
+	// bulk operation is where a `confirm` earns its place; see the `admin` tag
+	// for the shape that has one.
+	//
+	// Revoking every access token issued against a deleted registration is part
+	// of what happens: a JWT is verifiable by anybody holding the published key
+	// set until its `exp` arrives, so a token minted before the deletion fails
+	// at `userinfo` immediately rather than fifteen minutes later.
+	//
+	// Corresponds with DELETE /v1/accounts/{account_id} (the `DeleteAccount` operationId).
+	DeleteAccount(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetAccount Read an account
+	//
+	// One account and its members. **Minimum role: member.**
+	//
+	// `role` is **the caller's own** role in this account, not a property of the
+	// account. It is here because without it a client cannot render "you are an
+	// admin" or decide whether to show a settings form, and answering that
+	// otherwise costs a second round trip for a value the authorization layer
+	// has already resolved.
+	//
+	// `members` is the same array `listMembers` returns, newest first — so a
+	// client that already has the account does not have to re-read it to render
+	// a member panel, and a client that does not know which it needs can read
+	// one request instead of two. Every entry names the user, the role and when
+	// that membership was created; there is no `user_email`, because this service
+	// holds an address for an account and not for a membership, and joining on
+	// `GET /v1/users/{id}` is not an endpoint this service has — see Known gaps.
+	//
+	// A **404** is the answer for a caller who is not a member, an account that
+	// does not exist, and an id that is not an id this service issued. All three
+	// are the same answer on purpose.
+	//
+	// Corresponds with GET /v1/accounts/{account_id} (the `GetAccount` operationId).
+	GetAccount(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RenameAccountWithBody Rename an account
+	//
+	// Changes `name` and nothing else. **Minimum role: admin**, and `accounts:write`
+	// for a scoped API token.
+	//
+	// ### The slug does not move, and that is the point
+	//
+	// `slug` is the account's **original** handle and it is deliberately **not**
+	// re-derived. A slug is what goes into logs, into invitation emails and into
+	// a future hostname, and one that changed on a rename would break every link
+	// already sent — the invitations above would go to a path that no longer
+	// resolves. So a rename moves the human-facing name and leaves the handle
+	// alone, and the response repeats the original `slug` so a client learns
+	// that from the answer rather than from a support ticket.
+	//
+	// This is also why there is **no `slug` field in the request**: a caller
+	// cannot move the handle even if it wants to.
+	//
+	// `members` is absent from the response even though the schema declares it —
+	// a rename does not re-read the membership table, and `omitempty` on a field
+	// that is never populated here is what makes "absent" and "empty" different
+	// answers on `getAccount`.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with PATCH /v1/accounts/{account_id} (the `RenameAccount` operationId).
+	RenameAccountWithBody(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RenameAccount Rename an account
+	//
+	// Changes `name` and nothing else. **Minimum role: admin**, and `accounts:write`
+	// for a scoped API token.
+	//
+	// ### The slug does not move, and that is the point
+	//
+	// `slug` is the account's **original** handle and it is deliberately **not**
+	// re-derived. A slug is what goes into logs, into invitation emails and into
+	// a future hostname, and one that changed on a rename would break every link
+	// already sent — the invitations above would go to a path that no longer
+	// resolves. So a rename moves the human-facing name and leaves the handle
+	// alone, and the response repeats the original `slug` so a client learns
+	// that from the answer rather than from a support ticket.
+	//
+	// This is also why there is **no `slug` field in the request**: a caller
+	// cannot move the handle even if it wants to.
+	//
+	// `members` is absent from the response even though the schema declares it —
+	// a rename does not re-read the membership table, and `omitempty` on a field
+	// that is never populated here is what makes "absent" and "empty" different
+	// answers on `getAccount`.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with PATCH /v1/accounts/{account_id} (the `RenameAccount` operationId).
+	RenameAccount(ctx context.Context, accountID AccountID, body RenameAccountJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ListAccountAuditLog Read an account's admin audit trail
 	//
@@ -1915,6 +2427,217 @@ type ClientInterface interface {
 	//
 	// Corresponds with DELETE /v1/accounts/{account_id}/api-keys/{key_id} (the `RevokeAPIKey` operationId).
 	RevokeAPIKey(ctx context.Context, accountID AccountID, keyID openapi_types.UUID, body RevokeAPIKeyJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// InviteMemberWithBody Invite somebody to an account
+	//
+	// Creates a **pending** membership and hands back the token that redeems it.
+	// **Minimum role: admin**, and `accounts:write` for a scoped API token.
+	//
+	// ### `token` is here and nowhere else, ever
+	//
+	// The raw token exists exactly once, in this 201. There is no column holding
+	// it — only its SHA-256 — and no operation that re-reads one, so a caller
+	// that loses it invites again. That is the same rule a session token, an OIDC
+	// client secret and an API token already follow, and it is stated here
+	// because a client that expects a later "get the invitation" call will not
+	// find one.
+	//
+	// It is redeemable for **seven days** (`expires_at`), and the token is **not
+	// bound to the address it was sent to**: possession of a 256-bit value is
+	// the credential. That is what lets somebody be invited under one address
+	// and sign in under another, and the consequence is that an admin can invite
+	// an address they do not control and whoever clicks the link is who joins —
+	// which was already true, because an admin can invite any address they like.
+	//
+	// **There is no mail here.** This operation does not send anything; the token
+	// is the delivery mechanism until invitation mail is handed to the courier
+	// service, and a service that mints an invitation nobody can redeem is worse
+	// than one that hands the token back once.
+	//
+	// ### The role an admin may hand out
+	//
+	// `role` must be `member` or `admin`. **`owner` is refused with 422 and
+	// `not_invitable`**: ownership is granted, never invited, because an account
+	// whose owner appears by accepting a link has an owner nobody chose. An
+	// **admin may invite a member; only an owner may hand out `admin`** — the
+	// privilege has to be granted by somebody who already holds it, or an admin
+	// can clone themselves into a second admin who answers to nobody.
+	//
+	// A **409** means this account already has a *pending* invitation for that
+	// address. Revoked and already-accepted invitations do not block a new one,
+	// so "we sent it to the wrong list, revoke it and send it again" is two
+	// requests — which is the whole reason `revokeAccountInvitation` exists.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/accounts/{account_id}/invitations (the `InviteMember` operationId).
+	InviteMemberWithBody(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// InviteMember Invite somebody to an account
+	//
+	// Creates a **pending** membership and hands back the token that redeems it.
+	// **Minimum role: admin**, and `accounts:write` for a scoped API token.
+	//
+	// ### `token` is here and nowhere else, ever
+	//
+	// The raw token exists exactly once, in this 201. There is no column holding
+	// it — only its SHA-256 — and no operation that re-reads one, so a caller
+	// that loses it invites again. That is the same rule a session token, an OIDC
+	// client secret and an API token already follow, and it is stated here
+	// because a client that expects a later "get the invitation" call will not
+	// find one.
+	//
+	// It is redeemable for **seven days** (`expires_at`), and the token is **not
+	// bound to the address it was sent to**: possession of a 256-bit value is
+	// the credential. That is what lets somebody be invited under one address
+	// and sign in under another, and the consequence is that an admin can invite
+	// an address they do not control and whoever clicks the link is who joins —
+	// which was already true, because an admin can invite any address they like.
+	//
+	// **There is no mail here.** This operation does not send anything; the token
+	// is the delivery mechanism until invitation mail is handed to the courier
+	// service, and a service that mints an invitation nobody can redeem is worse
+	// than one that hands the token back once.
+	//
+	// ### The role an admin may hand out
+	//
+	// `role` must be `member` or `admin`. **`owner` is refused with 422 and
+	// `not_invitable`**: ownership is granted, never invited, because an account
+	// whose owner appears by accepting a link has an owner nobody chose. An
+	// **admin may invite a member; only an owner may hand out `admin`** — the
+	// privilege has to be granted by somebody who already holds it, or an admin
+	// can clone themselves into a second admin who answers to nobody.
+	//
+	// A **409** means this account already has a *pending* invitation for that
+	// address. Revoked and already-accepted invitations do not block a new one,
+	// so "we sent it to the wrong list, revoke it and send it again" is two
+	// requests — which is the whole reason `revokeAccountInvitation` exists.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/accounts/{account_id}/invitations (the `InviteMember` operationId).
+	InviteMember(ctx context.Context, accountID AccountID, body InviteMemberJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ListMembers List an account's members
+	//
+	// Every membership, newest first. **Minimum role: member**, and
+	// `accounts:read` for a scoped API token. An account with none answers an
+	// empty `memberships` array and not `null`.
+	//
+	// A separate route from the account detail because a client that already has
+	// the account does not have to re-read it to render a member list — and a
+	// member list is a panel while the account is a header, so the panel is
+	// re-fetched far more often than the header is.
+	//
+	// The caller's own `role` is on the **wrapper**, beside the array, so a
+	// client rendering the panel knows what to offer without a third request and
+	// without scanning the list for itself.
+	//
+	// **Every entry names its user.** An entry with no `user_id` is not a
+	// membership a client can act on, because the two operations that act on one
+	// — `changeMemberRole` and `removeMember` — both need that id in the path.
+	// There is no `user_email` on an entry: an invitation carries an address, a
+	// membership does not, and this service deliberately does not keep the two in
+	// step, so an entry's identity is a user id and the address is whatever
+	// `GET /v1/me` says for the caller's own session.
+	//
+	// Corresponds with GET /v1/accounts/{account_id}/members (the `ListMembers` operationId).
+	ListMembers(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RemoveMember Remove a member
+	//
+	// Deletes one membership. **Minimum role: admin**, and a scoped API token
+	// needs `accounts:write`.
+	//
+	// **Two rules, and both are about the target.** Neither is on the route: the
+	// route's minimum answers "may this caller remove somebody here", and these
+	// answer "may they remove *this* one".
+	//
+	// * **An admin may not remove an owner — 403.** The owner's membership is a
+	//   different object from an admin's and only an owner touches it.
+	// * **The last owner is never removed — 422 `last_owner`.** An account with
+	//   no owner is an account nobody can administer.
+	//
+	// ### Removing somebody also stops their credentials, immediately
+	//
+	// A scoped API token's authority is re-read from the membership table on
+	// every request, so the tokens this user holds stop working **on their next
+	// request** with nothing to invalidate and nothing to revoke. And a
+	// re-invitation does **not** bring them back: the removal also swept what
+	// they held, which is the one case where a credential could otherwise
+	// outlive the membership that justified it. This is why there is no
+	// "revoke everything this user holds" operation on this surface — it would
+	// be the mechanism for a credential to outlive its reason, and the sweep
+	// already happens.
+	//
+	// An OIDC access token is the exception and the reason this sentence is
+	// here: a JWT is verifiable by anybody holding the published key set until
+	// its `exp` arrives, so a token this user obtained through a product keeps
+	// working for what is left of its lifetime. Removing the membership is not
+	// revocation of a JWT.
+	//
+	// Corresponds with DELETE /v1/accounts/{account_id}/members/{user_id} (the `RemoveMember` operationId).
+	RemoveMember(ctx context.Context, accountID AccountID, userID UserID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ChangeMemberRoleWithBody Change a member's role
+	//
+	// Moves one membership to a new role. **Minimum role: owner** — an admin and
+	// a member never reach this operation, because changing who may do what is
+	// an owner's decision and nothing else. A scoped API token needs
+	// `accounts:write`.
+	//
+	// Two refusals are about the **target** rather than the caller, and both live
+	// in the use case rather than on the route, so they hold however this is
+	// reached:
+	//
+	// * **422 `last_owner`** — the change would leave the account with no owner.
+	//   An account with no owner cannot be administered, renamed or deleted by
+	//   anybody, so it is a state the service refuses to create rather than one
+	//   it repairs later.
+	// * **422 `last_owner`** with a different `detail` — an owner demoting
+	//   **themselves** when they are the only one. It is the same invariant with
+	//   its own name, so a client can tell "you cannot leave this account
+	//   ownerless" from "you cannot leave yourself ownerless".
+	//
+	// Every role is invitable through this route, **including `owner`** — unlike
+	// `inviteMember`, which cannot grant it. Granting is a decision an owner
+	// makes about somebody who is already in; inviting is a decision that would
+	// let an owner arrive by clicking a link.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with PATCH /v1/accounts/{account_id}/members/{user_id} (the `ChangeMemberRole` operationId).
+	ChangeMemberRoleWithBody(ctx context.Context, accountID AccountID, userID UserID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ChangeMemberRole Change a member's role
+	//
+	// Moves one membership to a new role. **Minimum role: owner** — an admin and
+	// a member never reach this operation, because changing who may do what is
+	// an owner's decision and nothing else. A scoped API token needs
+	// `accounts:write`.
+	//
+	// Two refusals are about the **target** rather than the caller, and both live
+	// in the use case rather than on the route, so they hold however this is
+	// reached:
+	//
+	// * **422 `last_owner`** — the change would leave the account with no owner.
+	//   An account with no owner cannot be administered, renamed or deleted by
+	//   anybody, so it is a state the service refuses to create rather than one
+	//   it repairs later.
+	// * **422 `last_owner`** with a different `detail` — an owner demoting
+	//   **themselves** when they are the only one. It is the same invariant with
+	//   its own name, so a client can tell "you cannot leave this account
+	//   ownerless" from "you cannot leave yourself ownerless".
+	//
+	// Every role is invitable through this route, **including `owner`** — unlike
+	// `inviteMember`, which cannot grant it. Granting is a decision an owner
+	// makes about somebody who is already in; inviting is a decision that would
+	// let an owner arrive by clicking a link.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with PATCH /v1/accounts/{account_id}/members/{user_id} (the `ChangeMemberRole` operationId).
+	ChangeMemberRole(ctx context.Context, accountID AccountID, userID UserID, body ChangeMemberRoleJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ListOIDCClients List an account's OpenID Connect clients
 	//
@@ -2472,6 +3195,84 @@ type ClientInterface interface {
 	//
 	// Corresponds with POST /v1/introspections (the `IntrospectAPIKey` operationId).
 	IntrospectAPIKey(ctx context.Context, body IntrospectAPIKeyJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// AcceptInvitationWithBody Accept an invitation
+	//
+	// Redeems an invitation token: creates the membership, marks the invitation
+	// accepted and announces it, in one transaction. There is **no account in the
+	// path** — the token names the account.
+	//
+	// **Session only**, and the caller still has to be signed in: the membership
+	// that gets created belongs to *them*, so an anonymous redemption would
+	// create a membership for nobody. The token is the second credential, not
+	// the only one, and this route answers 401 without a session rather than
+	// minting one — sign in first, then accept.
+	//
+	// ### Four statuses, and they are four different facts
+	//
+	// | status | meaning | what to do |
+	// |---|---|---|
+	// | `404` | no invitation matches this token | it was never issued, or the address was never sent one |
+	// | `410` | it expired | ask the account's admin for a new one |
+	// | `410` | it was already accepted | somebody else used it, or you did |
+	// | `409` | you are already a member of that account | nothing to do |
+	//
+	// **`404` covers everything that is not a live token, and there is no way to
+	// tell them apart.** A wrong token, an unknown one, a malformed one and an
+	// empty one are the same answer, because a status that differed would say
+	// which invitation ids exist. The `410`s are the only distinction, and they
+	// are there because the caller can *act* on them: asking for a new one is the
+	// next step, and "your link was already spent" is a different sentence from
+	// "this invitation never existed". An invitation an admin revoked is also
+	// `404` — it is not redeemable and there is nothing to redeem.
+	//
+	// Redemption is single-use and the guarantee is **conditional**: two requests
+	// carrying the same token that arrive at the same instant produce one
+	// membership, not two.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/invitations/accept (the `AcceptInvitation` operationId).
+	AcceptInvitationWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// AcceptInvitation Accept an invitation
+	//
+	// Redeems an invitation token: creates the membership, marks the invitation
+	// accepted and announces it, in one transaction. There is **no account in the
+	// path** — the token names the account.
+	//
+	// **Session only**, and the caller still has to be signed in: the membership
+	// that gets created belongs to *them*, so an anonymous redemption would
+	// create a membership for nobody. The token is the second credential, not
+	// the only one, and this route answers 401 without a session rather than
+	// minting one — sign in first, then accept.
+	//
+	// ### Four statuses, and they are four different facts
+	//
+	// | status | meaning | what to do |
+	// |---|---|---|
+	// | `404` | no invitation matches this token | it was never issued, or the address was never sent one |
+	// | `410` | it expired | ask the account's admin for a new one |
+	// | `410` | it was already accepted | somebody else used it, or you did |
+	// | `409` | you are already a member of that account | nothing to do |
+	//
+	// **`404` covers everything that is not a live token, and there is no way to
+	// tell them apart.** A wrong token, an unknown one, a malformed one and an
+	// empty one are the same answer, because a status that differed would say
+	// which invitation ids exist. The `410`s are the only distinction, and they
+	// are there because the caller can *act* on them: asking for a new one is the
+	// next step, and "your link was already spent" is a different sentence from
+	// "this invitation never existed". An invitation an admin revoked is also
+	// `404` — it is not redeemable and there is nothing to redeem.
+	//
+	// Redemption is single-use and the guarantee is **conditional**: two requests
+	// carrying the same token that arrive at the same instant produce one
+	// membership, not two.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/invitations/accept (the `AcceptInvitation` operationId).
+	AcceptInvitation(ctx context.Context, body AcceptInvitationJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetCurrentUser The authenticated user
 	//
@@ -3054,6 +3855,282 @@ func (c *Client) Readiness(ctx context.Context, reqEditors ...RequestEditorFn) (
 	return c.Client.Do(req)
 }
 
+// ListAccounts List the caller's accounts
+//
+// Every account **this user** belongs to, personal account first and then by
+// name. A user with none answers `[]` and not `null`.
+//
+// **Session only, and this is the operation that makes that matter most.**
+// The question is "which accounts does this human belong to", and a scoped
+// API token is bound to one of them: answering it with a token would hand a
+// CI job an inventory of every other tenant its owner is in. There is no
+// scope for it in the machine vocabulary and there is not going to be one.
+//
+// Each entry carries the caller's role **in that account** — which is why
+// one user appears here as an owner of one row and a member of another, and
+// why a client rendering this list cannot use one `role` for the page.
+//
+// A bare array rather than core's `data` + `page` wrapper, and the omission
+// is deliberate: a person belongs to a handful of accounts and a cursor over
+// them is a wrapper every client has to unwrap to draw a switcher. The
+// first account that belongs to a thousand tenants gets the wrapper then.
+//
+// Corresponds with GET /v1/accounts (the `ListAccounts` operationId).
+func (c *Client) ListAccounts(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewListAccountsRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// CreateAccountWithBody Create an account
+//
+// Provisions an account and makes the caller its **owner**, in one
+// transaction. Either all three of the account row, the membership row and
+// the `identity.account.created` event exist, or none does.
+//
+// **Session only.** A scoped API token is refused with 403 — a credential
+// that could enumerate or create tenants is not a credential scoped to one
+// tenant. See the `tenancy` tag for why.
+//
+// **There is no `owner` field.** The owner is whoever is signed in, and there
+// is no version of this body that can put an account in somebody else's
+// hands: `account_id` and `user_id` are both absent, and a body carrying
+// either is a 422.
+//
+// `slug` is **derived** from `name` — lower case, dashes, at most 63
+// characters — and is returned here. Two accounts whose names slug to the
+// same handle cannot both exist, so the second create is a **409**, and the
+// detail names the derivation so the caller can pick another name rather
+// than guess at a slug. Derivation is what makes a collision predictable
+// from the name alone; hiding it would make it a support ticket.
+//
+// `personal` is always `false` on this route. The personal account is the
+// one a registration creates for its user, and it is created by the system
+// rather than by a request — which is what lets a later packet say "you
+// always have exactly one personal account" without a second table.
+//
+// **`name` is trimmed, not otherwise repaired.** `"Acme  Corp"` with two
+// spaces is stored as typed: silently collapsing it would make the stored
+// name differ from what the caller chose. An all-whitespace name is `422`
+// with `required`; a name with nothing sluggable in it — `"東京"` — is
+// `422` with `invalid_format`, because a slug is NOT NULL and a name that
+// cannot produce one would otherwise be a 500.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/accounts (the `CreateAccount` operationId).
+func (c *Client) CreateAccountWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateAccountRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// CreateAccount Create an account
+//
+// Provisions an account and makes the caller its **owner**, in one
+// transaction. Either all three of the account row, the membership row and
+// the `identity.account.created` event exist, or none does.
+//
+// **Session only.** A scoped API token is refused with 403 — a credential
+// that could enumerate or create tenants is not a credential scoped to one
+// tenant. See the `tenancy` tag for why.
+//
+// **There is no `owner` field.** The owner is whoever is signed in, and there
+// is no version of this body that can put an account in somebody else's
+// hands: `account_id` and `user_id` are both absent, and a body carrying
+// either is a 422.
+//
+// `slug` is **derived** from `name` — lower case, dashes, at most 63
+// characters — and is returned here. Two accounts whose names slug to the
+// same handle cannot both exist, so the second create is a **409**, and the
+// detail names the derivation so the caller can pick another name rather
+// than guess at a slug. Derivation is what makes a collision predictable
+// from the name alone; hiding it would make it a support ticket.
+//
+// `personal` is always `false` on this route. The personal account is the
+// one a registration creates for its user, and it is created by the system
+// rather than by a request — which is what lets a later packet say "you
+// always have exactly one personal account" without a second table.
+//
+// **`name` is trimmed, not otherwise repaired.** `"Acme  Corp"` with two
+// spaces is stored as typed: silently collapsing it would make the stored
+// name differ from what the caller chose. An all-whitespace name is `422`
+// with `required`; a name with nothing sluggable in it — `"東京"` — is
+// `422` with `invalid_format`, because a slug is NOT NULL and a name that
+// cannot produce one would otherwise be a 500.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/accounts (the `CreateAccount` operationId).
+func (c *Client) CreateAccount(ctx context.Context, body CreateAccountJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateAccountRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// DeleteAccount Delete an account
+//
+// Removes the account and everything scoped by it — its memberships, its
+// invitations, its API keys and its OpenID Connect registrations.
+// **Minimum role: owner**, and it is the only operation on this tag that
+// takes `accounts:delete`: a token holding `accounts:write` is already
+// refused on the role check once its owner is only an admin, and the extra
+// scope is for the owner case where the role gate alone would let it through.
+//
+// **Irreversible, and it says so by asking for nothing.** There is no
+// `confirm` field on this route, for the reason `revokeAccountInvitation`
+// has none: the URL names the one thing being destroyed, and there is
+// nothing in the request that could be misread as "and everything else". A
+// bulk operation is where a `confirm` earns its place; see the `admin` tag
+// for the shape that has one.
+//
+// Revoking every access token issued against a deleted registration is part
+// of what happens: a JWT is verifiable by anybody holding the published key
+// set until its `exp` arrives, so a token minted before the deletion fails
+// at `userinfo` immediately rather than fifteen minutes later.
+//
+// Corresponds with DELETE /v1/accounts/{account_id} (the `DeleteAccount` operationId).
+func (c *Client) DeleteAccount(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeleteAccountRequest(c.Server, accountID)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetAccount Read an account
+//
+// One account and its members. **Minimum role: member.**
+//
+// `role` is **the caller's own** role in this account, not a property of the
+// account. It is here because without it a client cannot render "you are an
+// admin" or decide whether to show a settings form, and answering that
+// otherwise costs a second round trip for a value the authorization layer
+// has already resolved.
+//
+// `members` is the same array `listMembers` returns, newest first — so a
+// client that already has the account does not have to re-read it to render
+// a member panel, and a client that does not know which it needs can read
+// one request instead of two. Every entry names the user, the role and when
+// that membership was created; there is no `user_email`, because this service
+// holds an address for an account and not for a membership, and joining on
+// `GET /v1/users/{id}` is not an endpoint this service has — see Known gaps.
+//
+// A **404** is the answer for a caller who is not a member, an account that
+// does not exist, and an id that is not an id this service issued. All three
+// are the same answer on purpose.
+//
+// Corresponds with GET /v1/accounts/{account_id} (the `GetAccount` operationId).
+func (c *Client) GetAccount(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetAccountRequest(c.Server, accountID)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RenameAccountWithBody Rename an account
+//
+// Changes `name` and nothing else. **Minimum role: admin**, and `accounts:write`
+// for a scoped API token.
+//
+// ### The slug does not move, and that is the point
+//
+// `slug` is the account's **original** handle and it is deliberately **not**
+// re-derived. A slug is what goes into logs, into invitation emails and into
+// a future hostname, and one that changed on a rename would break every link
+// already sent — the invitations above would go to a path that no longer
+// resolves. So a rename moves the human-facing name and leaves the handle
+// alone, and the response repeats the original `slug` so a client learns
+// that from the answer rather than from a support ticket.
+//
+// This is also why there is **no `slug` field in the request**: a caller
+// cannot move the handle even if it wants to.
+//
+// `members` is absent from the response even though the schema declares it —
+// a rename does not re-read the membership table, and `omitempty` on a field
+// that is never populated here is what makes "absent" and "empty" different
+// answers on `getAccount`.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with PATCH /v1/accounts/{account_id} (the `RenameAccount` operationId).
+func (c *Client) RenameAccountWithBody(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRenameAccountRequestWithBody(c.Server, accountID, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RenameAccount Rename an account
+//
+// Changes `name` and nothing else. **Minimum role: admin**, and `accounts:write`
+// for a scoped API token.
+//
+// ### The slug does not move, and that is the point
+//
+// `slug` is the account's **original** handle and it is deliberately **not**
+// re-derived. A slug is what goes into logs, into invitation emails and into
+// a future hostname, and one that changed on a rename would break every link
+// already sent — the invitations above would go to a path that no longer
+// resolves. So a rename moves the human-facing name and leaves the handle
+// alone, and the response repeats the original `slug` so a client learns
+// that from the answer rather than from a support ticket.
+//
+// This is also why there is **no `slug` field in the request**: a caller
+// cannot move the handle even if it wants to.
+//
+// `members` is absent from the response even though the schema declares it —
+// a rename does not re-read the membership table, and `omitempty` on a field
+// that is never populated here is what makes "absent" and "empty" different
+// answers on `getAccount`.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with PATCH /v1/accounts/{account_id} (the `RenameAccount` operationId).
+func (c *Client) RenameAccount(ctx context.Context, accountID AccountID, body RenameAccountJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRenameAccountRequest(c.Server, accountID, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 // ListAccountAuditLog Read an account's admin audit trail
 //
 // Every admin action taken on this account, newest first, and **append-only**:
@@ -3505,6 +4582,277 @@ func (c *Client) RevokeAPIKeyWithBody(ctx context.Context, accountID AccountID, 
 // Corresponds with DELETE /v1/accounts/{account_id}/api-keys/{key_id} (the `RevokeAPIKey` operationId).
 func (c *Client) RevokeAPIKey(ctx context.Context, accountID AccountID, keyID openapi_types.UUID, body RevokeAPIKeyJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewRevokeAPIKeyRequest(c.Server, accountID, keyID, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// InviteMemberWithBody Invite somebody to an account
+//
+// Creates a **pending** membership and hands back the token that redeems it.
+// **Minimum role: admin**, and `accounts:write` for a scoped API token.
+//
+// ### `token` is here and nowhere else, ever
+//
+// The raw token exists exactly once, in this 201. There is no column holding
+// it — only its SHA-256 — and no operation that re-reads one, so a caller
+// that loses it invites again. That is the same rule a session token, an OIDC
+// client secret and an API token already follow, and it is stated here
+// because a client that expects a later "get the invitation" call will not
+// find one.
+//
+// It is redeemable for **seven days** (`expires_at`), and the token is **not
+// bound to the address it was sent to**: possession of a 256-bit value is
+// the credential. That is what lets somebody be invited under one address
+// and sign in under another, and the consequence is that an admin can invite
+// an address they do not control and whoever clicks the link is who joins —
+// which was already true, because an admin can invite any address they like.
+//
+// **There is no mail here.** This operation does not send anything; the token
+// is the delivery mechanism until invitation mail is handed to the courier
+// service, and a service that mints an invitation nobody can redeem is worse
+// than one that hands the token back once.
+//
+// ### The role an admin may hand out
+//
+// `role` must be `member` or `admin`. **`owner` is refused with 422 and
+// `not_invitable`**: ownership is granted, never invited, because an account
+// whose owner appears by accepting a link has an owner nobody chose. An
+// **admin may invite a member; only an owner may hand out `admin`** — the
+// privilege has to be granted by somebody who already holds it, or an admin
+// can clone themselves into a second admin who answers to nobody.
+//
+// A **409** means this account already has a *pending* invitation for that
+// address. Revoked and already-accepted invitations do not block a new one,
+// so "we sent it to the wrong list, revoke it and send it again" is two
+// requests — which is the whole reason `revokeAccountInvitation` exists.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/accounts/{account_id}/invitations (the `InviteMember` operationId).
+func (c *Client) InviteMemberWithBody(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewInviteMemberRequestWithBody(c.Server, accountID, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// InviteMember Invite somebody to an account
+//
+// Creates a **pending** membership and hands back the token that redeems it.
+// **Minimum role: admin**, and `accounts:write` for a scoped API token.
+//
+// ### `token` is here and nowhere else, ever
+//
+// The raw token exists exactly once, in this 201. There is no column holding
+// it — only its SHA-256 — and no operation that re-reads one, so a caller
+// that loses it invites again. That is the same rule a session token, an OIDC
+// client secret and an API token already follow, and it is stated here
+// because a client that expects a later "get the invitation" call will not
+// find one.
+//
+// It is redeemable for **seven days** (`expires_at`), and the token is **not
+// bound to the address it was sent to**: possession of a 256-bit value is
+// the credential. That is what lets somebody be invited under one address
+// and sign in under another, and the consequence is that an admin can invite
+// an address they do not control and whoever clicks the link is who joins —
+// which was already true, because an admin can invite any address they like.
+//
+// **There is no mail here.** This operation does not send anything; the token
+// is the delivery mechanism until invitation mail is handed to the courier
+// service, and a service that mints an invitation nobody can redeem is worse
+// than one that hands the token back once.
+//
+// ### The role an admin may hand out
+//
+// `role` must be `member` or `admin`. **`owner` is refused with 422 and
+// `not_invitable`**: ownership is granted, never invited, because an account
+// whose owner appears by accepting a link has an owner nobody chose. An
+// **admin may invite a member; only an owner may hand out `admin`** — the
+// privilege has to be granted by somebody who already holds it, or an admin
+// can clone themselves into a second admin who answers to nobody.
+//
+// A **409** means this account already has a *pending* invitation for that
+// address. Revoked and already-accepted invitations do not block a new one,
+// so "we sent it to the wrong list, revoke it and send it again" is two
+// requests — which is the whole reason `revokeAccountInvitation` exists.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/accounts/{account_id}/invitations (the `InviteMember` operationId).
+func (c *Client) InviteMember(ctx context.Context, accountID AccountID, body InviteMemberJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewInviteMemberRequest(c.Server, accountID, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ListMembers List an account's members
+//
+// Every membership, newest first. **Minimum role: member**, and
+// `accounts:read` for a scoped API token. An account with none answers an
+// empty `memberships` array and not `null`.
+//
+// A separate route from the account detail because a client that already has
+// the account does not have to re-read it to render a member list — and a
+// member list is a panel while the account is a header, so the panel is
+// re-fetched far more often than the header is.
+//
+// The caller's own `role` is on the **wrapper**, beside the array, so a
+// client rendering the panel knows what to offer without a third request and
+// without scanning the list for itself.
+//
+// **Every entry names its user.** An entry with no `user_id` is not a
+// membership a client can act on, because the two operations that act on one
+// — `changeMemberRole` and `removeMember` — both need that id in the path.
+// There is no `user_email` on an entry: an invitation carries an address, a
+// membership does not, and this service deliberately does not keep the two in
+// step, so an entry's identity is a user id and the address is whatever
+// `GET /v1/me` says for the caller's own session.
+//
+// Corresponds with GET /v1/accounts/{account_id}/members (the `ListMembers` operationId).
+func (c *Client) ListMembers(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewListMembersRequest(c.Server, accountID)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RemoveMember Remove a member
+//
+// Deletes one membership. **Minimum role: admin**, and a scoped API token
+// needs `accounts:write`.
+//
+// **Two rules, and both are about the target.** Neither is on the route: the
+// route's minimum answers "may this caller remove somebody here", and these
+// answer "may they remove *this* one".
+//
+//   - **An admin may not remove an owner — 403.** The owner's membership is a
+//     different object from an admin's and only an owner touches it.
+//   - **The last owner is never removed — 422 `last_owner`.** An account with
+//     no owner is an account nobody can administer.
+//
+// ### Removing somebody also stops their credentials, immediately
+//
+// A scoped API token's authority is re-read from the membership table on
+// every request, so the tokens this user holds stop working **on their next
+// request** with nothing to invalidate and nothing to revoke. And a
+// re-invitation does **not** bring them back: the removal also swept what
+// they held, which is the one case where a credential could otherwise
+// outlive the membership that justified it. This is why there is no
+// "revoke everything this user holds" operation on this surface — it would
+// be the mechanism for a credential to outlive its reason, and the sweep
+// already happens.
+//
+// An OIDC access token is the exception and the reason this sentence is
+// here: a JWT is verifiable by anybody holding the published key set until
+// its `exp` arrives, so a token this user obtained through a product keeps
+// working for what is left of its lifetime. Removing the membership is not
+// revocation of a JWT.
+//
+// Corresponds with DELETE /v1/accounts/{account_id}/members/{user_id} (the `RemoveMember` operationId).
+func (c *Client) RemoveMember(ctx context.Context, accountID AccountID, userID UserID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRemoveMemberRequest(c.Server, accountID, userID)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ChangeMemberRoleWithBody Change a member's role
+//
+// Moves one membership to a new role. **Minimum role: owner** — an admin and
+// a member never reach this operation, because changing who may do what is
+// an owner's decision and nothing else. A scoped API token needs
+// `accounts:write`.
+//
+// Two refusals are about the **target** rather than the caller, and both live
+// in the use case rather than on the route, so they hold however this is
+// reached:
+//
+//   - **422 `last_owner`** — the change would leave the account with no owner.
+//     An account with no owner cannot be administered, renamed or deleted by
+//     anybody, so it is a state the service refuses to create rather than one
+//     it repairs later.
+//   - **422 `last_owner`** with a different `detail` — an owner demoting
+//     **themselves** when they are the only one. It is the same invariant with
+//     its own name, so a client can tell "you cannot leave this account
+//     ownerless" from "you cannot leave yourself ownerless".
+//
+// Every role is invitable through this route, **including `owner`** — unlike
+// `inviteMember`, which cannot grant it. Granting is a decision an owner
+// makes about somebody who is already in; inviting is a decision that would
+// let an owner arrive by clicking a link.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with PATCH /v1/accounts/{account_id}/members/{user_id} (the `ChangeMemberRole` operationId).
+func (c *Client) ChangeMemberRoleWithBody(ctx context.Context, accountID AccountID, userID UserID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewChangeMemberRoleRequestWithBody(c.Server, accountID, userID, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ChangeMemberRole Change a member's role
+//
+// Moves one membership to a new role. **Minimum role: owner** — an admin and
+// a member never reach this operation, because changing who may do what is
+// an owner's decision and nothing else. A scoped API token needs
+// `accounts:write`.
+//
+// Two refusals are about the **target** rather than the caller, and both live
+// in the use case rather than on the route, so they hold however this is
+// reached:
+//
+//   - **422 `last_owner`** — the change would leave the account with no owner.
+//     An account with no owner cannot be administered, renamed or deleted by
+//     anybody, so it is a state the service refuses to create rather than one
+//     it repairs later.
+//   - **422 `last_owner`** with a different `detail` — an owner demoting
+//     **themselves** when they are the only one. It is the same invariant with
+//     its own name, so a client can tell "you cannot leave this account
+//     ownerless" from "you cannot leave yourself ownerless".
+//
+// Every role is invitable through this route, **including `owner`** — unlike
+// `inviteMember`, which cannot grant it. Granting is a decision an owner
+// makes about somebody who is already in; inviting is a decision that would
+// let an owner arrive by clicking a link.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with PATCH /v1/accounts/{account_id}/members/{user_id} (the `ChangeMemberRole` operationId).
+func (c *Client) ChangeMemberRole(ctx context.Context, accountID AccountID, userID UserID, body ChangeMemberRoleJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewChangeMemberRoleRequest(c.Server, accountID, userID, body)
 	if err != nil {
 		return nil, err
 	}
@@ -4242,6 +5590,104 @@ func (c *Client) IntrospectAPIKeyWithBody(ctx context.Context, contentType strin
 // Corresponds with POST /v1/introspections (the `IntrospectAPIKey` operationId).
 func (c *Client) IntrospectAPIKey(ctx context.Context, body IntrospectAPIKeyJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewIntrospectAPIKeyRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// AcceptInvitationWithBody Accept an invitation
+//
+// Redeems an invitation token: creates the membership, marks the invitation
+// accepted and announces it, in one transaction. There is **no account in the
+// path** — the token names the account.
+//
+// **Session only**, and the caller still has to be signed in: the membership
+// that gets created belongs to *them*, so an anonymous redemption would
+// create a membership for nobody. The token is the second credential, not
+// the only one, and this route answers 401 without a session rather than
+// minting one — sign in first, then accept.
+//
+// ### Four statuses, and they are four different facts
+//
+// | status | meaning | what to do |
+// |---|---|---|
+// | `404` | no invitation matches this token | it was never issued, or the address was never sent one |
+// | `410` | it expired | ask the account's admin for a new one |
+// | `410` | it was already accepted | somebody else used it, or you did |
+// | `409` | you are already a member of that account | nothing to do |
+//
+// **`404` covers everything that is not a live token, and there is no way to
+// tell them apart.** A wrong token, an unknown one, a malformed one and an
+// empty one are the same answer, because a status that differed would say
+// which invitation ids exist. The `410`s are the only distinction, and they
+// are there because the caller can *act* on them: asking for a new one is the
+// next step, and "your link was already spent" is a different sentence from
+// "this invitation never existed". An invitation an admin revoked is also
+// `404` — it is not redeemable and there is nothing to redeem.
+//
+// Redemption is single-use and the guarantee is **conditional**: two requests
+// carrying the same token that arrive at the same instant produce one
+// membership, not two.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/invitations/accept (the `AcceptInvitation` operationId).
+func (c *Client) AcceptInvitationWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewAcceptInvitationRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// AcceptInvitation Accept an invitation
+//
+// Redeems an invitation token: creates the membership, marks the invitation
+// accepted and announces it, in one transaction. There is **no account in the
+// path** — the token names the account.
+//
+// **Session only**, and the caller still has to be signed in: the membership
+// that gets created belongs to *them*, so an anonymous redemption would
+// create a membership for nobody. The token is the second credential, not
+// the only one, and this route answers 401 without a session rather than
+// minting one — sign in first, then accept.
+//
+// ### Four statuses, and they are four different facts
+//
+// | status | meaning | what to do |
+// |---|---|---|
+// | `404` | no invitation matches this token | it was never issued, or the address was never sent one |
+// | `410` | it expired | ask the account's admin for a new one |
+// | `410` | it was already accepted | somebody else used it, or you did |
+// | `409` | you are already a member of that account | nothing to do |
+//
+// **`404` covers everything that is not a live token, and there is no way to
+// tell them apart.** A wrong token, an unknown one, a malformed one and an
+// empty one are the same answer, because a status that differed would say
+// which invitation ids exist. The `410`s are the only distinction, and they
+// are there because the caller can *act* on them: asking for a new one is the
+// next step, and "your link was already spent" is a different sentence from
+// "this invitation never existed". An invitation an admin revoked is also
+// `404` — it is not redeemable and there is nothing to redeem.
+//
+// Redemption is single-use and the guarantee is **conditional**: two requests
+// carrying the same token that arrive at the same instant produce one
+// membership, not two.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/invitations/accept (the `AcceptInvitation` operationId).
+func (c *Client) AcceptInvitation(ctx context.Context, body AcceptInvitationJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewAcceptInvitationRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
@@ -5054,6 +6500,188 @@ func NewReadinessRequest(server string) (*http.Request, error) {
 	return req, nil
 }
 
+// NewListAccountsRequest constructs an http.Request for the ListAccounts method
+func NewListAccountsRequest(server string) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewCreateAccountRequest calls the generic CreateAccount builder with application/json body
+func NewCreateAccountRequest(server string, body CreateAccountJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewCreateAccountRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewCreateAccountRequestWithBody constructs an http.Request for the CreateAccount method, with any body, and a specified content type
+func NewCreateAccountRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewDeleteAccountRequest constructs an http.Request for the DeleteAccount method
+func NewDeleteAccountRequest(server string, accountID AccountID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "account_id", accountID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetAccountRequest constructs an http.Request for the GetAccount method
+func NewGetAccountRequest(server string, accountID AccountID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "account_id", accountID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewRenameAccountRequest calls the generic RenameAccount builder with application/json body
+func NewRenameAccountRequest(server string, accountID AccountID, body RenameAccountJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRenameAccountRequestWithBody(server, accountID, "application/json", bodyReader)
+}
+
+// NewRenameAccountRequestWithBody constructs an http.Request for the RenameAccount method, with any body, and a specified content type
+func NewRenameAccountRequestWithBody(server string, accountID AccountID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "account_id", accountID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPatch, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewListAccountAuditLogRequest constructs an http.Request for the ListAccountAuditLog method
 func NewListAccountAuditLogRequest(server string, accountID AccountID, params *ListAccountAuditLogParams) (*http.Request, error) {
 	var err error
@@ -5341,6 +6969,182 @@ func NewRevokeAPIKeyRequestWithBody(server string, accountID AccountID, keyID op
 	}
 
 	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewInviteMemberRequest calls the generic InviteMember builder with application/json body
+func NewInviteMemberRequest(server string, accountID AccountID, body InviteMemberJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewInviteMemberRequestWithBody(server, accountID, "application/json", bodyReader)
+}
+
+// NewInviteMemberRequestWithBody constructs an http.Request for the InviteMember method, with any body, and a specified content type
+func NewInviteMemberRequestWithBody(server string, accountID AccountID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "account_id", accountID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts/%s/invitations", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewListMembersRequest constructs an http.Request for the ListMembers method
+func NewListMembersRequest(server string, accountID AccountID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "account_id", accountID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts/%s/members", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewRemoveMemberRequest constructs an http.Request for the RemoveMember method
+func NewRemoveMemberRequest(server string, accountID AccountID, userID UserID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "account_id", accountID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "user_id", userID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts/%s/members/%s", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewChangeMemberRoleRequest calls the generic ChangeMemberRole builder with application/json body
+func NewChangeMemberRoleRequest(server string, accountID AccountID, userID UserID, body ChangeMemberRoleJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewChangeMemberRoleRequestWithBody(server, accountID, userID, "application/json", bodyReader)
+}
+
+// NewChangeMemberRoleRequestWithBody constructs an http.Request for the ChangeMemberRole method, with any body, and a specified content type
+func NewChangeMemberRoleRequestWithBody(server string, accountID AccountID, userID UserID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "account_id", accountID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "user_id", userID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/accounts/%s/members/%s", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPatch, queryURL.String(), body)
 	if err != nil {
 		return nil, err
 	}
@@ -5761,6 +7565,46 @@ func NewIntrospectAPIKeyRequestWithBody(server string, contentType string, body 
 	}
 
 	operationPath := fmt.Sprintf("/v1/introspections")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewAcceptInvitationRequest calls the generic AcceptInvitation builder with application/json body
+func NewAcceptInvitationRequest(server string, body AcceptInvitationJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewAcceptInvitationRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewAcceptInvitationRequestWithBody constructs an http.Request for the AcceptInvitation method, with any body, and a specified content type
+func NewAcceptInvitationRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/invitations/accept")
 	if operationPath[0] == '/' {
 		operationPath = "." + operationPath
 	}
@@ -6298,6 +8142,218 @@ type ClientWithResponsesInterface interface {
 	// Corresponds with GET /readyz (the `Readiness` operationId).
 	ReadinessWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ReadinessResponse, error)
 
+	// ListAccountsWithResponse List the caller's accounts
+	//
+	// Every account **this user** belongs to, personal account first and then by
+	// name. A user with none answers `[]` and not `null`.
+	//
+	// **Session only, and this is the operation that makes that matter most.**
+	// The question is "which accounts does this human belong to", and a scoped
+	// API token is bound to one of them: answering it with a token would hand a
+	// CI job an inventory of every other tenant its owner is in. There is no
+	// scope for it in the machine vocabulary and there is not going to be one.
+	//
+	// Each entry carries the caller's role **in that account** — which is why
+	// one user appears here as an owner of one row and a member of another, and
+	// why a client rendering this list cannot use one `role` for the page.
+	//
+	// A bare array rather than core's `data` + `page` wrapper, and the omission
+	// is deliberate: a person belongs to a handful of accounts and a cursor over
+	// them is a wrapper every client has to unwrap to draw a switcher. The
+	// first account that belongs to a thousand tenants gets the wrapper then.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /v1/accounts (the `ListAccounts` operationId).
+	ListAccountsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListAccountsResponse, error)
+
+	// CreateAccountWithBodyWithResponse Create an account
+	//
+	// Provisions an account and makes the caller its **owner**, in one
+	// transaction. Either all three of the account row, the membership row and
+	// the `identity.account.created` event exist, or none does.
+	//
+	// **Session only.** A scoped API token is refused with 403 — a credential
+	// that could enumerate or create tenants is not a credential scoped to one
+	// tenant. See the `tenancy` tag for why.
+	//
+	// **There is no `owner` field.** The owner is whoever is signed in, and there
+	// is no version of this body that can put an account in somebody else's
+	// hands: `account_id` and `user_id` are both absent, and a body carrying
+	// either is a 422.
+	//
+	// `slug` is **derived** from `name` — lower case, dashes, at most 63
+	// characters — and is returned here. Two accounts whose names slug to the
+	// same handle cannot both exist, so the second create is a **409**, and the
+	// detail names the derivation so the caller can pick another name rather
+	// than guess at a slug. Derivation is what makes a collision predictable
+	// from the name alone; hiding it would make it a support ticket.
+	//
+	// `personal` is always `false` on this route. The personal account is the
+	// one a registration creates for its user, and it is created by the system
+	// rather than by a request — which is what lets a later packet say "you
+	// always have exactly one personal account" without a second table.
+	//
+	// **`name` is trimmed, not otherwise repaired.** `"Acme  Corp"` with two
+	// spaces is stored as typed: silently collapsing it would make the stored
+	// name differ from what the caller chose. An all-whitespace name is `422`
+	// with `required`; a name with nothing sluggable in it — `"東京"` — is
+	// `422` with `invalid_format`, because a slug is NOT NULL and a name that
+	// cannot produce one would otherwise be a 500.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/accounts (the `CreateAccount` operationId).
+	CreateAccountWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateAccountResponse, error)
+
+	// CreateAccountWithResponse Create an account
+	//
+	// Provisions an account and makes the caller its **owner**, in one
+	// transaction. Either all three of the account row, the membership row and
+	// the `identity.account.created` event exist, or none does.
+	//
+	// **Session only.** A scoped API token is refused with 403 — a credential
+	// that could enumerate or create tenants is not a credential scoped to one
+	// tenant. See the `tenancy` tag for why.
+	//
+	// **There is no `owner` field.** The owner is whoever is signed in, and there
+	// is no version of this body that can put an account in somebody else's
+	// hands: `account_id` and `user_id` are both absent, and a body carrying
+	// either is a 422.
+	//
+	// `slug` is **derived** from `name` — lower case, dashes, at most 63
+	// characters — and is returned here. Two accounts whose names slug to the
+	// same handle cannot both exist, so the second create is a **409**, and the
+	// detail names the derivation so the caller can pick another name rather
+	// than guess at a slug. Derivation is what makes a collision predictable
+	// from the name alone; hiding it would make it a support ticket.
+	//
+	// `personal` is always `false` on this route. The personal account is the
+	// one a registration creates for its user, and it is created by the system
+	// rather than by a request — which is what lets a later packet say "you
+	// always have exactly one personal account" without a second table.
+	//
+	// **`name` is trimmed, not otherwise repaired.** `"Acme  Corp"` with two
+	// spaces is stored as typed: silently collapsing it would make the stored
+	// name differ from what the caller chose. An all-whitespace name is `422`
+	// with `required`; a name with nothing sluggable in it — `"東京"` — is
+	// `422` with `invalid_format`, because a slug is NOT NULL and a name that
+	// cannot produce one would otherwise be a 500.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/accounts (the `CreateAccount` operationId).
+	CreateAccountWithResponse(ctx context.Context, body CreateAccountJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateAccountResponse, error)
+
+	// DeleteAccountWithResponse Delete an account
+	//
+	// Removes the account and everything scoped by it — its memberships, its
+	// invitations, its API keys and its OpenID Connect registrations.
+	// **Minimum role: owner**, and it is the only operation on this tag that
+	// takes `accounts:delete`: a token holding `accounts:write` is already
+	// refused on the role check once its owner is only an admin, and the extra
+	// scope is for the owner case where the role gate alone would let it through.
+	//
+	// **Irreversible, and it says so by asking for nothing.** There is no
+	// `confirm` field on this route, for the reason `revokeAccountInvitation`
+	// has none: the URL names the one thing being destroyed, and there is
+	// nothing in the request that could be misread as "and everything else". A
+	// bulk operation is where a `confirm` earns its place; see the `admin` tag
+	// for the shape that has one.
+	//
+	// Revoking every access token issued against a deleted registration is part
+	// of what happens: a JWT is verifiable by anybody holding the published key
+	// set until its `exp` arrives, so a token minted before the deletion fails
+	// at `userinfo` immediately rather than fifteen minutes later.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with DELETE /v1/accounts/{account_id} (the `DeleteAccount` operationId).
+	DeleteAccountWithResponse(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*DeleteAccountResponse, error)
+
+	// GetAccountWithResponse Read an account
+	//
+	// One account and its members. **Minimum role: member.**
+	//
+	// `role` is **the caller's own** role in this account, not a property of the
+	// account. It is here because without it a client cannot render "you are an
+	// admin" or decide whether to show a settings form, and answering that
+	// otherwise costs a second round trip for a value the authorization layer
+	// has already resolved.
+	//
+	// `members` is the same array `listMembers` returns, newest first — so a
+	// client that already has the account does not have to re-read it to render
+	// a member panel, and a client that does not know which it needs can read
+	// one request instead of two. Every entry names the user, the role and when
+	// that membership was created; there is no `user_email`, because this service
+	// holds an address for an account and not for a membership, and joining on
+	// `GET /v1/users/{id}` is not an endpoint this service has — see Known gaps.
+	//
+	// A **404** is the answer for a caller who is not a member, an account that
+	// does not exist, and an id that is not an id this service issued. All three
+	// are the same answer on purpose.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /v1/accounts/{account_id} (the `GetAccount` operationId).
+	GetAccountWithResponse(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*GetAccountResponse, error)
+
+	// RenameAccountWithBodyWithResponse Rename an account
+	//
+	// Changes `name` and nothing else. **Minimum role: admin**, and `accounts:write`
+	// for a scoped API token.
+	//
+	// ### The slug does not move, and that is the point
+	//
+	// `slug` is the account's **original** handle and it is deliberately **not**
+	// re-derived. A slug is what goes into logs, into invitation emails and into
+	// a future hostname, and one that changed on a rename would break every link
+	// already sent — the invitations above would go to a path that no longer
+	// resolves. So a rename moves the human-facing name and leaves the handle
+	// alone, and the response repeats the original `slug` so a client learns
+	// that from the answer rather than from a support ticket.
+	//
+	// This is also why there is **no `slug` field in the request**: a caller
+	// cannot move the handle even if it wants to.
+	//
+	// `members` is absent from the response even though the schema declares it —
+	// a rename does not re-read the membership table, and `omitempty` on a field
+	// that is never populated here is what makes "absent" and "empty" different
+	// answers on `getAccount`.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PATCH /v1/accounts/{account_id} (the `RenameAccount` operationId).
+	RenameAccountWithBodyWithResponse(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RenameAccountResponse, error)
+
+	// RenameAccountWithResponse Rename an account
+	//
+	// Changes `name` and nothing else. **Minimum role: admin**, and `accounts:write`
+	// for a scoped API token.
+	//
+	// ### The slug does not move, and that is the point
+	//
+	// `slug` is the account's **original** handle and it is deliberately **not**
+	// re-derived. A slug is what goes into logs, into invitation emails and into
+	// a future hostname, and one that changed on a rename would break every link
+	// already sent — the invitations above would go to a path that no longer
+	// resolves. So a rename moves the human-facing name and leaves the handle
+	// alone, and the response repeats the original `slug` so a client learns
+	// that from the answer rather than from a support ticket.
+	//
+	// This is also why there is **no `slug` field in the request**: a caller
+	// cannot move the handle even if it wants to.
+	//
+	// `members` is absent from the response even though the schema declares it —
+	// a rename does not re-read the membership table, and `omitempty` on a field
+	// that is never populated here is what makes "absent" and "empty" different
+	// answers on `getAccount`.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PATCH /v1/accounts/{account_id} (the `RenameAccount` operationId).
+	RenameAccountWithResponse(ctx context.Context, accountID AccountID, body RenameAccountJSONRequestBody, reqEditors ...RequestEditorFn) (*RenameAccountResponse, error)
+
 	// ListAccountAuditLogWithResponse Read an account's admin audit trail
 	//
 	// Every admin action taken on this account, newest first, and **append-only**:
@@ -6674,6 +8730,221 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with DELETE /v1/accounts/{account_id}/api-keys/{key_id} (the `RevokeAPIKey` operationId).
 	RevokeAPIKeyWithResponse(ctx context.Context, accountID AccountID, keyID openapi_types.UUID, body RevokeAPIKeyJSONRequestBody, reqEditors ...RequestEditorFn) (*RevokeAPIKeyResponse, error)
+
+	// InviteMemberWithBodyWithResponse Invite somebody to an account
+	//
+	// Creates a **pending** membership and hands back the token that redeems it.
+	// **Minimum role: admin**, and `accounts:write` for a scoped API token.
+	//
+	// ### `token` is here and nowhere else, ever
+	//
+	// The raw token exists exactly once, in this 201. There is no column holding
+	// it — only its SHA-256 — and no operation that re-reads one, so a caller
+	// that loses it invites again. That is the same rule a session token, an OIDC
+	// client secret and an API token already follow, and it is stated here
+	// because a client that expects a later "get the invitation" call will not
+	// find one.
+	//
+	// It is redeemable for **seven days** (`expires_at`), and the token is **not
+	// bound to the address it was sent to**: possession of a 256-bit value is
+	// the credential. That is what lets somebody be invited under one address
+	// and sign in under another, and the consequence is that an admin can invite
+	// an address they do not control and whoever clicks the link is who joins —
+	// which was already true, because an admin can invite any address they like.
+	//
+	// **There is no mail here.** This operation does not send anything; the token
+	// is the delivery mechanism until invitation mail is handed to the courier
+	// service, and a service that mints an invitation nobody can redeem is worse
+	// than one that hands the token back once.
+	//
+	// ### The role an admin may hand out
+	//
+	// `role` must be `member` or `admin`. **`owner` is refused with 422 and
+	// `not_invitable`**: ownership is granted, never invited, because an account
+	// whose owner appears by accepting a link has an owner nobody chose. An
+	// **admin may invite a member; only an owner may hand out `admin`** — the
+	// privilege has to be granted by somebody who already holds it, or an admin
+	// can clone themselves into a second admin who answers to nobody.
+	//
+	// A **409** means this account already has a *pending* invitation for that
+	// address. Revoked and already-accepted invitations do not block a new one,
+	// so "we sent it to the wrong list, revoke it and send it again" is two
+	// requests — which is the whole reason `revokeAccountInvitation` exists.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/accounts/{account_id}/invitations (the `InviteMember` operationId).
+	InviteMemberWithBodyWithResponse(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*InviteMemberResponse, error)
+
+	// InviteMemberWithResponse Invite somebody to an account
+	//
+	// Creates a **pending** membership and hands back the token that redeems it.
+	// **Minimum role: admin**, and `accounts:write` for a scoped API token.
+	//
+	// ### `token` is here and nowhere else, ever
+	//
+	// The raw token exists exactly once, in this 201. There is no column holding
+	// it — only its SHA-256 — and no operation that re-reads one, so a caller
+	// that loses it invites again. That is the same rule a session token, an OIDC
+	// client secret and an API token already follow, and it is stated here
+	// because a client that expects a later "get the invitation" call will not
+	// find one.
+	//
+	// It is redeemable for **seven days** (`expires_at`), and the token is **not
+	// bound to the address it was sent to**: possession of a 256-bit value is
+	// the credential. That is what lets somebody be invited under one address
+	// and sign in under another, and the consequence is that an admin can invite
+	// an address they do not control and whoever clicks the link is who joins —
+	// which was already true, because an admin can invite any address they like.
+	//
+	// **There is no mail here.** This operation does not send anything; the token
+	// is the delivery mechanism until invitation mail is handed to the courier
+	// service, and a service that mints an invitation nobody can redeem is worse
+	// than one that hands the token back once.
+	//
+	// ### The role an admin may hand out
+	//
+	// `role` must be `member` or `admin`. **`owner` is refused with 422 and
+	// `not_invitable`**: ownership is granted, never invited, because an account
+	// whose owner appears by accepting a link has an owner nobody chose. An
+	// **admin may invite a member; only an owner may hand out `admin`** — the
+	// privilege has to be granted by somebody who already holds it, or an admin
+	// can clone themselves into a second admin who answers to nobody.
+	//
+	// A **409** means this account already has a *pending* invitation for that
+	// address. Revoked and already-accepted invitations do not block a new one,
+	// so "we sent it to the wrong list, revoke it and send it again" is two
+	// requests — which is the whole reason `revokeAccountInvitation` exists.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/accounts/{account_id}/invitations (the `InviteMember` operationId).
+	InviteMemberWithResponse(ctx context.Context, accountID AccountID, body InviteMemberJSONRequestBody, reqEditors ...RequestEditorFn) (*InviteMemberResponse, error)
+
+	// ListMembersWithResponse List an account's members
+	//
+	// Every membership, newest first. **Minimum role: member**, and
+	// `accounts:read` for a scoped API token. An account with none answers an
+	// empty `memberships` array and not `null`.
+	//
+	// A separate route from the account detail because a client that already has
+	// the account does not have to re-read it to render a member list — and a
+	// member list is a panel while the account is a header, so the panel is
+	// re-fetched far more often than the header is.
+	//
+	// The caller's own `role` is on the **wrapper**, beside the array, so a
+	// client rendering the panel knows what to offer without a third request and
+	// without scanning the list for itself.
+	//
+	// **Every entry names its user.** An entry with no `user_id` is not a
+	// membership a client can act on, because the two operations that act on one
+	// — `changeMemberRole` and `removeMember` — both need that id in the path.
+	// There is no `user_email` on an entry: an invitation carries an address, a
+	// membership does not, and this service deliberately does not keep the two in
+	// step, so an entry's identity is a user id and the address is whatever
+	// `GET /v1/me` says for the caller's own session.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /v1/accounts/{account_id}/members (the `ListMembers` operationId).
+	ListMembersWithResponse(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*ListMembersResponse, error)
+
+	// RemoveMemberWithResponse Remove a member
+	//
+	// Deletes one membership. **Minimum role: admin**, and a scoped API token
+	// needs `accounts:write`.
+	//
+	// **Two rules, and both are about the target.** Neither is on the route: the
+	// route's minimum answers "may this caller remove somebody here", and these
+	// answer "may they remove *this* one".
+	//
+	// * **An admin may not remove an owner — 403.** The owner's membership is a
+	//   different object from an admin's and only an owner touches it.
+	// * **The last owner is never removed — 422 `last_owner`.** An account with
+	//   no owner is an account nobody can administer.
+	//
+	// ### Removing somebody also stops their credentials, immediately
+	//
+	// A scoped API token's authority is re-read from the membership table on
+	// every request, so the tokens this user holds stop working **on their next
+	// request** with nothing to invalidate and nothing to revoke. And a
+	// re-invitation does **not** bring them back: the removal also swept what
+	// they held, which is the one case where a credential could otherwise
+	// outlive the membership that justified it. This is why there is no
+	// "revoke everything this user holds" operation on this surface — it would
+	// be the mechanism for a credential to outlive its reason, and the sweep
+	// already happens.
+	//
+	// An OIDC access token is the exception and the reason this sentence is
+	// here: a JWT is verifiable by anybody holding the published key set until
+	// its `exp` arrives, so a token this user obtained through a product keeps
+	// working for what is left of its lifetime. Removing the membership is not
+	// revocation of a JWT.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with DELETE /v1/accounts/{account_id}/members/{user_id} (the `RemoveMember` operationId).
+	RemoveMemberWithResponse(ctx context.Context, accountID AccountID, userID UserID, reqEditors ...RequestEditorFn) (*RemoveMemberResponse, error)
+
+	// ChangeMemberRoleWithBodyWithResponse Change a member's role
+	//
+	// Moves one membership to a new role. **Minimum role: owner** — an admin and
+	// a member never reach this operation, because changing who may do what is
+	// an owner's decision and nothing else. A scoped API token needs
+	// `accounts:write`.
+	//
+	// Two refusals are about the **target** rather than the caller, and both live
+	// in the use case rather than on the route, so they hold however this is
+	// reached:
+	//
+	// * **422 `last_owner`** — the change would leave the account with no owner.
+	//   An account with no owner cannot be administered, renamed or deleted by
+	//   anybody, so it is a state the service refuses to create rather than one
+	//   it repairs later.
+	// * **422 `last_owner`** with a different `detail` — an owner demoting
+	//   **themselves** when they are the only one. It is the same invariant with
+	//   its own name, so a client can tell "you cannot leave this account
+	//   ownerless" from "you cannot leave yourself ownerless".
+	//
+	// Every role is invitable through this route, **including `owner`** — unlike
+	// `inviteMember`, which cannot grant it. Granting is a decision an owner
+	// makes about somebody who is already in; inviting is a decision that would
+	// let an owner arrive by clicking a link.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PATCH /v1/accounts/{account_id}/members/{user_id} (the `ChangeMemberRole` operationId).
+	ChangeMemberRoleWithBodyWithResponse(ctx context.Context, accountID AccountID, userID UserID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ChangeMemberRoleResponse, error)
+
+	// ChangeMemberRoleWithResponse Change a member's role
+	//
+	// Moves one membership to a new role. **Minimum role: owner** — an admin and
+	// a member never reach this operation, because changing who may do what is
+	// an owner's decision and nothing else. A scoped API token needs
+	// `accounts:write`.
+	//
+	// Two refusals are about the **target** rather than the caller, and both live
+	// in the use case rather than on the route, so they hold however this is
+	// reached:
+	//
+	// * **422 `last_owner`** — the change would leave the account with no owner.
+	//   An account with no owner cannot be administered, renamed or deleted by
+	//   anybody, so it is a state the service refuses to create rather than one
+	//   it repairs later.
+	// * **422 `last_owner`** with a different `detail` — an owner demoting
+	//   **themselves** when they are the only one. It is the same invariant with
+	//   its own name, so a client can tell "you cannot leave this account
+	//   ownerless" from "you cannot leave yourself ownerless".
+	//
+	// Every role is invitable through this route, **including `owner`** — unlike
+	// `inviteMember`, which cannot grant it. Granting is a decision an owner
+	// makes about somebody who is already in; inviting is a decision that would
+	// let an owner arrive by clicking a link.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PATCH /v1/accounts/{account_id}/members/{user_id} (the `ChangeMemberRole` operationId).
+	ChangeMemberRoleWithResponse(ctx context.Context, accountID AccountID, userID UserID, body ChangeMemberRoleJSONRequestBody, reqEditors ...RequestEditorFn) (*ChangeMemberRoleResponse, error)
 
 	// ListOIDCClientsWithResponse List an account's OpenID Connect clients
 	//
@@ -7239,6 +9510,84 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with POST /v1/introspections (the `IntrospectAPIKey` operationId).
 	IntrospectAPIKeyWithResponse(ctx context.Context, body IntrospectAPIKeyJSONRequestBody, reqEditors ...RequestEditorFn) (*IntrospectAPIKeyResponse, error)
+
+	// AcceptInvitationWithBodyWithResponse Accept an invitation
+	//
+	// Redeems an invitation token: creates the membership, marks the invitation
+	// accepted and announces it, in one transaction. There is **no account in the
+	// path** — the token names the account.
+	//
+	// **Session only**, and the caller still has to be signed in: the membership
+	// that gets created belongs to *them*, so an anonymous redemption would
+	// create a membership for nobody. The token is the second credential, not
+	// the only one, and this route answers 401 without a session rather than
+	// minting one — sign in first, then accept.
+	//
+	// ### Four statuses, and they are four different facts
+	//
+	// | status | meaning | what to do |
+	// |---|---|---|
+	// | `404` | no invitation matches this token | it was never issued, or the address was never sent one |
+	// | `410` | it expired | ask the account's admin for a new one |
+	// | `410` | it was already accepted | somebody else used it, or you did |
+	// | `409` | you are already a member of that account | nothing to do |
+	//
+	// **`404` covers everything that is not a live token, and there is no way to
+	// tell them apart.** A wrong token, an unknown one, a malformed one and an
+	// empty one are the same answer, because a status that differed would say
+	// which invitation ids exist. The `410`s are the only distinction, and they
+	// are there because the caller can *act* on them: asking for a new one is the
+	// next step, and "your link was already spent" is a different sentence from
+	// "this invitation never existed". An invitation an admin revoked is also
+	// `404` — it is not redeemable and there is nothing to redeem.
+	//
+	// Redemption is single-use and the guarantee is **conditional**: two requests
+	// carrying the same token that arrive at the same instant produce one
+	// membership, not two.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/invitations/accept (the `AcceptInvitation` operationId).
+	AcceptInvitationWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AcceptInvitationResponse, error)
+
+	// AcceptInvitationWithResponse Accept an invitation
+	//
+	// Redeems an invitation token: creates the membership, marks the invitation
+	// accepted and announces it, in one transaction. There is **no account in the
+	// path** — the token names the account.
+	//
+	// **Session only**, and the caller still has to be signed in: the membership
+	// that gets created belongs to *them*, so an anonymous redemption would
+	// create a membership for nobody. The token is the second credential, not
+	// the only one, and this route answers 401 without a session rather than
+	// minting one — sign in first, then accept.
+	//
+	// ### Four statuses, and they are four different facts
+	//
+	// | status | meaning | what to do |
+	// |---|---|---|
+	// | `404` | no invitation matches this token | it was never issued, or the address was never sent one |
+	// | `410` | it expired | ask the account's admin for a new one |
+	// | `410` | it was already accepted | somebody else used it, or you did |
+	// | `409` | you are already a member of that account | nothing to do |
+	//
+	// **`404` covers everything that is not a live token, and there is no way to
+	// tell them apart.** A wrong token, an unknown one, a malformed one and an
+	// empty one are the same answer, because a status that differed would say
+	// which invitation ids exist. The `410`s are the only distinction, and they
+	// are there because the caller can *act* on them: asking for a new one is the
+	// next step, and "your link was already spent" is a different sentence from
+	// "this invitation never existed". An invitation an admin revoked is also
+	// `404` — it is not redeemable and there is nothing to redeem.
+	//
+	// Redemption is single-use and the guarantee is **conditional**: two requests
+	// carrying the same token that arrive at the same instant produce one
+	// membership, not two.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/invitations/accept (the `AcceptInvitation` operationId).
+	AcceptInvitationWithResponse(ctx context.Context, body AcceptInvitationJSONRequestBody, reqEditors ...RequestEditorFn) (*AcceptInvitationResponse, error)
 
 	// GetCurrentUserWithResponse The authenticated user
 	//
@@ -7889,6 +10238,589 @@ func (r ReadinessResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r ReadinessResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// ListAccountsResponse200Headers the declared response headers of an HTTP 200 response for ListAccounts
+type ListAccountsResponse200Headers struct {
+	XTraceID string
+}
+
+// ListAccountsResponse401Headers the declared response headers of an HTTP 401 response for ListAccounts
+type ListAccountsResponse401Headers struct {
+	XTraceID string
+}
+
+// ListAccountsResponse403Headers the declared response headers of an HTTP 403 response for ListAccounts
+type ListAccountsResponse403Headers struct {
+	XTraceID string
+}
+
+// ListAccountsResponse500Headers the declared response headers of an HTTP 500 response for ListAccounts
+type ListAccountsResponse500Headers struct {
+	XTraceID string
+}
+
+type ListAccountsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *[]AccountSummary
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Problem
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *ListAccountsResponse200Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *ListAccountsResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *ListAccountsResponse403Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *ListAccountsResponse500Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ListAccountsResponse) GetJSON200() *[]AccountSummary {
+	return r.JSON200
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r ListAccountsResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r ListAccountsResponse) GetApplicationProblemJSON403() *Problem {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r ListAccountsResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r ListAccountsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ListAccountsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ListAccountsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ListAccountsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// CreateAccountResponse201Headers the declared response headers of an HTTP 201 response for CreateAccount
+type CreateAccountResponse201Headers struct {
+	XTraceID string
+}
+
+// CreateAccountResponse400Headers the declared response headers of an HTTP 400 response for CreateAccount
+type CreateAccountResponse400Headers struct {
+	XTraceID string
+}
+
+// CreateAccountResponse401Headers the declared response headers of an HTTP 401 response for CreateAccount
+type CreateAccountResponse401Headers struct {
+	XTraceID string
+}
+
+// CreateAccountResponse403Headers the declared response headers of an HTTP 403 response for CreateAccount
+type CreateAccountResponse403Headers struct {
+	XTraceID string
+}
+
+// CreateAccountResponse409Headers the declared response headers of an HTTP 409 response for CreateAccount
+type CreateAccountResponse409Headers struct {
+	XTraceID string
+}
+
+// CreateAccountResponse413Headers the declared response headers of an HTTP 413 response for CreateAccount
+type CreateAccountResponse413Headers struct {
+	XTraceID string
+}
+
+// CreateAccountResponse422Headers the declared response headers of an HTTP 422 response for CreateAccount
+type CreateAccountResponse422Headers struct {
+	XTraceID string
+}
+
+// CreateAccountResponse500Headers the declared response headers of an HTTP 500 response for CreateAccount
+type CreateAccountResponse500Headers struct {
+	XTraceID string
+}
+
+type CreateAccountResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *Account
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Problem
+	// ApplicationProblemJSON409 the response for an HTTP 409 `application/problem+json` response
+	ApplicationProblemJSON409 *Problem
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers201 the parsed response headers for an HTTP 201 response
+	Headers201 *CreateAccountResponse201Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *CreateAccountResponse400Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *CreateAccountResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *CreateAccountResponse403Headers
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *CreateAccountResponse409Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *CreateAccountResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *CreateAccountResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *CreateAccountResponse500Headers
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r CreateAccountResponse) GetJSON201() *Account {
+	return r.JSON201
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r CreateAccountResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r CreateAccountResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r CreateAccountResponse) GetApplicationProblemJSON403() *Problem {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON409 returns the response for an HTTP 409 `application/problem+json` response
+func (r CreateAccountResponse) GetApplicationProblemJSON409() *Problem {
+	return r.ApplicationProblemJSON409
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r CreateAccountResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r CreateAccountResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r CreateAccountResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r CreateAccountResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r CreateAccountResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r CreateAccountResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r CreateAccountResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// DeleteAccountResponse204Headers the declared response headers of an HTTP 204 response for DeleteAccount
+type DeleteAccountResponse204Headers struct {
+	XTraceID string
+}
+
+// DeleteAccountResponse401Headers the declared response headers of an HTTP 401 response for DeleteAccount
+type DeleteAccountResponse401Headers struct {
+	XTraceID string
+}
+
+// DeleteAccountResponse403Headers the declared response headers of an HTTP 403 response for DeleteAccount
+type DeleteAccountResponse403Headers struct {
+	XTraceID string
+}
+
+// DeleteAccountResponse404Headers the declared response headers of an HTTP 404 response for DeleteAccount
+type DeleteAccountResponse404Headers struct {
+	XTraceID string
+}
+
+// DeleteAccountResponse500Headers the declared response headers of an HTTP 500 response for DeleteAccount
+type DeleteAccountResponse500Headers struct {
+	XTraceID string
+}
+
+type DeleteAccountResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Forbidden
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *NotFound
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers204 the parsed response headers for an HTTP 204 response
+	Headers204 *DeleteAccountResponse204Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *DeleteAccountResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *DeleteAccountResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *DeleteAccountResponse404Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *DeleteAccountResponse500Headers
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r DeleteAccountResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r DeleteAccountResponse) GetApplicationProblemJSON403() *Forbidden {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r DeleteAccountResponse) GetApplicationProblemJSON404() *NotFound {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r DeleteAccountResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r DeleteAccountResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r DeleteAccountResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeleteAccountResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r DeleteAccountResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// GetAccountResponse200Headers the declared response headers of an HTTP 200 response for GetAccount
+type GetAccountResponse200Headers struct {
+	XTraceID string
+}
+
+// GetAccountResponse401Headers the declared response headers of an HTTP 401 response for GetAccount
+type GetAccountResponse401Headers struct {
+	XTraceID string
+}
+
+// GetAccountResponse403Headers the declared response headers of an HTTP 403 response for GetAccount
+type GetAccountResponse403Headers struct {
+	XTraceID string
+}
+
+// GetAccountResponse404Headers the declared response headers of an HTTP 404 response for GetAccount
+type GetAccountResponse404Headers struct {
+	XTraceID string
+}
+
+// GetAccountResponse500Headers the declared response headers of an HTTP 500 response for GetAccount
+type GetAccountResponse500Headers struct {
+	XTraceID string
+}
+
+type GetAccountResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *Account
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Forbidden
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *NotFound
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *GetAccountResponse200Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *GetAccountResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *GetAccountResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *GetAccountResponse404Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *GetAccountResponse500Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetAccountResponse) GetJSON200() *Account {
+	return r.JSON200
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r GetAccountResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r GetAccountResponse) GetApplicationProblemJSON403() *Forbidden {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r GetAccountResponse) GetApplicationProblemJSON404() *NotFound {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r GetAccountResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r GetAccountResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetAccountResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetAccountResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetAccountResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// RenameAccountResponse200Headers the declared response headers of an HTTP 200 response for RenameAccount
+type RenameAccountResponse200Headers struct {
+	XTraceID string
+}
+
+// RenameAccountResponse400Headers the declared response headers of an HTTP 400 response for RenameAccount
+type RenameAccountResponse400Headers struct {
+	XTraceID string
+}
+
+// RenameAccountResponse401Headers the declared response headers of an HTTP 401 response for RenameAccount
+type RenameAccountResponse401Headers struct {
+	XTraceID string
+}
+
+// RenameAccountResponse403Headers the declared response headers of an HTTP 403 response for RenameAccount
+type RenameAccountResponse403Headers struct {
+	XTraceID string
+}
+
+// RenameAccountResponse404Headers the declared response headers of an HTTP 404 response for RenameAccount
+type RenameAccountResponse404Headers struct {
+	XTraceID string
+}
+
+// RenameAccountResponse413Headers the declared response headers of an HTTP 413 response for RenameAccount
+type RenameAccountResponse413Headers struct {
+	XTraceID string
+}
+
+// RenameAccountResponse422Headers the declared response headers of an HTTP 422 response for RenameAccount
+type RenameAccountResponse422Headers struct {
+	XTraceID string
+}
+
+// RenameAccountResponse500Headers the declared response headers of an HTTP 500 response for RenameAccount
+type RenameAccountResponse500Headers struct {
+	XTraceID string
+}
+
+type RenameAccountResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *Account
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Forbidden
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *NotFound
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *RenameAccountResponse200Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *RenameAccountResponse400Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *RenameAccountResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *RenameAccountResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *RenameAccountResponse404Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *RenameAccountResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *RenameAccountResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *RenameAccountResponse500Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r RenameAccountResponse) GetJSON200() *Account {
+	return r.JSON200
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r RenameAccountResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r RenameAccountResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r RenameAccountResponse) GetApplicationProblemJSON403() *Forbidden {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r RenameAccountResponse) GetApplicationProblemJSON404() *NotFound {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r RenameAccountResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r RenameAccountResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r RenameAccountResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r RenameAccountResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RenameAccountResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RenameAccountResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RenameAccountResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -8583,6 +11515,527 @@ func (r RevokeAPIKeyResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r RevokeAPIKeyResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// InviteMemberResponse201Headers the declared response headers of an HTTP 201 response for InviteMember
+type InviteMemberResponse201Headers struct {
+	XTraceID string
+}
+
+// InviteMemberResponse400Headers the declared response headers of an HTTP 400 response for InviteMember
+type InviteMemberResponse400Headers struct {
+	XTraceID string
+}
+
+// InviteMemberResponse401Headers the declared response headers of an HTTP 401 response for InviteMember
+type InviteMemberResponse401Headers struct {
+	XTraceID string
+}
+
+// InviteMemberResponse403Headers the declared response headers of an HTTP 403 response for InviteMember
+type InviteMemberResponse403Headers struct {
+	XTraceID string
+}
+
+// InviteMemberResponse404Headers the declared response headers of an HTTP 404 response for InviteMember
+type InviteMemberResponse404Headers struct {
+	XTraceID string
+}
+
+// InviteMemberResponse409Headers the declared response headers of an HTTP 409 response for InviteMember
+type InviteMemberResponse409Headers struct {
+	XTraceID string
+}
+
+// InviteMemberResponse413Headers the declared response headers of an HTTP 413 response for InviteMember
+type InviteMemberResponse413Headers struct {
+	XTraceID string
+}
+
+// InviteMemberResponse422Headers the declared response headers of an HTTP 422 response for InviteMember
+type InviteMemberResponse422Headers struct {
+	XTraceID string
+}
+
+// InviteMemberResponse500Headers the declared response headers of an HTTP 500 response for InviteMember
+type InviteMemberResponse500Headers struct {
+	XTraceID string
+}
+
+type InviteMemberResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *IssuedInvitation
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Forbidden
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *NotFound
+	// ApplicationProblemJSON409 the response for an HTTP 409 `application/problem+json` response
+	ApplicationProblemJSON409 *Problem
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers201 the parsed response headers for an HTTP 201 response
+	Headers201 *InviteMemberResponse201Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *InviteMemberResponse400Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *InviteMemberResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *InviteMemberResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *InviteMemberResponse404Headers
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *InviteMemberResponse409Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *InviteMemberResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *InviteMemberResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *InviteMemberResponse500Headers
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r InviteMemberResponse) GetJSON201() *IssuedInvitation {
+	return r.JSON201
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r InviteMemberResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r InviteMemberResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r InviteMemberResponse) GetApplicationProblemJSON403() *Forbidden {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r InviteMemberResponse) GetApplicationProblemJSON404() *NotFound {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON409 returns the response for an HTTP 409 `application/problem+json` response
+func (r InviteMemberResponse) GetApplicationProblemJSON409() *Problem {
+	return r.ApplicationProblemJSON409
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r InviteMemberResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r InviteMemberResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r InviteMemberResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r InviteMemberResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r InviteMemberResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r InviteMemberResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r InviteMemberResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// ListMembersResponse200Headers the declared response headers of an HTTP 200 response for ListMembers
+type ListMembersResponse200Headers struct {
+	XTraceID string
+}
+
+// ListMembersResponse401Headers the declared response headers of an HTTP 401 response for ListMembers
+type ListMembersResponse401Headers struct {
+	XTraceID string
+}
+
+// ListMembersResponse403Headers the declared response headers of an HTTP 403 response for ListMembers
+type ListMembersResponse403Headers struct {
+	XTraceID string
+}
+
+// ListMembersResponse404Headers the declared response headers of an HTTP 404 response for ListMembers
+type ListMembersResponse404Headers struct {
+	XTraceID string
+}
+
+// ListMembersResponse500Headers the declared response headers of an HTTP 500 response for ListMembers
+type ListMembersResponse500Headers struct {
+	XTraceID string
+}
+
+type ListMembersResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *MemberList
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Forbidden
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *NotFound
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *ListMembersResponse200Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *ListMembersResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *ListMembersResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *ListMembersResponse404Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *ListMembersResponse500Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ListMembersResponse) GetJSON200() *MemberList {
+	return r.JSON200
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r ListMembersResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r ListMembersResponse) GetApplicationProblemJSON403() *Forbidden {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r ListMembersResponse) GetApplicationProblemJSON404() *NotFound {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r ListMembersResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r ListMembersResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ListMembersResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ListMembersResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ListMembersResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// RemoveMemberResponse204Headers the declared response headers of an HTTP 204 response for RemoveMember
+type RemoveMemberResponse204Headers struct {
+	XTraceID string
+}
+
+// RemoveMemberResponse401Headers the declared response headers of an HTTP 401 response for RemoveMember
+type RemoveMemberResponse401Headers struct {
+	XTraceID string
+}
+
+// RemoveMemberResponse403Headers the declared response headers of an HTTP 403 response for RemoveMember
+type RemoveMemberResponse403Headers struct {
+	XTraceID string
+}
+
+// RemoveMemberResponse404Headers the declared response headers of an HTTP 404 response for RemoveMember
+type RemoveMemberResponse404Headers struct {
+	XTraceID string
+}
+
+// RemoveMemberResponse422Headers the declared response headers of an HTTP 422 response for RemoveMember
+type RemoveMemberResponse422Headers struct {
+	XTraceID string
+}
+
+// RemoveMemberResponse500Headers the declared response headers of an HTTP 500 response for RemoveMember
+type RemoveMemberResponse500Headers struct {
+	XTraceID string
+}
+
+type RemoveMemberResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Forbidden
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *NotFound
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *Problem
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers204 the parsed response headers for an HTTP 204 response
+	Headers204 *RemoveMemberResponse204Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *RemoveMemberResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *RemoveMemberResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *RemoveMemberResponse404Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *RemoveMemberResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *RemoveMemberResponse500Headers
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r RemoveMemberResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r RemoveMemberResponse) GetApplicationProblemJSON403() *Forbidden {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r RemoveMemberResponse) GetApplicationProblemJSON404() *NotFound {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r RemoveMemberResponse) GetApplicationProblemJSON422() *Problem {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r RemoveMemberResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r RemoveMemberResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RemoveMemberResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RemoveMemberResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RemoveMemberResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// ChangeMemberRoleResponse200Headers the declared response headers of an HTTP 200 response for ChangeMemberRole
+type ChangeMemberRoleResponse200Headers struct {
+	XTraceID string
+}
+
+// ChangeMemberRoleResponse400Headers the declared response headers of an HTTP 400 response for ChangeMemberRole
+type ChangeMemberRoleResponse400Headers struct {
+	XTraceID string
+}
+
+// ChangeMemberRoleResponse401Headers the declared response headers of an HTTP 401 response for ChangeMemberRole
+type ChangeMemberRoleResponse401Headers struct {
+	XTraceID string
+}
+
+// ChangeMemberRoleResponse403Headers the declared response headers of an HTTP 403 response for ChangeMemberRole
+type ChangeMemberRoleResponse403Headers struct {
+	XTraceID string
+}
+
+// ChangeMemberRoleResponse404Headers the declared response headers of an HTTP 404 response for ChangeMemberRole
+type ChangeMemberRoleResponse404Headers struct {
+	XTraceID string
+}
+
+// ChangeMemberRoleResponse413Headers the declared response headers of an HTTP 413 response for ChangeMemberRole
+type ChangeMemberRoleResponse413Headers struct {
+	XTraceID string
+}
+
+// ChangeMemberRoleResponse422Headers the declared response headers of an HTTP 422 response for ChangeMemberRole
+type ChangeMemberRoleResponse422Headers struct {
+	XTraceID string
+}
+
+// ChangeMemberRoleResponse500Headers the declared response headers of an HTTP 500 response for ChangeMemberRole
+type ChangeMemberRoleResponse500Headers struct {
+	XTraceID string
+}
+
+type ChangeMemberRoleResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *Membership
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Forbidden
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *NotFound
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *ChangeMemberRoleResponse200Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *ChangeMemberRoleResponse400Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *ChangeMemberRoleResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *ChangeMemberRoleResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *ChangeMemberRoleResponse404Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *ChangeMemberRoleResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *ChangeMemberRoleResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *ChangeMemberRoleResponse500Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ChangeMemberRoleResponse) GetJSON200() *Membership {
+	return r.JSON200
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r ChangeMemberRoleResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r ChangeMemberRoleResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r ChangeMemberRoleResponse) GetApplicationProblemJSON403() *Forbidden {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r ChangeMemberRoleResponse) GetApplicationProblemJSON404() *NotFound {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r ChangeMemberRoleResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r ChangeMemberRoleResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r ChangeMemberRoleResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r ChangeMemberRoleResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ChangeMemberRoleResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ChangeMemberRoleResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ChangeMemberRoleResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -9840,6 +13293,180 @@ func (r IntrospectAPIKeyResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r IntrospectAPIKeyResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// AcceptInvitationResponse200Headers the declared response headers of an HTTP 200 response for AcceptInvitation
+type AcceptInvitationResponse200Headers struct {
+	XTraceID string
+}
+
+// AcceptInvitationResponse400Headers the declared response headers of an HTTP 400 response for AcceptInvitation
+type AcceptInvitationResponse400Headers struct {
+	XTraceID string
+}
+
+// AcceptInvitationResponse401Headers the declared response headers of an HTTP 401 response for AcceptInvitation
+type AcceptInvitationResponse401Headers struct {
+	XTraceID string
+}
+
+// AcceptInvitationResponse403Headers the declared response headers of an HTTP 403 response for AcceptInvitation
+type AcceptInvitationResponse403Headers struct {
+	XTraceID string
+}
+
+// AcceptInvitationResponse404Headers the declared response headers of an HTTP 404 response for AcceptInvitation
+type AcceptInvitationResponse404Headers struct {
+	XTraceID string
+}
+
+// AcceptInvitationResponse409Headers the declared response headers of an HTTP 409 response for AcceptInvitation
+type AcceptInvitationResponse409Headers struct {
+	XTraceID string
+}
+
+// AcceptInvitationResponse410Headers the declared response headers of an HTTP 410 response for AcceptInvitation
+type AcceptInvitationResponse410Headers struct {
+	XTraceID string
+}
+
+// AcceptInvitationResponse413Headers the declared response headers of an HTTP 413 response for AcceptInvitation
+type AcceptInvitationResponse413Headers struct {
+	XTraceID string
+}
+
+// AcceptInvitationResponse422Headers the declared response headers of an HTTP 422 response for AcceptInvitation
+type AcceptInvitationResponse422Headers struct {
+	XTraceID string
+}
+
+// AcceptInvitationResponse500Headers the declared response headers of an HTTP 500 response for AcceptInvitation
+type AcceptInvitationResponse500Headers struct {
+	XTraceID string
+}
+
+type AcceptInvitationResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *Membership
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Unauthenticated
+	// ApplicationProblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationProblemJSON403 *Problem
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *Problem
+	// ApplicationProblemJSON409 the response for an HTTP 409 `application/problem+json` response
+	ApplicationProblemJSON409 *Problem
+	// ApplicationProblemJSON410 the response for an HTTP 410 `application/problem+json` response
+	ApplicationProblemJSON410 *Problem
+	// ApplicationProblemJSON413 the response for an HTTP 413 `application/problem+json` response
+	ApplicationProblemJSON413 *BodyTooLarge
+	// ApplicationProblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationProblemJSON422 *ValidationFailed
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *AcceptInvitationResponse200Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *AcceptInvitationResponse400Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *AcceptInvitationResponse401Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *AcceptInvitationResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *AcceptInvitationResponse404Headers
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *AcceptInvitationResponse409Headers
+	// Headers410 the parsed response headers for an HTTP 410 response
+	Headers410 *AcceptInvitationResponse410Headers
+	// Headers413 the parsed response headers for an HTTP 413 response
+	Headers413 *AcceptInvitationResponse413Headers
+	// Headers422 the parsed response headers for an HTTP 422 response
+	Headers422 *AcceptInvitationResponse422Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *AcceptInvitationResponse500Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r AcceptInvitationResponse) GetJSON200() *Membership {
+	return r.JSON200
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r AcceptInvitationResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r AcceptInvitationResponse) GetApplicationProblemJSON401() *Unauthenticated {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r AcceptInvitationResponse) GetApplicationProblemJSON403() *Problem {
+	return r.ApplicationProblemJSON403
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r AcceptInvitationResponse) GetApplicationProblemJSON404() *Problem {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON409 returns the response for an HTTP 409 `application/problem+json` response
+func (r AcceptInvitationResponse) GetApplicationProblemJSON409() *Problem {
+	return r.ApplicationProblemJSON409
+}
+
+// GetApplicationProblemJSON410 returns the response for an HTTP 410 `application/problem+json` response
+func (r AcceptInvitationResponse) GetApplicationProblemJSON410() *Problem {
+	return r.ApplicationProblemJSON410
+}
+
+// GetApplicationProblemJSON413 returns the response for an HTTP 413 `application/problem+json` response
+func (r AcceptInvitationResponse) GetApplicationProblemJSON413() *BodyTooLarge {
+	return r.ApplicationProblemJSON413
+}
+
+// GetApplicationProblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r AcceptInvitationResponse) GetApplicationProblemJSON422() *ValidationFailed {
+	return r.ApplicationProblemJSON422
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r AcceptInvitationResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r AcceptInvitationResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r AcceptInvitationResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r AcceptInvitationResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r AcceptInvitationResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -11319,6 +14946,260 @@ func (c *ClientWithResponses) ReadinessWithResponse(ctx context.Context, reqEdit
 	return ParseReadinessResponse(rsp)
 }
 
+// ListAccountsWithResponse List the caller's accounts
+//
+// Every account **this user** belongs to, personal account first and then by
+// name. A user with none answers `[]` and not `null`.
+//
+// **Session only, and this is the operation that makes that matter most.**
+// The question is "which accounts does this human belong to", and a scoped
+// API token is bound to one of them: answering it with a token would hand a
+// CI job an inventory of every other tenant its owner is in. There is no
+// scope for it in the machine vocabulary and there is not going to be one.
+//
+// Each entry carries the caller's role **in that account** — which is why
+// one user appears here as an owner of one row and a member of another, and
+// why a client rendering this list cannot use one `role` for the page.
+//
+// A bare array rather than core's `data` + `page` wrapper, and the omission
+// is deliberate: a person belongs to a handful of accounts and a cursor over
+// them is a wrapper every client has to unwrap to draw a switcher. The
+// first account that belongs to a thousand tenants gets the wrapper then.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /v1/accounts (the `ListAccounts` operationId).
+func (c *ClientWithResponses) ListAccountsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListAccountsResponse, error) {
+	rsp, err := c.ListAccounts(ctx, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseListAccountsResponse(rsp)
+}
+
+// CreateAccountWithBodyWithResponse Create an account
+//
+// Provisions an account and makes the caller its **owner**, in one
+// transaction. Either all three of the account row, the membership row and
+// the `identity.account.created` event exist, or none does.
+//
+// **Session only.** A scoped API token is refused with 403 — a credential
+// that could enumerate or create tenants is not a credential scoped to one
+// tenant. See the `tenancy` tag for why.
+//
+// **There is no `owner` field.** The owner is whoever is signed in, and there
+// is no version of this body that can put an account in somebody else's
+// hands: `account_id` and `user_id` are both absent, and a body carrying
+// either is a 422.
+//
+// `slug` is **derived** from `name` — lower case, dashes, at most 63
+// characters — and is returned here. Two accounts whose names slug to the
+// same handle cannot both exist, so the second create is a **409**, and the
+// detail names the derivation so the caller can pick another name rather
+// than guess at a slug. Derivation is what makes a collision predictable
+// from the name alone; hiding it would make it a support ticket.
+//
+// `personal` is always `false` on this route. The personal account is the
+// one a registration creates for its user, and it is created by the system
+// rather than by a request — which is what lets a later packet say "you
+// always have exactly one personal account" without a second table.
+//
+// **`name` is trimmed, not otherwise repaired.** `"Acme  Corp"` with two
+// spaces is stored as typed: silently collapsing it would make the stored
+// name differ from what the caller chose. An all-whitespace name is `422`
+// with `required`; a name with nothing sluggable in it — `"東京"` — is
+// `422` with `invalid_format`, because a slug is NOT NULL and a name that
+// cannot produce one would otherwise be a 500.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/accounts (the `CreateAccount` operationId).
+func (c *ClientWithResponses) CreateAccountWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateAccountResponse, error) {
+	rsp, err := c.CreateAccountWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCreateAccountResponse(rsp)
+}
+
+// CreateAccountWithResponse Create an account
+//
+// Provisions an account and makes the caller its **owner**, in one
+// transaction. Either all three of the account row, the membership row and
+// the `identity.account.created` event exist, or none does.
+//
+// **Session only.** A scoped API token is refused with 403 — a credential
+// that could enumerate or create tenants is not a credential scoped to one
+// tenant. See the `tenancy` tag for why.
+//
+// **There is no `owner` field.** The owner is whoever is signed in, and there
+// is no version of this body that can put an account in somebody else's
+// hands: `account_id` and `user_id` are both absent, and a body carrying
+// either is a 422.
+//
+// `slug` is **derived** from `name` — lower case, dashes, at most 63
+// characters — and is returned here. Two accounts whose names slug to the
+// same handle cannot both exist, so the second create is a **409**, and the
+// detail names the derivation so the caller can pick another name rather
+// than guess at a slug. Derivation is what makes a collision predictable
+// from the name alone; hiding it would make it a support ticket.
+//
+// `personal` is always `false` on this route. The personal account is the
+// one a registration creates for its user, and it is created by the system
+// rather than by a request — which is what lets a later packet say "you
+// always have exactly one personal account" without a second table.
+//
+// **`name` is trimmed, not otherwise repaired.** `"Acme  Corp"` with two
+// spaces is stored as typed: silently collapsing it would make the stored
+// name differ from what the caller chose. An all-whitespace name is `422`
+// with `required`; a name with nothing sluggable in it — `"東京"` — is
+// `422` with `invalid_format`, because a slug is NOT NULL and a name that
+// cannot produce one would otherwise be a 500.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/accounts (the `CreateAccount` operationId).
+func (c *ClientWithResponses) CreateAccountWithResponse(ctx context.Context, body CreateAccountJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateAccountResponse, error) {
+	rsp, err := c.CreateAccount(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCreateAccountResponse(rsp)
+}
+
+// DeleteAccountWithResponse Delete an account
+//
+// Removes the account and everything scoped by it — its memberships, its
+// invitations, its API keys and its OpenID Connect registrations.
+// **Minimum role: owner**, and it is the only operation on this tag that
+// takes `accounts:delete`: a token holding `accounts:write` is already
+// refused on the role check once its owner is only an admin, and the extra
+// scope is for the owner case where the role gate alone would let it through.
+//
+// **Irreversible, and it says so by asking for nothing.** There is no
+// `confirm` field on this route, for the reason `revokeAccountInvitation`
+// has none: the URL names the one thing being destroyed, and there is
+// nothing in the request that could be misread as "and everything else". A
+// bulk operation is where a `confirm` earns its place; see the `admin` tag
+// for the shape that has one.
+//
+// Revoking every access token issued against a deleted registration is part
+// of what happens: a JWT is verifiable by anybody holding the published key
+// set until its `exp` arrives, so a token minted before the deletion fails
+// at `userinfo` immediately rather than fifteen minutes later.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with DELETE /v1/accounts/{account_id} (the `DeleteAccount` operationId).
+func (c *ClientWithResponses) DeleteAccountWithResponse(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*DeleteAccountResponse, error) {
+	rsp, err := c.DeleteAccount(ctx, accountID, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeleteAccountResponse(rsp)
+}
+
+// GetAccountWithResponse Read an account
+//
+// One account and its members. **Minimum role: member.**
+//
+// `role` is **the caller's own** role in this account, not a property of the
+// account. It is here because without it a client cannot render "you are an
+// admin" or decide whether to show a settings form, and answering that
+// otherwise costs a second round trip for a value the authorization layer
+// has already resolved.
+//
+// `members` is the same array `listMembers` returns, newest first — so a
+// client that already has the account does not have to re-read it to render
+// a member panel, and a client that does not know which it needs can read
+// one request instead of two. Every entry names the user, the role and when
+// that membership was created; there is no `user_email`, because this service
+// holds an address for an account and not for a membership, and joining on
+// `GET /v1/users/{id}` is not an endpoint this service has — see Known gaps.
+//
+// A **404** is the answer for a caller who is not a member, an account that
+// does not exist, and an id that is not an id this service issued. All three
+// are the same answer on purpose.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /v1/accounts/{account_id} (the `GetAccount` operationId).
+func (c *ClientWithResponses) GetAccountWithResponse(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*GetAccountResponse, error) {
+	rsp, err := c.GetAccount(ctx, accountID, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetAccountResponse(rsp)
+}
+
+// RenameAccountWithBodyWithResponse Rename an account
+//
+// Changes `name` and nothing else. **Minimum role: admin**, and `accounts:write`
+// for a scoped API token.
+//
+// ### The slug does not move, and that is the point
+//
+// `slug` is the account's **original** handle and it is deliberately **not**
+// re-derived. A slug is what goes into logs, into invitation emails and into
+// a future hostname, and one that changed on a rename would break every link
+// already sent — the invitations above would go to a path that no longer
+// resolves. So a rename moves the human-facing name and leaves the handle
+// alone, and the response repeats the original `slug` so a client learns
+// that from the answer rather than from a support ticket.
+//
+// This is also why there is **no `slug` field in the request**: a caller
+// cannot move the handle even if it wants to.
+//
+// `members` is absent from the response even though the schema declares it —
+// a rename does not re-read the membership table, and `omitempty` on a field
+// that is never populated here is what makes "absent" and "empty" different
+// answers on `getAccount`.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PATCH /v1/accounts/{account_id} (the `RenameAccount` operationId).
+func (c *ClientWithResponses) RenameAccountWithBodyWithResponse(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RenameAccountResponse, error) {
+	rsp, err := c.RenameAccountWithBody(ctx, accountID, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRenameAccountResponse(rsp)
+}
+
+// RenameAccountWithResponse Rename an account
+//
+// Changes `name` and nothing else. **Minimum role: admin**, and `accounts:write`
+// for a scoped API token.
+//
+// ### The slug does not move, and that is the point
+//
+// `slug` is the account's **original** handle and it is deliberately **not**
+// re-derived. A slug is what goes into logs, into invitation emails and into
+// a future hostname, and one that changed on a rename would break every link
+// already sent — the invitations above would go to a path that no longer
+// resolves. So a rename moves the human-facing name and leaves the handle
+// alone, and the response repeats the original `slug` so a client learns
+// that from the answer rather than from a support ticket.
+//
+// This is also why there is **no `slug` field in the request**: a caller
+// cannot move the handle even if it wants to.
+//
+// `members` is absent from the response even though the schema declares it —
+// a rename does not re-read the membership table, and `omitempty` on a field
+// that is never populated here is what makes "absent" and "empty" different
+// answers on `getAccount`.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PATCH /v1/accounts/{account_id} (the `RenameAccount` operationId).
+func (c *ClientWithResponses) RenameAccountWithResponse(ctx context.Context, accountID AccountID, body RenameAccountJSONRequestBody, reqEditors ...RequestEditorFn) (*RenameAccountResponse, error) {
+	rsp, err := c.RenameAccount(ctx, accountID, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRenameAccountResponse(rsp)
+}
+
 // ListAccountAuditLogWithResponse Read an account's admin audit trail
 //
 // Every admin action taken on this account, newest first, and **append-only**:
@@ -11748,6 +15629,257 @@ func (c *ClientWithResponses) RevokeAPIKeyWithResponse(ctx context.Context, acco
 		return nil, err
 	}
 	return ParseRevokeAPIKeyResponse(rsp)
+}
+
+// InviteMemberWithBodyWithResponse Invite somebody to an account
+//
+// Creates a **pending** membership and hands back the token that redeems it.
+// **Minimum role: admin**, and `accounts:write` for a scoped API token.
+//
+// ### `token` is here and nowhere else, ever
+//
+// The raw token exists exactly once, in this 201. There is no column holding
+// it — only its SHA-256 — and no operation that re-reads one, so a caller
+// that loses it invites again. That is the same rule a session token, an OIDC
+// client secret and an API token already follow, and it is stated here
+// because a client that expects a later "get the invitation" call will not
+// find one.
+//
+// It is redeemable for **seven days** (`expires_at`), and the token is **not
+// bound to the address it was sent to**: possession of a 256-bit value is
+// the credential. That is what lets somebody be invited under one address
+// and sign in under another, and the consequence is that an admin can invite
+// an address they do not control and whoever clicks the link is who joins —
+// which was already true, because an admin can invite any address they like.
+//
+// **There is no mail here.** This operation does not send anything; the token
+// is the delivery mechanism until invitation mail is handed to the courier
+// service, and a service that mints an invitation nobody can redeem is worse
+// than one that hands the token back once.
+//
+// ### The role an admin may hand out
+//
+// `role` must be `member` or `admin`. **`owner` is refused with 422 and
+// `not_invitable`**: ownership is granted, never invited, because an account
+// whose owner appears by accepting a link has an owner nobody chose. An
+// **admin may invite a member; only an owner may hand out `admin`** — the
+// privilege has to be granted by somebody who already holds it, or an admin
+// can clone themselves into a second admin who answers to nobody.
+//
+// A **409** means this account already has a *pending* invitation for that
+// address. Revoked and already-accepted invitations do not block a new one,
+// so "we sent it to the wrong list, revoke it and send it again" is two
+// requests — which is the whole reason `revokeAccountInvitation` exists.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/accounts/{account_id}/invitations (the `InviteMember` operationId).
+func (c *ClientWithResponses) InviteMemberWithBodyWithResponse(ctx context.Context, accountID AccountID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*InviteMemberResponse, error) {
+	rsp, err := c.InviteMemberWithBody(ctx, accountID, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseInviteMemberResponse(rsp)
+}
+
+// InviteMemberWithResponse Invite somebody to an account
+//
+// Creates a **pending** membership and hands back the token that redeems it.
+// **Minimum role: admin**, and `accounts:write` for a scoped API token.
+//
+// ### `token` is here and nowhere else, ever
+//
+// The raw token exists exactly once, in this 201. There is no column holding
+// it — only its SHA-256 — and no operation that re-reads one, so a caller
+// that loses it invites again. That is the same rule a session token, an OIDC
+// client secret and an API token already follow, and it is stated here
+// because a client that expects a later "get the invitation" call will not
+// find one.
+//
+// It is redeemable for **seven days** (`expires_at`), and the token is **not
+// bound to the address it was sent to**: possession of a 256-bit value is
+// the credential. That is what lets somebody be invited under one address
+// and sign in under another, and the consequence is that an admin can invite
+// an address they do not control and whoever clicks the link is who joins —
+// which was already true, because an admin can invite any address they like.
+//
+// **There is no mail here.** This operation does not send anything; the token
+// is the delivery mechanism until invitation mail is handed to the courier
+// service, and a service that mints an invitation nobody can redeem is worse
+// than one that hands the token back once.
+//
+// ### The role an admin may hand out
+//
+// `role` must be `member` or `admin`. **`owner` is refused with 422 and
+// `not_invitable`**: ownership is granted, never invited, because an account
+// whose owner appears by accepting a link has an owner nobody chose. An
+// **admin may invite a member; only an owner may hand out `admin`** — the
+// privilege has to be granted by somebody who already holds it, or an admin
+// can clone themselves into a second admin who answers to nobody.
+//
+// A **409** means this account already has a *pending* invitation for that
+// address. Revoked and already-accepted invitations do not block a new one,
+// so "we sent it to the wrong list, revoke it and send it again" is two
+// requests — which is the whole reason `revokeAccountInvitation` exists.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/accounts/{account_id}/invitations (the `InviteMember` operationId).
+func (c *ClientWithResponses) InviteMemberWithResponse(ctx context.Context, accountID AccountID, body InviteMemberJSONRequestBody, reqEditors ...RequestEditorFn) (*InviteMemberResponse, error) {
+	rsp, err := c.InviteMember(ctx, accountID, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseInviteMemberResponse(rsp)
+}
+
+// ListMembersWithResponse List an account's members
+//
+// Every membership, newest first. **Minimum role: member**, and
+// `accounts:read` for a scoped API token. An account with none answers an
+// empty `memberships` array and not `null`.
+//
+// A separate route from the account detail because a client that already has
+// the account does not have to re-read it to render a member list — and a
+// member list is a panel while the account is a header, so the panel is
+// re-fetched far more often than the header is.
+//
+// The caller's own `role` is on the **wrapper**, beside the array, so a
+// client rendering the panel knows what to offer without a third request and
+// without scanning the list for itself.
+//
+// **Every entry names its user.** An entry with no `user_id` is not a
+// membership a client can act on, because the two operations that act on one
+// — `changeMemberRole` and `removeMember` — both need that id in the path.
+// There is no `user_email` on an entry: an invitation carries an address, a
+// membership does not, and this service deliberately does not keep the two in
+// step, so an entry's identity is a user id and the address is whatever
+// `GET /v1/me` says for the caller's own session.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /v1/accounts/{account_id}/members (the `ListMembers` operationId).
+func (c *ClientWithResponses) ListMembersWithResponse(ctx context.Context, accountID AccountID, reqEditors ...RequestEditorFn) (*ListMembersResponse, error) {
+	rsp, err := c.ListMembers(ctx, accountID, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseListMembersResponse(rsp)
+}
+
+// RemoveMemberWithResponse Remove a member
+//
+// Deletes one membership. **Minimum role: admin**, and a scoped API token
+// needs `accounts:write`.
+//
+// **Two rules, and both are about the target.** Neither is on the route: the
+// route's minimum answers "may this caller remove somebody here", and these
+// answer "may they remove *this* one".
+//
+//   - **An admin may not remove an owner — 403.** The owner's membership is a
+//     different object from an admin's and only an owner touches it.
+//   - **The last owner is never removed — 422 `last_owner`.** An account with
+//     no owner is an account nobody can administer.
+//
+// ### Removing somebody also stops their credentials, immediately
+//
+// A scoped API token's authority is re-read from the membership table on
+// every request, so the tokens this user holds stop working **on their next
+// request** with nothing to invalidate and nothing to revoke. And a
+// re-invitation does **not** bring them back: the removal also swept what
+// they held, which is the one case where a credential could otherwise
+// outlive the membership that justified it. This is why there is no
+// "revoke everything this user holds" operation on this surface — it would
+// be the mechanism for a credential to outlive its reason, and the sweep
+// already happens.
+//
+// An OIDC access token is the exception and the reason this sentence is
+// here: a JWT is verifiable by anybody holding the published key set until
+// its `exp` arrives, so a token this user obtained through a product keeps
+// working for what is left of its lifetime. Removing the membership is not
+// revocation of a JWT.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with DELETE /v1/accounts/{account_id}/members/{user_id} (the `RemoveMember` operationId).
+func (c *ClientWithResponses) RemoveMemberWithResponse(ctx context.Context, accountID AccountID, userID UserID, reqEditors ...RequestEditorFn) (*RemoveMemberResponse, error) {
+	rsp, err := c.RemoveMember(ctx, accountID, userID, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRemoveMemberResponse(rsp)
+}
+
+// ChangeMemberRoleWithBodyWithResponse Change a member's role
+//
+// Moves one membership to a new role. **Minimum role: owner** — an admin and
+// a member never reach this operation, because changing who may do what is
+// an owner's decision and nothing else. A scoped API token needs
+// `accounts:write`.
+//
+// Two refusals are about the **target** rather than the caller, and both live
+// in the use case rather than on the route, so they hold however this is
+// reached:
+//
+//   - **422 `last_owner`** — the change would leave the account with no owner.
+//     An account with no owner cannot be administered, renamed or deleted by
+//     anybody, so it is a state the service refuses to create rather than one
+//     it repairs later.
+//   - **422 `last_owner`** with a different `detail` — an owner demoting
+//     **themselves** when they are the only one. It is the same invariant with
+//     its own name, so a client can tell "you cannot leave this account
+//     ownerless" from "you cannot leave yourself ownerless".
+//
+// Every role is invitable through this route, **including `owner`** — unlike
+// `inviteMember`, which cannot grant it. Granting is a decision an owner
+// makes about somebody who is already in; inviting is a decision that would
+// let an owner arrive by clicking a link.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PATCH /v1/accounts/{account_id}/members/{user_id} (the `ChangeMemberRole` operationId).
+func (c *ClientWithResponses) ChangeMemberRoleWithBodyWithResponse(ctx context.Context, accountID AccountID, userID UserID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ChangeMemberRoleResponse, error) {
+	rsp, err := c.ChangeMemberRoleWithBody(ctx, accountID, userID, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseChangeMemberRoleResponse(rsp)
+}
+
+// ChangeMemberRoleWithResponse Change a member's role
+//
+// Moves one membership to a new role. **Minimum role: owner** — an admin and
+// a member never reach this operation, because changing who may do what is
+// an owner's decision and nothing else. A scoped API token needs
+// `accounts:write`.
+//
+// Two refusals are about the **target** rather than the caller, and both live
+// in the use case rather than on the route, so they hold however this is
+// reached:
+//
+//   - **422 `last_owner`** — the change would leave the account with no owner.
+//     An account with no owner cannot be administered, renamed or deleted by
+//     anybody, so it is a state the service refuses to create rather than one
+//     it repairs later.
+//   - **422 `last_owner`** with a different `detail` — an owner demoting
+//     **themselves** when they are the only one. It is the same invariant with
+//     its own name, so a client can tell "you cannot leave this account
+//     ownerless" from "you cannot leave yourself ownerless".
+//
+// Every role is invitable through this route, **including `owner`** — unlike
+// `inviteMember`, which cannot grant it. Granting is a decision an owner
+// makes about somebody who is already in; inviting is a decision that would
+// let an owner arrive by clicking a link.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PATCH /v1/accounts/{account_id}/members/{user_id} (the `ChangeMemberRole` operationId).
+func (c *ClientWithResponses) ChangeMemberRoleWithResponse(ctx context.Context, accountID AccountID, userID UserID, body ChangeMemberRoleJSONRequestBody, reqEditors ...RequestEditorFn) (*ChangeMemberRoleResponse, error) {
+	rsp, err := c.ChangeMemberRole(ctx, accountID, userID, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseChangeMemberRoleResponse(rsp)
 }
 
 // ListOIDCClientsWithResponse List an account's OpenID Connect clients
@@ -12421,6 +16553,96 @@ func (c *ClientWithResponses) IntrospectAPIKeyWithResponse(ctx context.Context, 
 		return nil, err
 	}
 	return ParseIntrospectAPIKeyResponse(rsp)
+}
+
+// AcceptInvitationWithBodyWithResponse Accept an invitation
+//
+// Redeems an invitation token: creates the membership, marks the invitation
+// accepted and announces it, in one transaction. There is **no account in the
+// path** — the token names the account.
+//
+// **Session only**, and the caller still has to be signed in: the membership
+// that gets created belongs to *them*, so an anonymous redemption would
+// create a membership for nobody. The token is the second credential, not
+// the only one, and this route answers 401 without a session rather than
+// minting one — sign in first, then accept.
+//
+// ### Four statuses, and they are four different facts
+//
+// | status | meaning | what to do |
+// |---|---|---|
+// | `404` | no invitation matches this token | it was never issued, or the address was never sent one |
+// | `410` | it expired | ask the account's admin for a new one |
+// | `410` | it was already accepted | somebody else used it, or you did |
+// | `409` | you are already a member of that account | nothing to do |
+//
+// **`404` covers everything that is not a live token, and there is no way to
+// tell them apart.** A wrong token, an unknown one, a malformed one and an
+// empty one are the same answer, because a status that differed would say
+// which invitation ids exist. The `410`s are the only distinction, and they
+// are there because the caller can *act* on them: asking for a new one is the
+// next step, and "your link was already spent" is a different sentence from
+// "this invitation never existed". An invitation an admin revoked is also
+// `404` — it is not redeemable and there is nothing to redeem.
+//
+// Redemption is single-use and the guarantee is **conditional**: two requests
+// carrying the same token that arrive at the same instant produce one
+// membership, not two.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/invitations/accept (the `AcceptInvitation` operationId).
+func (c *ClientWithResponses) AcceptInvitationWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AcceptInvitationResponse, error) {
+	rsp, err := c.AcceptInvitationWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseAcceptInvitationResponse(rsp)
+}
+
+// AcceptInvitationWithResponse Accept an invitation
+//
+// Redeems an invitation token: creates the membership, marks the invitation
+// accepted and announces it, in one transaction. There is **no account in the
+// path** — the token names the account.
+//
+// **Session only**, and the caller still has to be signed in: the membership
+// that gets created belongs to *them*, so an anonymous redemption would
+// create a membership for nobody. The token is the second credential, not
+// the only one, and this route answers 401 without a session rather than
+// minting one — sign in first, then accept.
+//
+// ### Four statuses, and they are four different facts
+//
+// | status | meaning | what to do |
+// |---|---|---|
+// | `404` | no invitation matches this token | it was never issued, or the address was never sent one |
+// | `410` | it expired | ask the account's admin for a new one |
+// | `410` | it was already accepted | somebody else used it, or you did |
+// | `409` | you are already a member of that account | nothing to do |
+//
+// **`404` covers everything that is not a live token, and there is no way to
+// tell them apart.** A wrong token, an unknown one, a malformed one and an
+// empty one are the same answer, because a status that differed would say
+// which invitation ids exist. The `410`s are the only distinction, and they
+// are there because the caller can *act* on them: asking for a new one is the
+// next step, and "your link was already spent" is a different sentence from
+// "this invitation never existed". An invitation an admin revoked is also
+// `404` — it is not redeemable and there is nothing to redeem.
+//
+// Redemption is single-use and the guarantee is **conditional**: two requests
+// carrying the same token that arrive at the same instant produce one
+// membership, not two.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/invitations/accept (the `AcceptInvitation` operationId).
+func (c *ClientWithResponses) AcceptInvitationWithResponse(ctx context.Context, body AcceptInvitationJSONRequestBody, reqEditors ...RequestEditorFn) (*AcceptInvitationResponse, error) {
+	rsp, err := c.AcceptInvitation(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseAcceptInvitationResponse(rsp)
 }
 
 // GetCurrentUserWithResponse The authenticated user
@@ -13188,6 +17410,622 @@ func ParseReadinessResponse(rsp *http.Response) (*ReadinessResponse, error) {
 	return response, nil
 }
 
+// ParseListAccountsResponse parses an HTTP response from a ListAccountsWithResponse call
+func ParseListAccountsResponse(rsp *http.Response) (*ListAccountsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ListAccountsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest []AccountSummary
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers ListAccountsResponse200Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 401:
+		var headers ListAccountsResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers ListAccountsResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 500:
+		var headers ListAccountsResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseCreateAccountResponse parses an HTTP response from a CreateAccountWithResponse call
+func ParseCreateAccountResponse(rsp *http.Response) (*CreateAccountResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CreateAccountResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest Account
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 201:
+		var headers CreateAccountResponse201Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers201 = &headers
+	case rsp.StatusCode == 400:
+		var headers CreateAccountResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 401:
+		var headers CreateAccountResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers CreateAccountResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 409:
+		var headers CreateAccountResponse409Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers409 = &headers
+	case rsp.StatusCode == 413:
+		var headers CreateAccountResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers CreateAccountResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers CreateAccountResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseDeleteAccountResponse parses an HTTP response from a DeleteAccountWithResponse call
+func ParseDeleteAccountResponse(rsp *http.Response) (*DeleteAccountResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeleteAccountResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		var headers DeleteAccountResponse204Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers204 = &headers
+	case rsp.StatusCode == 401:
+		var headers DeleteAccountResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers DeleteAccountResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers DeleteAccountResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 500:
+		var headers DeleteAccountResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseGetAccountResponse parses an HTTP response from a GetAccountWithResponse call
+func ParseGetAccountResponse(rsp *http.Response) (*GetAccountResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetAccountResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest Account
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers GetAccountResponse200Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 401:
+		var headers GetAccountResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers GetAccountResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers GetAccountResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 500:
+		var headers GetAccountResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseRenameAccountResponse parses an HTTP response from a RenameAccountWithResponse call
+func ParseRenameAccountResponse(rsp *http.Response) (*RenameAccountResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RenameAccountResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest Account
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers RenameAccountResponse200Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 400:
+		var headers RenameAccountResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 401:
+		var headers RenameAccountResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers RenameAccountResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers RenameAccountResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 413:
+		var headers RenameAccountResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers RenameAccountResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers RenameAccountResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
 // ParseListAccountAuditLogResponse parses an HTTP response from a ListAccountAuditLogWithResponse call
 func ParseListAccountAuditLogResponse(rsp *http.Response) (*ListAccountAuditLogResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -13908,6 +18746,566 @@ func ParseRevokeAPIKeyResponse(rsp *http.Response) (*RevokeAPIKeyResponse, error
 		response.Headers422 = &headers
 	case rsp.StatusCode == 500:
 		var headers RevokeAPIKeyResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseInviteMemberResponse parses an HTTP response from a InviteMemberWithResponse call
+func ParseInviteMemberResponse(rsp *http.Response) (*InviteMemberResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &InviteMemberResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest IssuedInvitation
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 201:
+		var headers InviteMemberResponse201Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers201 = &headers
+	case rsp.StatusCode == 400:
+		var headers InviteMemberResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 401:
+		var headers InviteMemberResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers InviteMemberResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers InviteMemberResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 409:
+		var headers InviteMemberResponse409Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers409 = &headers
+	case rsp.StatusCode == 413:
+		var headers InviteMemberResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers InviteMemberResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers InviteMemberResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseListMembersResponse parses an HTTP response from a ListMembersWithResponse call
+func ParseListMembersResponse(rsp *http.Response) (*ListMembersResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ListMembersResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest MemberList
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers ListMembersResponse200Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 401:
+		var headers ListMembersResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers ListMembersResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers ListMembersResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 500:
+		var headers ListMembersResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseRemoveMemberResponse parses an HTTP response from a RemoveMemberWithResponse call
+func ParseRemoveMemberResponse(rsp *http.Response) (*RemoveMemberResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RemoveMemberResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		var headers RemoveMemberResponse204Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers204 = &headers
+	case rsp.StatusCode == 401:
+		var headers RemoveMemberResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers RemoveMemberResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers RemoveMemberResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 422:
+		var headers RemoveMemberResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers RemoveMemberResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseChangeMemberRoleResponse parses an HTTP response from a ChangeMemberRoleWithResponse call
+func ParseChangeMemberRoleResponse(rsp *http.Response) (*ChangeMemberRoleResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ChangeMemberRoleResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest Membership
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers ChangeMemberRoleResponse200Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 400:
+		var headers ChangeMemberRoleResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 401:
+		var headers ChangeMemberRoleResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers ChangeMemberRoleResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers ChangeMemberRoleResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 413:
+		var headers ChangeMemberRoleResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers ChangeMemberRoleResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers ChangeMemberRoleResponse500Headers
 		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
 			var value string
 			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
@@ -15237,6 +20635,198 @@ func ParseIntrospectAPIKeyResponse(rsp *http.Response) (*IntrospectAPIKeyRespons
 		response.Headers422 = &headers
 	case rsp.StatusCode == 500:
 		var headers IntrospectAPIKeyResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseAcceptInvitationResponse parses an HTTP response from a AcceptInvitationWithResponse call
+func ParseAcceptInvitationResponse(rsp *http.Response) (*AcceptInvitationResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &AcceptInvitationResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest Membership
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthenticated
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 410:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON410 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 413:
+		var dest BodyTooLarge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON413 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers AcceptInvitationResponse200Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 400:
+		var headers AcceptInvitationResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 401:
+		var headers AcceptInvitationResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 403:
+		var headers AcceptInvitationResponse403Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers AcceptInvitationResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 409:
+		var headers AcceptInvitationResponse409Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers409 = &headers
+	case rsp.StatusCode == 410:
+		var headers AcceptInvitationResponse410Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers410 = &headers
+	case rsp.StatusCode == 413:
+		var headers AcceptInvitationResponse413Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers413 = &headers
+	case rsp.StatusCode == 422:
+		var headers AcceptInvitationResponse422Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers422 = &headers
+	case rsp.StatusCode == 500:
+		var headers AcceptInvitationResponse500Headers
 		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
 			var value string
 			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {

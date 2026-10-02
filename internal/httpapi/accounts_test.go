@@ -425,6 +425,99 @@ func TestAccountListIsAnArrayNotNull(t *testing.T) {
 	}
 }
 
+// EVERY ENTRY OF A MEMBER LIST HAS TO IDENTIFY THE MEMBER, and it did not.
+//
+// `membershipResponses` projected only `Role`, because `accounts.MemberSummary`
+// carries the ACCOUNT and the role and never the user — the struct is shaped for
+// `ListMine`, which answers "which accounts does this user belong to", and
+// `Members` reuses it for "who is in this account". The consequence on the wire
+// was three entries that differed only by role:
+//
+//	[{"account_id":"","user_id":"","role":"admin","created_at":"0001-01-01T00:00:00Z"}, …]
+//
+// A member list nobody can tell apart is not a member list, and it is worse than
+// a missing one: a client rendering it draws three rows with no way to send
+// `PATCH` or `DELETE` against any of them, because the path needs a user id the
+// response does not carry.
+//
+// It went unnoticed because the operation is in no document — so there is no
+// generated client and no consumer whose complaint would have surfaced it. That
+// is the same gap packet identity-28 closes, and this is what closing it found.
+// The fix is on the projection and on the summary; the assertion is here because
+// a member list is exactly the kind of response a refactor silently empties.
+func TestEveryMemberInAMemberListIdentifiesItself(t *testing.T) {
+	accountID, ownerID, memberID, adminID := id.MustNew(), id.MustNew(), id.MustNew(), id.MustNew()
+	joined := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+	account := accounts.Account{ID: accountID, Name: "Acme Corp", Slug: "acme-corp", CreatedAt: joined, UpdatedAt: joined}
+
+	fake := newFakeTenancy()
+	fake.account = account
+	fake.role = accounts.RoleOwner
+	fake.members = []accounts.MemberSummary{
+		{Account: account, UserID: adminID, JoinedAt: joined, Role: accounts.RoleAdmin},
+		{Account: account, UserID: ownerID, JoinedAt: joined, Role: accounts.RoleOwner},
+		{Account: account, UserID: memberID, JoinedAt: joined, Role: accounts.RoleMember},
+	}
+
+	auth := newFakeAuth()
+	handler := New(nil, WithAuth(auth), WithTenancy(fake))
+
+	for _, target := range []string{
+		"/v1/accounts/" + accountID.String(),
+		"/v1/accounts/" + accountID.String() + "/members",
+	} {
+		rec := requestAs(t, handler, auth.token, http.MethodGet, target, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200; body: %s", target, rec.Code, rec.Body)
+		}
+
+		// Read the raw body rather than one projection: `GET /v1/accounts/{id}`
+		// nests the array under `members` and `/members` under `memberships`, and a
+		// test that only knows one of them would pass while the other stayed empty.
+		var envelope struct {
+			Members     []membershipResponse `json:"members"`
+			Memberships []membershipResponse `json:"memberships"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("GET %s is not JSON: %v\n%s", target, err, rec.Body)
+		}
+		got := envelope.Members
+		if got == nil {
+			got = envelope.Memberships
+		}
+
+		if len(got) != 3 {
+			t.Fatalf("GET %s returned %d membership(s), want 3; body: %s", target, len(got), rec.Body)
+		}
+		seen := map[string]accounts.Role{}
+		for _, m := range got {
+			if m.UserID == "" {
+				t.Errorf("GET %s — a membership carries no user_id: %+v\n"+
+					"The two other routes that act on a member are "+
+					"PATCH and DELETE /v1/accounts/{account_id}/members/{user_id}, so an entry "+
+					"without one cannot be acted on by anything.", target, m)
+				continue
+			}
+			if m.AccountID != accountID.String() {
+				t.Errorf("GET %s — membership.account_id = %q, want %q", target, m.AccountID, accountID)
+			}
+			if m.CreatedAt.IsZero() {
+				t.Errorf("GET %s — membership for %s has a zero created_at; it is when this user "+
+					"joined, and a client rendering a member list shows it", target, m.UserID)
+			}
+			seen[m.UserID] = m.Role
+		}
+		for user, role := range map[id.UUID]accounts.Role{
+			ownerID: accounts.RoleOwner, memberID: accounts.RoleMember, adminID: accounts.RoleAdmin,
+		} {
+			if seen[user.String()] != role {
+				t.Errorf("GET %s — no entry for %s with role %q; the list read %v",
+					target, user, role, seen)
+			}
+		}
+	}
+}
+
 // The invitation token is returned exactly once, in the 201, and never again.
 // A 200 on the same token has to be impossible, which is the store's conditional
 // UPDATE; here the point is narrower: the create response is the only place it

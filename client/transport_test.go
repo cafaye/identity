@@ -201,8 +201,8 @@ func TestTheTransportCoversEveryOperationInTheDocument(t *testing.T) {
 	// oapi-codegen EXPORTS them, so the Go method is `MintAPIKey`. The comparison is
 	// therefore case-insensitive rather than exact, and that is stated rather than
 	// papered over: it is not a loose match, it is the generator's one documented
-	// transformation, and an exact comparison here would report all twenty operations
-	// as missing and all twenty methods as invented.
+	// transformation, and an exact comparison here would report every operation as
+	// missing and every method as invented.
 	method := regexp.MustCompile(`(?m)^\t([A-Z][A-Za-z0-9]*)\(ctx context\.Context`)
 	implemented := map[string]bool{}
 	for _, match := range method.FindAllStringSubmatch(string(source), -1) {

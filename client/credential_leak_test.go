@@ -495,7 +495,7 @@ func TestTheGeneratedSecretBearingTypesAreSafeToPrint(t *testing.T) {
 
 	// And it must be the default that a caller reaches for, not a thing they have to
 	// remember. That is why it is a function with this name rather than a
-	// `RedactedString` field on twenty types.
+	// `RedactedString` field on every generated type that carries one.
 	if got := SafeToLog(generated.Session{Token: fakeToken}); strings.Contains(got, fakeToken) {
 		t.Errorf("SafeToLog printed a Session's token: %s", got)
 	}

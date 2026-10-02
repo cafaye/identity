@@ -25,7 +25,7 @@
 //
 //	client/generated/   oapi-codegen v2.8.0 output, COMMITTED, lint-excluded
 //	transport.go        the interface the generated client satisfies
-//	client.go           the hand-written client: twenty operations, typed results
+//	client.go           the hand-written client: forty-one operations, typed results
 //	credentials.go      which credential this is, and where it may be sent
 //	baseurl.go          where requests go, in a documented order
 //	errors.go           RFC 9457 problem to typed error, with a typed fallback
@@ -74,7 +74,7 @@ import (
 // Not `http.Client`'s zero value, which means "no timeout at all": a client for the
 // platform's security boundary that can hang forever on a socket is a resource leak
 // with a credential attached. Thirty seconds is generous for every operation in
-// this document — all twenty are row reads, row writes, and one argon2id
+// this document — all forty-one are row reads, row writes, and one argon2id
 // verification — and short enough that a caller is not left holding a goroutine.
 const DefaultTimeout = 30 * time.Second
 
@@ -297,7 +297,7 @@ func call[Out any](
 
 	// A 204, and any success with no body, is a success with nothing to decode.
 	// Treating "empty" as an error would make every DELETE in this document — eight
-	// of the twenty operations — fail while succeeding.
+	// of the forty-one operations — fail while succeeding.
 	if len(bytes.TrimSpace(body)) == 0 {
 		return nil
 	}
@@ -319,7 +319,7 @@ func call[Out any](
 //
 // It exists because Go cannot infer a type parameter from an untyped `nil`, and the
 // alternative — passing a `*struct{}` and hoping — is how a caller ends up with a
-// method that returns a value the contract says does not exist. Eight of the twenty
+// method that returns a value the contract says does not exist. Nine of the forty-one
 // operations in this document answer 204, so this is not a rare shape.
 //
 // `ctx` is accepted and ignored for symmetry with `call`; the context reaches the
@@ -328,7 +328,7 @@ func callVoid(ctx context.Context, c *Client, operation string, send func() (*ht
 	return call[struct{}](c, operation, send, nil)
 }
 
-// --- the twenty operations ---------------------------------------------------
+// --- the forty-one operations ------------------------------------------------
 //
 // One per `operationId`, named exactly as the document names them. That naming is
 // not a style choice: `operationId` is the contract, it is what every generated
@@ -457,7 +457,7 @@ func (c *Client) CreateSession(ctx context.Context, body generated.LoginRequest)
 // being returned to the pool either way, and there is nothing a caller could do
 // with "the body could not be signalled closed". Discarding it is correct — but
 // discarding it with a bare `_ =` is a decision that should be written down once
-// rather than argued about at twenty call sites, and `bodyclose`/`errcheck` are in
+// rather than argued about at forty call sites, and `bodyclose`/`errcheck` are in
 // the fleet's linter set precisely so that "did anybody close it" is never a
 // question.
 func closeBody(res *http.Response) {
@@ -698,6 +698,190 @@ func (c *Client) ConfirmEmailChangeNewAddress(ctx context.Context, body generate
 	var out generated.EmailChange
 	err := call(c, "confirmEmailChangeNewAddress", func() (*http.Response, error) {
 		return c.transport.ConfirmEmailChangeNewAddress(ctx, body)
+	}, &out)
+	return &out, err
+}
+
+// CreateAccount provisions an account and makes the caller its owner.
+// Corresponds to `POST /v1/accounts`.
+//
+// **The caller has to hold a session, not an API token**, and the service answers
+// 403 to one — this operation, `ListAccounts` and `AcceptInvitation` are the three
+// on this surface that refuse a token, because each answers a question about the
+// caller's whole set of accounts and a token is bound to one of them. A caller
+// building an onboarding flow therefore needs a session for this step even when
+// every step after it is done with a token.
+//
+// `body.Name` is the only field: the owner is the caller and the slug is derived,
+// so there is nothing a caller can send that puts an account in somebody else's
+// hands. A **409** means the derived slug is taken, and the detail says how it is
+// derived, so pick another name rather than retrying with the same one.
+func (c *Client) CreateAccount(ctx context.Context, body generated.CreateAccountJSONRequestBody) (*generated.Account, error) {
+	var out generated.Account
+	err := call(c, "createAccount", func() (*http.Response, error) {
+		return c.transport.CreateAccount(ctx, body)
+	}, &out)
+	return &out, err
+}
+
+// ListAccounts lists the accounts the presented session's user belongs to.
+// Corresponds to `GET /v1/accounts`.
+//
+// Session only, same as `CreateAccount`. Each entry's `Role` is the caller's role
+// **in that account**, so one user is an owner of one row and a member of
+// another; a client that renders one `role` for the whole page is reading a
+// thing this service does not have. An account with none is an empty slice and
+// not `null`.
+func (c *Client) ListAccounts(ctx context.Context) ([]generated.AccountSummary, error) {
+	var out []generated.AccountSummary
+	err := call(c, "listAccounts", func() (*http.Response, error) {
+		return c.transport.ListAccounts(ctx)
+	}, &out)
+	return out, err
+}
+
+// GetAccount reads one account and its members. Corresponds to
+// `GET /v1/accounts/{account_id}`.
+//
+// `out.Role` is the CALLER's role in this account, and `out.Members` is the same
+// array `ListMembers` returns — the document puts it on both so a client that
+// already holds the account does not re-read it for a member panel.
+//
+// **A non-member gets 404, never 403**, and so does an account that does not
+// exist: the two are deliberately the same answer, because a 403 would confirm
+// that a guessed account id is real. A client that renders "forbidden" here has
+// read a 404 as a 403.
+func (c *Client) GetAccount(ctx context.Context, accountId openapiTypes.UUID) (*generated.Account, error) {
+	var out generated.Account
+	err := call(c, "getAccount", func() (*http.Response, error) {
+		return c.transport.GetAccount(ctx, accountId)
+	}, &out)
+	return &out, err
+}
+
+// RenameAccount changes an account's name. Corresponds to
+// `PATCH /v1/accounts/{account_id}`.
+//
+// **The returned `Slug` is the account's ORIGINAL handle and does not change.** A
+// slug goes into logs, into invitation emails and into a future hostname, and one
+// that moved on a rename would break every link already sent — so the response
+// repeats the old value and a client must not derive an expected slug from the
+// name it just sent. Admin only, and `accounts:write` for a token.
+func (c *Client) RenameAccount(ctx context.Context, accountId openapiTypes.UUID, body generated.RenameAccountJSONRequestBody) (*generated.Account, error) {
+	var out generated.Account
+	err := call(c, "renameAccount", func() (*http.Response, error) {
+		return c.transport.RenameAccount(ctx, accountId, body)
+	}, &out)
+	return &out, err
+}
+
+// DeleteAccount removes an account and everything scoped by it. Corresponds to
+// `DELETE /v1/accounts/{account_id}`.
+//
+// **Irreversible, and it is the only operation on this surface that takes
+// `accounts:delete`.** Owner only; a token holding `accounts:write` is refused.
+// There is no `confirm` field on this route — the URL names the one thing being
+// destroyed — so a caller that wants a confirmation dialog draws one itself
+// rather than expecting the service to ask.
+func (c *Client) DeleteAccount(ctx context.Context, accountId openapiTypes.UUID) error {
+	return callVoid(ctx, c, "deleteAccount", func() (*http.Response, error) {
+		return c.transport.DeleteAccount(ctx, accountId)
+	})
+}
+
+// ListMembers lists an account's memberships. Corresponds to
+// `GET /v1/accounts/{account_id}/members`.
+//
+// `out.Role` is the caller's own role, on the wrapper rather than inside the
+// array, so a client rendering the panel knows what to offer without scanning the
+// list for itself. Every entry names the `user_id` that `ChangeMemberRole` and
+// `RemoveMember` need — an entry without one is a membership nothing can be acted
+// on, and this client does not paper over that by inventing an id.
+func (c *Client) ListMembers(ctx context.Context, accountId openapiTypes.UUID) (*generated.MemberList, error) {
+	var out generated.MemberList
+	err := call(c, "listMembers", func() (*http.Response, error) {
+		return c.transport.ListMembers(ctx, accountId)
+	}, &out)
+	return &out, err
+}
+
+// InviteMember creates a pending membership. Corresponds to
+// `POST /v1/accounts/{account_id}/invitations`.
+//
+// **`out.Token` is the only copy of the redemption token that will ever exist.** It
+// is not stored, only a SHA-256 of it is, and no operation re-reads one — so a
+// caller that drops it invites again rather than looking for a way to fetch it.
+// The generated `IssuedInvitation` carries `Token` and has no redacting
+// `String()`, so this is a value that must not be logged; see
+// `TestTheGeneratedSecretBearingTypesAreSafeToPrint`.
+//
+// **Nothing is mailed.** Until invitation mail is handed to the courier service,
+// this token IS the delivery mechanism and a caller that sends it itself owns the
+// whole invitation. `role` is `member` or `admin`: `owner` is a 422, and so is an
+// admin inviting an `admin`.
+func (c *Client) InviteMember(ctx context.Context, accountId openapiTypes.UUID, body generated.InviteMemberJSONRequestBody) (*generated.IssuedInvitation, error) {
+	var out generated.IssuedInvitation
+	err := call(c, "inviteMember", func() (*http.Response, error) {
+		return c.transport.InviteMember(ctx, accountId, body)
+	}, &out)
+	return &out, err
+}
+
+// ChangeMemberRole moves one membership to a new role. Corresponds to
+// `PATCH /v1/accounts/{account_id}/members/{user_id}`.
+//
+// **Owner only** — an admin and a member never reach it. The 422s here are about
+// the target rather than the caller, and a caller must not read one as "your role
+// is too low": `last_owner` means the change would leave the account with no
+// owner, or that the caller is the only owner demoting themselves, and both are
+// answered by granting a second owner rather than by retrying.
+//
+// Removing somebody is `RemoveMember`, not a change to a lower role: a membership
+// that should not exist should be deleted, so that withdrawing the credentials the
+// person held is part of the same request.
+func (c *Client) ChangeMemberRole(ctx context.Context, accountId, userId openapiTypes.UUID, body generated.ChangeMemberRoleJSONRequestBody) (*generated.Membership, error) {
+	var out generated.Membership
+	err := call(c, "changeMemberRole", func() (*http.Response, error) {
+		return c.transport.ChangeMemberRole(ctx, accountId, userId, body)
+	}, &out)
+	return &out, err
+}
+
+// RemoveMember deletes one membership. Corresponds to
+// `DELETE /v1/accounts/{account_id}/members/{user_id}`.
+//
+// **It also stops the credentials that membership justified**, on the removed
+// user's next request, and a re-invitation does not bring them back. An OIDC
+// access token is the exception: a JWT is verifiable until its `exp`, so one this
+// user obtained through a product keeps working for what is left of its lifetime
+// and nothing here revokes it.
+//
+// A 204, so this returns no body. A 422 is `last_owner`; a 403 is an admin
+// reaching for an owner's membership.
+func (c *Client) RemoveMember(ctx context.Context, accountId, userId openapiTypes.UUID) error {
+	return callVoid(ctx, c, "removeMember", func() (*http.Response, error) {
+		return c.transport.RemoveMember(ctx, accountId, userId)
+	})
+}
+
+// AcceptInvitation redeems an invitation token. Corresponds to
+// `POST /v1/invitations/accept`.
+//
+// **The caller must already hold a session**, and this client does not mint one:
+// the membership belongs to the caller, so an anonymous redemption would create a
+// membership for nobody, and the route answers 401 rather than signing anybody in.
+// Sign in, then redeem.
+//
+// The token is a credential for as long as it is live. The generated
+// `AcceptInvitationRequest` has no redacting `String()`, so a caller printing
+// `body` whole prints a value that is dead the moment this returns — and a 410
+// means it is already dead, where asking for a new invitation is the only next
+// step. A 404 is one answer for every token that is not live, and a caller must
+// not attempt to tell a wrong one from an expired one.
+func (c *Client) AcceptInvitation(ctx context.Context, body generated.AcceptInvitationJSONRequestBody) (*generated.Membership, error) {
+	var out generated.Membership
+	err := call(c, "acceptInvitation", func() (*http.Response, error) {
+		return c.transport.AcceptInvitation(ctx, body)
 	}, &out)
 	return &out, err
 }

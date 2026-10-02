@@ -19,7 +19,7 @@ and its entry here is deleted; the number is never reused.**
 
 | # | Question | Call made |
 | --- | --- | --- |
-| [D1](#d1-twelve-served-operations-are-in-no-document) | twelve served operations are in no document — document them, or rule them out of the contract? | not decided: the tripwire ships holding all twelve in a pinned list, and the question is escalated here |
+| [D1](#d1-twelve-served-operations-are-in-no-document) | twelve served operations are in no document — document them, or rule them out of the contract? | **RULED by `identity-28`: they are contract surface.** All twelve documented; `knownDrift` empty and pinned at empty — see [the ruling](#d1-ruled-2026-10-02-by-packet-identity-28-option-1-and-here-is-why) |
 | [D2](#d2-the-privilege-boundary-of-the-admin-surface) | what exactly may an account admin do that a member may not? | RULED: one sentence, and the code says exactly it. Three operations, two scopes, one table |
 | [D3](#d3-where-the-audit-record-lives-and-why-nothing-can-edit-it) | where does the admin audit record live, and how is it made un-editable? | RULED: `account_audit_log`, append-only in the DATABASE, no foreign key to `accounts` |
 | [D4](#d4-the-admin-surface-is-token-only) | may a browser session reach the admin surface? | RULED: no. Token-only, and the refusal is asserted per route |
@@ -29,6 +29,8 @@ and its entry here is deleted; the number is never reused.**
 | [D9](#d9-registration-publishes-that-an-address-is-taken-and-that-is-the-last-one) | `POST /v1/users` answers `409` for a taken address, so an unauthenticated caller can discover whether anybody has an account here. Is that disclosure accepted, or does registration change shape? | RULED for now: it is accepted, and it is named. Closing it is a decision about products, not about identity |
 
 ## D1: twelve served operations are in no document
+
+> **RULED 2026-10-02 — [option 1, below](#d1-ruled-2026-10-02-by-packet-identity-28-option-1-and-here-is-why).** Everything in this section is the finding and the two calls as `identity-09` left them; the ruling is the section after it, and the twelve are now documented.
 
 **Raised** 2026-09-30 by packet `identity-09`, which added the document-versus-
 router tripwire (`internal/httpapi/openapi_drift_test.go`) and found this on its
@@ -149,6 +151,137 @@ The general lesson, and the reason it is in DECISIONS.md rather than only in a
 test comment: **a struct literal used to configure a check is a completeness
 obligation, and nothing about it looks like one.** A conditional route makes the
 omission silent and the suite green.
+
+## D1 RULED, 2026-10-02, by packet `identity-28`: option 1, and here is why
+
+**The ruling.** All twelve are contract surface. The ten tenancy operations are
+written into `openapi/v1.yaml` under a new `tenancy` tag with request and
+response schemas, operationIds and the full status table; the two OIDC `POST`s
+are written into `openid/openid.yaml` beside the `GET` they duplicate.
+`info.version` is **1.7.0**. `knownDrift` is **empty**, and pinned at empty.
+
+### Why option 1, stated as the argument rather than as the preference
+
+The alternative was not "document them or leave them broken forever" — it was
+"rule them out of the contract, in writing". That would have produced a document
+that describes a service that does not exist, and it would have been defensible
+prose. Three facts make it wrong here.
+
+1. **The strongest evidence for option 1 was already in the document.** The
+   `bearerToken` scheme's required-scopes table has named `getAccount`,
+   `listMembers`, `renameAccount`, `inviteMember`, `changeMemberRole`,
+   `removeMember`, `deleteAccount`, `listAccounts`, `createAccount` and
+   `acceptInvitation` since 1.4.0 — the operationIds, by name — because seven of
+   those routes enforce a scope and a scope that gates a route no document
+   declares is a promise with nothing behind it. So this repository was already
+   committed to these being client operations; it had not noticed that it had.
+   The ten names in the table are now the method names on every generated client,
+   and the table and the document agree for the first time.
+
+2. **The customer-facing cost was measured, not estimated.** `cafaye-ts` is the
+   TypeScript client `parlor` itself calls and the one a customer writes against.
+   Its generated identity methods were `createClient`, `createSession`,
+   `deleteSession`, `getCurrentUser`, `getEmailVerificationStatus`, `getMfaStatus`,
+   `getOidcClient`, `introspectApiKey`, `listAccountAuditLog`, `listApiKeys`,
+   `listOidcClients`. **No `createAccount`. No `inviteMember`. No
+   `acceptInvitation`.** A customer could list an account's API keys and OIDC
+   clients and had no way to make the account. We are selling hosted identity to
+   a customer who cannot onboard a tenant through the client we ship, and that is
+   not a documentation debt — it is the product's first call failing.
+
+3. **The "not client operations" ruling could not have covered the OIDC pair at
+   all**, and could not have covered the account detail honestly. `GET
+   /v1/accounts/{account_id}` and `GET /v1/accounts/{account_id}/members` are
+   member-and-role reads on a product's own tenant: the two operations a settings
+   page cannot be built without. Only the **three collection operations** are
+   genuinely session-shaped, and they are not excluded — they are documented with
+   `security: [sessionCookie]` and a 403 on a token, which is the accurate
+   statement and is strictly better than a sentence in a header saying "these are
+   never client operations".
+
+### What it cost, honestly
+
+- **A large contract change in one commit**, reviewed as contract rather than as
+  bookkeeping. That was the cost `identity-09` named, and it is real: about
+  900 lines of `openapi/v1.yaml` and the whole of the Go client regenerated on
+  top of it.
+- **One response shape changed**, on the two member-list operations. See below;
+  it is a behaviour change and it is stated in the document's own version history
+  rather than only here.
+- **`knownDrift`'s "cannot be emptied" clause had to be rewritten**, because the
+  clause was written against a list of *known bugs* where deleting an entry could
+  have meant deleting the memory of a gap. That is no longer the shape: the list's
+  own comment now records all twelve and the commit that closed them, so the
+  memory survives the removal. `TestKnownDriftIsEmptyBecauseEveryServedOperationIsDocumented`
+  pins it at zero and its failure message is the whole of the argument for why a
+  future entry is not the answer.
+
+### The defect this packet found by having to document the response
+
+`membershipResponses` in `internal/httpapi/accounts.go` projected only `Role`,
+because `accounts.MemberSummary` is shaped for `ListMine` ("which accounts does
+this user belong to") and carries the ACCOUNT and the role and no user.
+`Members` reuses the same struct for the other direction, and the wire carried:
+
+```json
+[{"account_id":"","user_id":"","role":"admin","created_at":"0001-01-01T00:00:00Z"}]
+```
+
+**A member list whose entries cannot be told apart, on the two operations whose
+whole purpose is to be acted on by `user_id`.** `PATCH` and `DELETE
+/v1/accounts/{account_id}/members/{user_id}` both need a user id the response did
+not carry, so nothing in the service could have rendered or removed a member.
+
+Two honest readings, and the packet took the first:
+
+- **The alternative was to leave those two operations in `knownDrift`** with a
+  reason naming this blocker. That is the escape the brief allows and it would
+  have been defensible.
+- **The other was to fix the projection** — four fields on `MemberSummary`, two
+  on the select list, four lines in the projection — and document the shape that
+  results. It was chosen because a documented operation whose response cannot
+  identify its own subject is a contract that lies green, which is the most
+  expensive kind of wrong in a document; and because **no client can be reading
+  the old shape**, since these operations were in no document at all, so there is
+  no migration and no consumer with a switch on it.
+
+`TestEveryMemberInAMemberListIdentifiesItself` holds the result, on both routes,
+by asserting that every entry names a user, names the account, and carries a
+non-zero `created_at`.
+
+### What is still true, and what this ruling does NOT cover
+
+- **The neighbouring event gap is untouched and still real.** identity emits five
+  events no manifest declares: `identity.account.created`, `identity.member.
+  invited`, `identity.member.accepted`, `identity.member.role_changed`,
+  `identity.member.removed`. This packet **re-verified the blocker against core at
+  `5ec0cec` and it still holds**: core's `schemas/events/identity/` has `api_key`,
+  `mfa`, `oidc_client`, `session` and `user` and **no `account/` and no
+  `member/`**, and `identity.member.accepted` has no catalog row at all under that
+  name (core calls the fact `identity.member.joined`). Declaring the five today
+  would trade a silent gap for five `event.payload-schema-missing` reds and one
+  `event.unknown-published`. So they stay undeclared, pinned with a reason in
+  `internal/platform/ci/event_grammar_test.go`. **What core needs, if it takes
+  this: five files at `schemas/events/identity/account/created.schema.json` and
+  `schemas/events/identity/member/{invited,accepted,role_changed,removed}.schema.json`,
+  plus a catalog row for `identity.member.accepted` or a recorded ruling that
+  `accepted` and `joined` are the same fact.** That is core's packet, not this one.
+- **A second defect was found while verifying and is NOT fixed by this packet.** See
+  the CHANGELOG entry and the report: **a revoked invitation still redeems.**
+  `Store.InvitationByToken` has no `revoked_at` filter and
+  `Store.MarkInvitationAccepted`'s conditional UPDATE requires only
+  `accepted_at IS NULL`, so `POST /v1/invitations/accept` creates a membership
+  from a token an admin explicitly withdrew — and leaves a row with both
+  `accepted_at` and `revoked_at` set, which `migrations/00013`'s own header says
+  cannot happen. `TestTheRevokedInvitationIsActuallyDead` passes while this is
+  true because it posts the redemption **with no credential** and reads the 401 as
+  the refusal. That is a security finding on the admin surface and it belongs to
+  its own packet; it is recorded here so it is not lost, and nothing in this
+  packet's document change depends on it.
+- **`D9`'s 409 on `POST /v1/users` is still open** and untouched. This packet
+  documents the tenancy surface and says nothing about registration.
+- **core's D25** — may a service document `/healthz` and `/readyz`? — is still
+  core's. identity documents both and this ruling does not touch that.
 
 ## D2: the privilege boundary of the admin surface
 
