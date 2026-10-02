@@ -1,0 +1,368 @@
+# tenancy.yml — what identity declares about its own account boundary.
+#
+# Checked by cafaye/core's contract harness:
+#
+#     /Users/kaka/Code/any/moon/cafaye/core/harness/bin/tenancy-check .
+#
+# It REPLACES `tenancy.probe.yml`, which was the pilot's measurement rather than a
+# declaration: core's scanner could not see `cafaye.protect_table`, so a file
+# describing what this migration really writes was reported as "the migrations
+# create no policy at all". That is fixed in core (577b3f3), the probe is deleted
+# in the same commit as this file, and nothing about the database changed to make
+# it fit — `pg_class.relforcerowsecurity` and `internal/tenancy` already agreed it
+# was protected.
+#
+# THE `rls` BLOCK IS THE SUBSTRATE'S, NOT OURS. `migrations/00016_account_isolation.sql`
+# is kit's `templates/database/tenancy/substrate.sql` copied verbatim, so this
+# block records five `select cafaye.protect_table(...)` calls and what the template
+# writes for each. It does not claim any policy, any predicate or any `force` bit
+# that this repository wrote: every one of the twenty policies is generated, and
+# the four `constrained` lines below are the five CALLS, which is the only place
+# the template's shape is written down in this tree.
+version: 1
+service: identity
+
+# This service holds other people's accounts and reads and writes their rows. The
+# table below is the audit log of a security boundary, so `false` here would be a
+# lie rather than a declaration.
+accountScoped: true
+
+scope:
+  # The column every account-scoped statement in this service scopes by. Spelled
+  # `account_id` and not `tenant_id` because that is what the migrations call it,
+  # and the schema is explicit that the checker searches for what the service uses
+  # rather than guessing between the fleet's three vocabularies.
+  key: account_id
+  # FILES, NOT DIRECTORIES, and the reason is a completeness obligation rather than
+  # tidiness. These are the three production stores whose SQL reaches one of the
+  # five protected tables; a directory would drag in `_test.go` fixtures, whose
+  # `dbtest.Schema` clones have an `account_id` column and no policies and are not
+  # entry points into anything.
+  #
+  # TWO OF THE THREE CONTRIBUTE NO ATTRIBUTED SITE, and naming them anyway is the
+  # point. The scanner reads `internal/apikeys/store.go` and `internal/oidc/store.go`
+  # in full and attributes no account-scoped statement in either, because their
+  # credential lookups are addressed by an unguessable secret rather than by an
+  # account — `api_keys` by `token_digest`, `oidc_clients` by `client_id` — and
+  # because the statements that DO carry `where account_id` put the verb and the
+  # predicate more than four lines apart (all six are listed and classified above
+  # `entryPoints`). The credential half is a measured production limitation rather
+  # than a gap in this list: it is pinned by
+  # `internal/tenancy/credential_lookup_test.go` and written up in
+  # `moon/logs/REPORT-identity-isolation-02.md` §3. Naming the two files is what
+  # makes it checkable — the day somebody adds `and account_id = $2` to either
+  # lookup, or rewrites one of those six as a single line, this checker goes red
+  # naming the statement, which is the moment the fix lands and nobody has to
+  # remember to come back here.
+  #
+  # WHAT IS DELIBERATELY NOT HERE, named so it cannot be mistaken for an
+  # oversight: `internal/accounts/store.go`, which holds this service's other five
+  # account-scoped statements (lines 286, 356, 386, 593, 625). See the comment
+  # above `entryPoints` for why they are absent rather than declared, which is a
+  # finding for core rather than a line in this file.
+  sources:
+    - internal/admin/store.go
+    - internal/apikeys/store.go
+    - internal/oidc/store.go
+
+rls:
+  # True, and it is the reason this file exists rather than saying `false` and
+  # listing nothing: migration 00016 makes Postgres refuse a cross-account read.
+  # A service whose database enforces nothing has to be able to SAY that, and this
+  # service cannot.
+  databaseEnforced: true
+  # The template's own function, and not `app.current_account()`: `protect_table`
+  # writes every predicate as `account_id = (select cafaye.current_account_id())`,
+  # so naming anything else here would make `tenancy.rls-permissive` correct.
+  #
+  # It is the WRAPPED spelling that matters, and this field cannot express the
+  # wrapper because the schema's pattern requires the bare name ending in `()`. The
+  # wrap is `(select …)`, and it is why the substrate's policies are evaluated once
+  # per statement rather than once per row.
+  identity: cafaye.current_account_id()
+  # The DDL tree, and separate from `scope.sources` above because the two checks
+  # read different things: this one reads `create policy` and
+  # `alter table … row level security`, the other reads statements.
+  sources:
+    - migrations
+  # All five, each with all four policies, and the number is the arithmetic of the
+  # template: `protect_table` writes one policy per command and refuses to write
+  # `for all`, so a declaration naming three of the four gets
+  # `tenancy.rls-undeclared` on the fourth. Permissive policies are OR-ed together,
+  # so the one nobody declared can widen the three that were.
+  #
+  # `roles` is the honest half of a shape the migration text cannot state. The
+  # template writes `to %I, %I` bound to `current_user` and
+  # `coalesce(p_login_role, current_user || '_app')`, so the two principals are
+  # decided by the session that ran the migration rather than written in the file:
+  # `identity` owns every table here and `identity_app` is the role kit's cluster
+  # provisions for it (`KIT_POSTGRES_DATABASES: identity`). Neither is `PUBLIC`,
+  # which is what the template never leaves off, and neither carries BYPASSRLS —
+  # a policy bound to a bypassing role is enforced on no read at all, and the
+  # checker reads these names for exactly that.
+  tables:
+    - table: account_users
+      forced: true
+      policies:
+        - name: account_users_cafaye_select
+          command: select
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 508
+        - name: account_users_cafaye_insert
+          command: insert
+          clause: with check
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 508
+        - name: account_users_cafaye_update
+          command: update
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 508
+        - name: account_users_cafaye_delete
+          command: delete
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 508
+    - table: account_invitations
+      forced: true
+      policies:
+        - name: account_invitations_cafaye_select
+          command: select
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 512
+        - name: account_invitations_cafaye_insert
+          command: insert
+          clause: with check
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 512
+        - name: account_invitations_cafaye_update
+          command: update
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 512
+        - name: account_invitations_cafaye_delete
+          command: delete
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 512
+    - table: api_keys
+      forced: true
+      policies:
+        - name: api_keys_cafaye_select
+          command: select
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 516
+        - name: api_keys_cafaye_insert
+          command: insert
+          clause: with check
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 516
+        - name: api_keys_cafaye_update
+          command: update
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 516
+        - name: api_keys_cafaye_delete
+          command: delete
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 516
+    - table: oidc_clients
+      forced: true
+      policies:
+        - name: oidc_clients_cafaye_select
+          command: select
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 520
+        - name: oidc_clients_cafaye_insert
+          command: insert
+          clause: with check
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 520
+        - name: oidc_clients_cafaye_update
+          command: update
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 520
+        - name: oidc_clients_cafaye_delete
+          command: delete
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 520
+    - table: account_audit_log
+      forced: true
+      policies:
+        - name: account_audit_log_cafaye_select
+          command: select
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 524
+        - name: account_audit_log_cafaye_insert
+          command: insert
+          clause: with check
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 524
+        - name: account_audit_log_cafaye_update
+          command: update
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 524
+        - name: account_audit_log_cafaye_delete
+          command: delete
+          clause: using
+          roles: [identity, identity_app]
+          constrained:
+            file: migrations/00016_account_isolation.sql
+            line: 524
+
+# `tenancy.enumeration-partial` NAMES ELEVEN SITES IN `scope.sources` THAT IT
+# COULD NOT ATTRIBUTE, and the finding says the author must read them and confirm
+# each one is declared. Done, and they are two classes:
+#
+# FIVE ARE NOT STATEMENTS. `internal/admin/store.go:27` and
+# `internal/oidc/store.go:92` are the `auditColumns` and `clientColumns` select-list
+# constants, and `internal/admin/store.go:67`, `internal/apikeys/store.go:140` and
+# `internal/oidc/store.go:99` are the column lists of the three `insert into`
+# statements. A column list carrying the word `account_id` is not an account-scoped
+# read, and an `insert` is absent from `entryPoints[].operation` by the schema's own
+# rule: it creates a row rather than reaching an existing one.
+#
+# SIX ARE REAL ACCOUNT-SCOPED STATEMENTS THE SCANNER COULD NOT REACH, and they are
+# listed here because that is a measured limit of the checker rather than a
+# property of this service:
+#
+#   internal/apikeys/store.go:222  the credential lookup's `join account_users`
+#   internal/apikeys/store.go:287  select  api_keys      where account_id = $1
+#   internal/apikeys/store.go:329  update  api_keys      where id = $1 and account_id = $2
+#   internal/apikeys/store.go:404  update  api_keys      where account_id = $1 and user_id = $2
+#   internal/oidc/store.go:159     select  oidc_clients  where account_id = $1
+#   internal/oidc/store.go:234     update  oidc_clients  where id = $1 and account_id = $2
+#
+# All six DO carry their own `where account_id`, and none is attributed because Go
+# raw-string SQL puts the verb and the predicate three to eight lines apart while
+# core's `ATTRIBUTION_WINDOW` is 4. The two that share the format with
+# `internal/admin/store.go` (where the statement is one long line) are found; the
+# four that do not are not. That is a finding for core — the window should follow
+# the statement, not the line — and it is in
+# `moon/logs/REPORT-identity-isolation-03.md` §4. Until it is fixed the six live
+# here, named, rather than in a green the checker cannot see them inside.
+#
+# And the reason none of the six is DECLARED is the same reason the five in
+# `internal/accounts/store.go` are not: see below.
+#
+# THE DECLARED ENUMERATION, AND IT IS ONE ENTRY POINT, WHICH IS NOT THE SAME AS ONE
+# BEING ENOUGH. `internal/tenancy/tenancy_test.go` proves the three-way denial on
+# REAL ROWS for `account_audit_log` only, and that is the single entry point below.
+# The reason is a property of the table rather than a choice: 00012 gives
+# `account_audit_log` no foreign keys, so its fixture needs no users and no
+# accounts and cannot collide with another package's rows in a shared database.
+#
+# WHAT IS NOT DECLARED, and it is named rather than left for a reader to infer:
+#
+#   internal/accounts/store.go:286  select  account_users       (account_id = $1)
+#   internal/accounts/store.go:356  select  account_users       (account_id = $1)
+#   internal/accounts/store.go:386  delete  account_users       (account_id = $1)
+#   internal/accounts/store.go:593  update  account_invitations (account_id = $2)
+#   internal/accounts/store.go:625  update  account_invitations (account_id = $1)
+#
+# All five ARE account-scoped and all five DO carry their own `where account_id`,
+# which is the half of the boundary this service had before 00016. They are absent
+# because `negative.cases` requires three arms naming three assertion lines in a
+# test, and this repository has no row-level denial fixture for `account_users` or
+# `account_invitations` — seeding either means writing `users` and `accounts` rows
+# that other packages' tests also write, and `tenancy_test.go`'s own header says
+# why that was declined. Declaring them with the arms pointing at the
+# `account_audit_log` proof would make the checker green and the declaration
+# false, so they are declared nowhere and written down here instead. The two ways
+# out are somebody's: core grows a way for an entry point to name a TABLE's denial
+# proof and inherit it, or identity seeds four more tables. Both are in
+# `moon/logs/REPORT-identity-isolation-03.md` §4 and in
+# `HANDOFF-identity-isolation.md` §4.
+#
+# AND THE THREE SECRET-ADDRESSED LOOKUPS CANNOT BE DECLARED AT ALL, which is worth
+# stating because it is the format meeting a real fact: `api_keys` by
+# `token_digest`, `account_invitations` by `token_digest` and `oidc_clients` by
+# `client_id` are reached with no account predicate, and `operation: call` still
+# requires `enforced.line` to carry the tenancy key. Their measurement is
+# `internal/tenancy/credential_lookup_test.go`, which is green while pinning that a
+# request with no identity reads zero of them.
+entryPoints:
+  - id: admin-audit-log-list
+    operation: select
+    subject: account_audit_log
+    enforced:
+      # The predicate, and the index it uses: this statement is account-scoped in
+      # Go as well as by the policy, and 00016's `protect_table` requires a leading
+      # `account_id` index precisely so the filter is not a sequential scan behind
+      # a primary-key lookup.
+      mechanism: query-filter
+      file: internal/admin/store.go
+      line: 127
+    negative:
+      asserts: absent
+      cases:
+        # ARM ONE, no identity — the state a request that never authenticated is
+        # in. Go has no `nil` for a row count, so the token is the helper whose
+        # return is being compared against 0.
+        - id: no-identity
+          asserts: absent
+          expects: countAuditRows
+          file: internal/tenancy/tenancy_test.go
+          line: 324
+        # ARM TWO, another account's VALID identity. The arm with the information
+        # in it: the credential is real and belongs to somebody else, and the
+        # result has to be indistinguishable from an account that does not exist.
+        - id: other-account
+          asserts: absent
+          expects: countAuditRowsIn
+          file: internal/tenancy/tenancy_test.go
+          line: 339
+        # ARM THREE, its own rows. The positive control, and the only arm a table
+        # that denies everybody cannot pass.
+        - id: own-account
+          asserts: present
+          expects: countAuditRowsIn
+          file: internal/tenancy/tenancy_test.go
+          line: 349
