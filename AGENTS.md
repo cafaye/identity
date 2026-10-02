@@ -52,6 +52,14 @@ gate.yml               WHAT THIS GATE IS WORTH, declared: the entrypoint, the pr
 docker-compose.yml     an OVERRIDE on kit's stack: our service, our database, our
                        crash layer. No collector config, no postgres container of
                        our own, and no `depends_on: otel-collector`.
+                       `KIT_POSTGRES_DATABASES: identity` is the WHOLE of what
+                       we say about postgres — one name, which becomes one
+                       NOSUPERUSER role and one database it owns. We do not set
+                       POSTGRES_USER/PASSWORD/DB: that is the cluster admin
+                       role, overriding it makes the AUTH service a cluster
+                       superuser, and kit's own fleet_check.py recommends
+                       exactly that override, which is why the reasoning is
+                       written down at the top of the file.
 ```
 
 `client/` is deliberately NOT under `internal/`, and that is the only reason it is
@@ -532,8 +540,28 @@ has reported something false.
 ```sh
 docker compose up -d --wait postgres
 goose -dir migrations postgres "$DATABASE_URL" up
-TEST_DATABASE_URL="postgres://identity:identity@localhost:5432/identity?sslmode=disable" go test ./...
+TEST_DATABASE_URL="postgres://identity:cafaye@localhost:5432/identity?sslmode=disable" go test ./...
 ```
+
+**The password in that DSN is the CLUSTER's, and it changed in packet
+identity-27.** `docker-compose.yml` no longer sets `POSTGRES_PASSWORD`, so the
+role that `KIT_POSTGRES_DATABASES: identity` provisions takes kit's
+`KIT_POSTGRES_PASSWORD`, default `cafaye`. The old `identity:identity` DSN now
+fails authentication against the shared cluster while continuing to work verbatim
+in CI — which is the worst possible split, because a developer who copies a DSN
+out of `.github/workflows/ci.yml` gets a failure that names a password rather than
+the architecture change. Take the local DSN from the `identity` service's own
+`DATABASE_URL` in `docker-compose.yml`: it is written down in exactly one place,
+and it interpolates `${KIT_POSTGRES_PASSWORD:-cafaye}` so it follows an
+overridden cluster password instead of drifting from it.
+
+`docker compose up` also needs `kit.ref` to name a kit commit that has
+`templates/compose/postgres/`. Before packet identity-27 it did not: the pinned
+stack shipped a plain `postgres:17-alpine` with no init script and no
+`KIT_POSTGRES_DATABASES`, so the database and role in that DSN were an accident
+of the image's defaults rather than a declaration anybody had made — and
+`POSTGRES_USER: identity`, which did the accidental declaring, turned identity's
+credentials into that cluster's superuser.
 
 `goose up` is a deploy step and is above the suite, never in the same command: a
 suite run against an unmigrated database fails with

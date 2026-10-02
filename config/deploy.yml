@@ -221,6 +221,22 @@ builder:
     options: mode=max,image-manifest=true,oci-mediatypes=true
 
 accessories:
+  # THIS ACCESSORY STAYS, deliberately, and the reason is that the shared cluster
+  # is a DEVELOPMENT topology.
+  #
+  # Locally, `docker-compose.yml` declares `KIT_POSTGRES_DATABASES: identity` and
+  # reaches one cluster that kit owns, where the DATABASE is the isolation
+  # boundary. Here, identity is the only service on its host and the host is the
+  # boundary, so a single-tenant accessory is the honest arrangement: there is
+  # nothing for a per-service role to be isolated FROM. A deployer who runs the
+  # whole fleet onto one host is the case that would need the shared cluster in
+  # production too, and that is a topology decision for whoever owns the hosts,
+  # not a change to make silently in a deploy file.
+  #
+  # What this block must NOT acquire is a `POSTGRES_USER` override, for the
+  # reason written at length in `docker-compose.yml`: that variable is the
+  # cluster's superuser. Naming it after this service makes the auth service a
+  # superuser of whatever host it lands on. It is absent, deliberately.
   postgres:
     image: postgres:17-alpine
     host: <%= web_host %>
@@ -235,6 +251,14 @@ accessories:
     # arrangement and they do not travel. Adding `POSTGRES_DB: identity` here
     # would be a second decision about a deployed database's name, taken in a
     # config file whose subject is containers; leave it to the DSN.
+    #
+    # The NAMES still agree; the CREDENTIALS do not. Since packet identity-27 the
+    # local role also takes the cluster's development password rather than
+    # `identity`, so a DSN copied from `docker-compose.yml` into `.kamal/secrets`
+    # fails authentication here. That is the correct outcome — production
+    # credentials come from the deployment secret store and are distinct per
+    # environment — but it fails as "password authentication failed", which names
+    # the symptom rather than the cause, so it is recorded here.
     env:
       secret:
         - POSTGRES_PASSWORD
