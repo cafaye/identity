@@ -61,16 +61,21 @@
 
 -- +goose Up
 -- +goose StatementBegin
+-- The body below is VERBATIM from kit's templates/database/tenancy/substrate.sql at
+-- kit commit efa49e5, from `create or replace function` through its closing `$caf$;`
+-- with nothing inserted between -- not even a comment, because a comment inside the
+-- body is a byte difference and `internal/platform/ci/substrate_copy_test.go`
+-- compares the two byte for byte. Kit's comment above that function is the argument
+-- for it and is not duplicated here on purpose: one argument in one file is a fact,
+-- and a second copy of it in this repository is the thing this migration exists to
+-- stop.
 create or replace function cafaye.credential_tables()
 returns table (table_schema text, table_name text, digest_column text)
 language sql
 stable
 as $caf$
-  -- Verbatim from kit's templates/database/tenancy/substrate.sql at kit commit
-  -- efa49e5. The comment above it in that file is the argument for it and is not
-  -- duplicated here on purpose: one argument in one file is a fact, and a second
-  -- copy of it in this repository is the thing this migration exists to stop.
-  -- `internal/platform/ci/substrate_copy_test.go` is what holds the two in step.
+  -- (1) The digest function, by OID. `pronargs = 0` is part of the identity and
+  --     not decoration — see cost 3 above.
   with digest_fn as (
     select fn.oid
       from pg_proc fn
@@ -79,6 +84,11 @@ as $caf$
        and fn.proname = 'current_credential_digest'
        and fn.pronargs = 0
   ),
+
+  -- (2) The policies in the substrate's own naming that call it, with the columns
+  --     of THEIR OWN table that the call sits beside. `cd.refobjid = pol.polrelid`
+  --     is what keeps a qualifier that reads another table's column out: the
+  --     audit is about what THIS table resolves by.
   resolve as (
     select pol.oid as policy_oid,
            pol.polrelid,
@@ -103,6 +113,11 @@ as $caf$
      where pol.polname like '%!_cafaye!_resolve' escape '!'
        and pol.polcmd = 'r'
   )
+
+  -- (3) One row per policy. The column is reported only when the qualifier names
+  --     exactly one of the table's own columns, and `'(unresolved)'` otherwise —
+  --     cost 4 above. `min()` is never the answer; it is what a single-column
+  --     qualifier reduces to.
   select n.nspname::text,
          c.relname::text,
          case when g.columns_named = 1 then g.column_name
