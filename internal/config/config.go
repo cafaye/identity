@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cafaye/identity/internal/oauth"
 	"github.com/cafaye/identity/internal/oidc"
 	"github.com/cafaye/identity/internal/recovery"
 )
@@ -75,6 +76,19 @@ var (
 	// password reset or an address confirmation, and it would find out from a user
 	// who never got one, in front of somebody waiting on a link.
 	ErrInvalidCourier = errors.New("invalid courier configuration")
+
+	// ErrInvalidOAuth means the social-login block is present and incomplete: a
+	// provider with a client id and no secret, or a deployment that configured a
+	// redirect base without an encryption key. The startup-failure rule is the
+	// courier one — a half-configured OAuth provider produces callbacks that fail
+	// at the provider, in front of a user who was told the button would work,
+	// rather than at boot where an operator could see it.
+	//
+	// The rules themselves belong to oauth.Settings.Validate and are not
+	// restated here; a second copy is a second thing to forget to update. Every
+	// message this produces names a variable, because Validate's do and the
+	// alternative sends an operator looking through six variables instead of one.
+	ErrInvalidOAuth = errors.New("invalid OAuth configuration")
 
 	// ErrNoCourierToken means COURIER_TOKEN is not set at all, which is a
 	// SUPPORTED state: a deployment with no mail path. It is a distinct sentinel
@@ -184,7 +198,43 @@ type Config struct {
 	// deployment fix — and `buildMailer` says so in a warning rather than leaving an
 	// operator to discover it from a user.
 	DefaultLinkTemplate string
+
+	// OAuth is the social-login block, read as one `oauth.Settings` rather than as
+	// six fields.
+	//
+	// IT IS A VALUE AND NOT SIX STRINGS because the rules about which combinations
+	// make sense belong to the package that consumes them: "a provider needs a base
+	// URL and a token key", "half a provider's credentials is a mistake and never an
+	// intention" and "an absent provider is a supported state" are all
+	// oauth.Settings.Validate, and re-expressing them here would be a second
+	// implementation to keep in step with the first. This package reads the
+	// environment into the struct and calls Validate.
+	//
+	// The dependency runs one way: internal/oauth does not import internal/config.
+	OAuth oauth.Settings
 }
+
+// The social-login environment variables, named in one place.
+//
+// They are a const block rather than scattered string literals because the failure
+// message for a half-configured provider has to name the variable the operator has
+// to set, and a literal repeated in two places is a literal that gets one of them
+// wrong. Every one of them is OPTIONAL: absent is a deployment that has not turned
+// social login on, which is the state this service ships in.
+const (
+	// OAuthRedirectBaseURLVar is this service's public base URL. Callback URLs are
+	// built from it and from nothing else — never from a Host header.
+	OAuthRedirectBaseURLVar = "OAUTH_REDIRECT_BASE_URL"
+	// OAuthEncryptionKeyVar is standard base64 of 32 raw bytes, which is what
+	// `head -c 32 /dev/urandom | base64` prints.
+	OAuthEncryptionKeyVar = "OAUTH_ENCRYPTION_KEY"
+	// OAuthGoogleClientIDVar and OAuthGoogleClientSecretVar are the Google pair.
+	OAuthGoogleClientIDVar     = "OAUTH_GOOGLE_CLIENT_ID"
+	OAuthGoogleClientSecretVar = "OAUTH_GOOGLE_CLIENT_SECRET"
+	// OAuthGitHubClientIDVar and OAuthGitHubClientSecretVar are the GitHub pair.
+	OAuthGitHubClientIDVar     = "OAUTH_GITHUB_CLIENT_ID"
+	OAuthGitHubClientSecretVar = "OAUTH_GITHUB_CLIENT_SECRET"
+)
 
 // MFAEncryptionKey returns the configured key, or ErrNoMFAEncryptionKey.
 //
@@ -383,11 +433,65 @@ func Load(lookup Lookup) (Config, error) {
 		return Config{}, err
 	}
 
+	if err := cfg.loadOAuth(lookup); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
 }
 
-// loadMFA reads the MFA block.
+// OAuthEnabled reports whether the social-login routes should be mounted.
 //
+// It asks the Settings rather than re-deriving "is there a provider", for the reason
+// the whole OAuth field is a value and not six strings: the answer to "is this
+// deployment offering social sign-in" belongs to the package that knows what a
+// provider is. A Config built as a literal with a half-configured provider still
+// answers false here, and `Load` — which validates — is what keeps that from being a
+// state a real process can reach.
+func (c Config) OAuthEnabled() bool { return c.OAuth.Enabled() }
+
+// loadOAuth reads the social-login block.
+//
+// FIVE VARIABLES AND TWO PROVIDERS, and the rules are oauth.Settings.Validate's
+// rather than this function's:
+//
+//   - a provider with one half of its credentials is a STARTUP FAILURE, not a
+//     disabled provider. A "Continue with Google" button that 404s because a secret
+//     went missing is a support call that should have been a failed deploy.
+//   - a provider with both halves needs a redirect base URL and a token encryption
+//     key, because a callback with nowhere to arrive and a token with nowhere to be
+//     sealed are both useless rather than degraded.
+//   - a key that does not decode is a startup failure EVEN WHEN NO PROVIDER IS
+//     CONFIGURED, and this is the one rule that reads as harsh. It is the same rule
+//     MFA_ENCRYPTION_KEY follows (loadMFA), for the same reason: a deployment whose
+//     key is wrong should find out at boot rather than at the first social sign-in,
+//     in front of a person who cannot sign in.
+//   - NO BLOCK AT ALL is a supported state. This is the one optional surface whose
+//     absence is a decision rather than a gap, and refusing to boot without it would
+//     mean this service could not be deployed password-only.
+func (c *Config) loadOAuth(lookup Lookup) error {
+	c.OAuth = oauth.Settings{
+		RedirectBaseURL: lookupValue(lookup, OAuthRedirectBaseURLVar),
+		EncryptionKey:   lookupValue(lookup, OAuthEncryptionKeyVar),
+		Google: oauth.ProviderSettings{
+			ClientID:     lookupValue(lookup, OAuthGoogleClientIDVar),
+			ClientSecret: lookupValue(lookup, OAuthGoogleClientSecretVar),
+		},
+		GitHub: oauth.ProviderSettings{
+			ClientID:     lookupValue(lookup, OAuthGitHubClientIDVar),
+			ClientSecret: lookupValue(lookup, OAuthGitHubClientSecretVar),
+		},
+	}
+
+	if err := c.OAuth.Validate(); err != nil {
+		// Every message this produces names a variable, because Validate's do and
+		// the alternative — "invalid oauth settings" — sends an operator looking
+		// through six variables instead of at one.
+		return fmt.Errorf("%w: %v", ErrInvalidOAuth, err)
+	}
+	return nil
+}
+
 // The asymmetry with the OIDC block above is deliberate and is the whole of this
 // function: OIDC's three variables are all-or-nothing because a provider with an
 // issuer and no key is a broken provider, whereas MFA's single variable has a

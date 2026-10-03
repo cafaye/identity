@@ -186,6 +186,13 @@ func (o options) registerRoutes(r chiRouter) {
 	// key, and it is the last thing in this registrar because it is the only one
 	// whose routes are reachable with no credential at all.
 	o.registerRecoveryRoutes(r)
+
+	// And the social-login surface, which is also reachable with no credential and
+	// for the same reason: a browser arrives at the callback holding nothing but
+	// the state cookie this service set. It is absent unless a provider is
+	// configured, which is a NORMAL state here rather than a broken one — this is
+	// the one surface a deployment can leave off on purpose.
+	o.registerSocialRoutes(r)
 }
 
 // chiRouter is the slice of *chi.Mux these routes need. Naming it keeps the
