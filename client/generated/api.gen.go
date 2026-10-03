@@ -381,6 +381,24 @@ func (e RegisteredOIDCClientScopes) Valid() bool {
 	}
 }
 
+// Defines values for SocialLinkedLinkedProvider.
+const (
+	SocialLinkedLinkedProviderGithub SocialLinkedLinkedProvider = "github"
+	SocialLinkedLinkedProviderGoogle SocialLinkedLinkedProvider = "google"
+)
+
+// Valid indicates whether the value is a known member of the SocialLinkedLinkedProvider enum.
+func (e SocialLinkedLinkedProvider) Valid() bool {
+	switch e {
+	case SocialLinkedLinkedProviderGithub:
+		return true
+	case SocialLinkedLinkedProviderGoogle:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for StartedEnrollmentAlgorithm.
 const (
 	SHA1 StartedEnrollmentAlgorithm = "SHA1"
@@ -405,6 +423,42 @@ const (
 func (e StartedEnrollmentMethod) Valid() bool {
 	switch e {
 	case StartedEnrollmentMethodTotp:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for StartSocialLoginParamsProvider.
+const (
+	StartSocialLoginParamsProviderGithub StartSocialLoginParamsProvider = "github"
+	StartSocialLoginParamsProviderGoogle StartSocialLoginParamsProvider = "google"
+)
+
+// Valid indicates whether the value is a known member of the StartSocialLoginParamsProvider enum.
+func (e StartSocialLoginParamsProvider) Valid() bool {
+	switch e {
+	case StartSocialLoginParamsProviderGithub:
+		return true
+	case StartSocialLoginParamsProviderGoogle:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CompleteSocialLoginParamsProvider.
+const (
+	CompleteSocialLoginParamsProviderGithub CompleteSocialLoginParamsProvider = "github"
+	CompleteSocialLoginParamsProviderGoogle CompleteSocialLoginParamsProvider = "google"
+)
+
+// Valid indicates whether the value is a known member of the CompleteSocialLoginParamsProvider enum.
+func (e CompleteSocialLoginParamsProvider) Valid() bool {
+	switch e {
+	case CompleteSocialLoginParamsProviderGithub:
+		return true
+	case CompleteSocialLoginParamsProviderGoogle:
 		return true
 	default:
 		return false
@@ -1484,6 +1538,25 @@ type Session struct {
 	Token string `json:"token"`
 }
 
+// SocialLinked The 200 from the **link** path of `completeSocialLogin`: a provider
+// identity was attached to the account the caller was already signed in as,
+// and **no session was minted**.
+//
+// There is no `token` property here and adding one would be the bug this
+// shape exists to prevent. Linking is not signing in — the caller already
+// holds a session — and a client that reads `token` finds no field at all,
+// which is the honest signal. A body that carried an empty token would make
+// an accidentally-empty session indistinguishable from a successful link.
+type SocialLinked struct {
+	// LinkedProvider Which provider was just linked, so a client can answer "did that work"
+	// without a boolean that says the same thing twice.
+	LinkedProvider SocialLinkedLinkedProvider `json:"linked_provider"`
+}
+
+// SocialLinkedLinkedProvider Which provider was just linked, so a client can answer "did that work"
+// without a boolean that says the same thing twice.
+type SocialLinkedLinkedProvider string
+
 // StartEnrollmentRequest defines model for StartEnrollmentRequest.
 type StartEnrollmentRequest struct {
 	// Code Required **only** when this account already has a credential, where
@@ -1659,6 +1732,33 @@ type ListAccountAuditLogParams struct {
 	Before *string `form:"before,omitempty" json:"before,omitempty"`
 }
 
+// StartSocialLoginParamsProvider defines parameters for StartSocialLogin.
+type StartSocialLoginParamsProvider string
+
+// CompleteSocialLoginParams defines parameters for CompleteSocialLogin.
+type CompleteSocialLoginParams struct {
+	// Code The authorization code. Absent when the provider sent `error`.
+	Code *string `form:"code,omitempty" json:"code,omitempty"`
+
+	// State The value minted on `startSocialLogin`, compared against the
+	// `__Host-oauth-state` cookie. A mismatch is a 400 and does not name which
+	// of the two disagreed.
+	State string `form:"state" json:"state"`
+
+	// Error Present when the person declined consent at the provider. Answered as a
+	// 400 **refusal** rather than treated as "no code", so somebody who said
+	// no is told that rather than told they presented something invalid.
+	Error *string `form:"error,omitempty" json:"error,omitempty"`
+}
+
+// CompleteSocialLoginParamsProvider defines parameters for CompleteSocialLogin.
+type CompleteSocialLoginParamsProvider string
+
+// CompleteSocialLogin200JSONResponseBody defines parameters for CompleteSocialLogin.
+type CompleteSocialLogin200JSONResponseBody struct {
+	union json.RawMessage
+}
+
 // CreateAccountJSONRequestBody defines body for CreateAccount for application/json ContentType.
 type CreateAccountJSONRequestBody = CreateAccountRequest
 
@@ -1730,6 +1830,68 @@ type CompleteSecondFactorJSONRequestBody = CompleteSecondFactorRequest
 
 // RegisterUserJSONRequestBody defines body for RegisterUser for application/json ContentType.
 type RegisterUserJSONRequestBody = RegisterRequest
+
+// AsSession returns the union data inside the CompleteSocialLogin200JSONResponseBody as a Session
+func (t CompleteSocialLogin200JSONResponseBody) AsSession() (Session, error) {
+	var body Session
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSession overwrites any union data inside the CompleteSocialLogin200JSONResponseBody as the provided Session
+func (t *CompleteSocialLogin200JSONResponseBody) FromSession(v Session) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeSession performs a merge with any union data inside the CompleteSocialLogin200JSONResponseBody, using the provided Session
+func (t *CompleteSocialLogin200JSONResponseBody) MergeSession(v Session) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsSocialLinked returns the union data inside the CompleteSocialLogin200JSONResponseBody as a SocialLinked
+func (t CompleteSocialLogin200JSONResponseBody) AsSocialLinked() (SocialLinked, error) {
+	var body SocialLinked
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSocialLinked overwrites any union data inside the CompleteSocialLogin200JSONResponseBody as the provided SocialLinked
+func (t *CompleteSocialLogin200JSONResponseBody) FromSocialLinked(v SocialLinked) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeSocialLinked performs a merge with any union data inside the CompleteSocialLogin200JSONResponseBody, using the provided SocialLinked
+func (t *CompleteSocialLogin200JSONResponseBody) MergeSocialLinked(v SocialLinked) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t CompleteSocialLogin200JSONResponseBody) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *CompleteSocialLogin200JSONResponseBody) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
 
 // RequestEditorFn is the function signature for the RequestEditor callback function
 type RequestEditorFn func(ctx context.Context, req *http.Request) error
@@ -2725,6 +2887,86 @@ type ClientInterface interface {
 	//
 	// Corresponds with GET /v1/accounts/{account_id}/oidc-clients/{client_id} (the `GetOIDCClient` operationId).
 	GetOIDCClient(ctx context.Context, accountID AccountID, clientID openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// StartSocialLogin Begin a social sign-in
+	//
+	// Sends the browser to the named provider's authorization endpoint with a
+	// freshly minted `state`, and sets the `__Host-oauth-state` cookie that the
+	// callback will compare against.
+	//
+	// **This operation is a redirect, not a JSON API.** The answer is a 302 with a
+	// `Location` and no body — `http.Redirect` is not used, because it writes an
+	// HTML anchor with `Content-Type: text/html` for a user agent that cannot
+	// follow a redirect, and this service has none. The same is true of every
+	// other 302 in this document.
+	//
+	// **There is no credential on this operation** (`security: []`), and a client
+	// integrating it does not send one. A session cookie is read, but only to
+	// record an *intention*: if the caller holds a session that resolves, this
+	// becomes a **link** rather than a sign-in, and the callback will attach the
+	// provider identity to that user instead of signing anybody in. A session
+	// that does not resolve — stale, revoked, expired — is "not linking" and
+	// never an error, because a button that 401s forever to somebody whose cookie
+	// went stale is a support call about a sign-in that was never going to happen.
+	//
+	// The `redirect_uri` handed to the provider is built from the **configured**
+	// public base URL and never from the request's `Host` header: a host an
+	// attacker chose must not become part of a redirect URI, or the code is
+	// delivered wherever they asked.
+	//
+	// Corresponds with GET /v1/auth/oauth/{provider} (the `StartSocialLogin` operationId).
+	StartSocialLogin(ctx context.Context, provider StartSocialLoginParamsProvider, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// CompleteSocialLogin Finish a social sign-in
+	//
+	// Where the provider sends the browser back to. It resolves the provider,
+	// compares `state` against the `__Host-oauth-state` cookie, spends the code
+	// and mints a session — or refuses, with a code that says which refusal.
+	//
+	// **No credential is presented here either** (`security: []`). The state
+	// cookie this service set is the whole of what authenticates the round trip,
+	// and it is compared **before** the code is spent: a code is single-use at
+	// the provider, so spending it on a request whose state was forged would burn
+	// a real user's sign-in and teach an attacker that the check is advisory. A
+	// missing cookie, a missing `state` parameter, a mismatch, and a state minted
+	// for a different provider are all **one** 400, because each is
+	// attacker-influenced and a difference between them is an oracle about the
+	// cookie.
+	//
+	// **Three success shapes, and which one you get is not a field you choose.**
+	//
+	// * **200 `Session`** — a sign-in, and the `__Host-session` cookie is set
+	//   alongside the body exactly as `POST /v1/session` does it.
+	// * **202 `MFAChallenge`** — an account with a confirmed second factor gets a
+	//   challenge and **no session at all**, no `token` field and no cookie, and
+	//   finishes at `POST /v1/session/mfa`. Same status, same body and same
+	//   second step as a password login, deliberately: a client has one code path
+	//   for "the login is not finished yet" rather than one per way of starting
+	//   it.
+	// * **200 `SocialLinked`** — the **link** path, and no session is minted. The
+	//   caller was signed in when they started, and attaching a provider
+	//   identity to an account is not signing in. The body names which provider
+	//   was linked and carries no token, so a client that reads `token` finds no
+	//   field at all, which is the honest signal.
+	//
+	// Which of the three happened is decided by the **intention recorded when the
+	// flow started**, not by the shape of the result — a cross-site GET can make a
+	// signed-in browser arrive at this path, so the callback does not decide from
+	// the session cookie it happens to find. A flow that started as a link and
+	// whose session no longer resolves is a 401 rather than a quiet sign-in.
+	//
+	// **An address a local account already holds refuses the sign-in (409).** It
+	// does not sign into that account. The caller is told to sign in locally
+	// instead, which is Jumpstart Pro's behaviour and the anti-account-takeover
+	// rule: somebody who controls a provider account with another person's address
+	// must not be able to walk into it.
+	//
+	// Tokens received from the provider are encrypted at rest and expiry is
+	// judged with a 30-minute skew, so a provider token is never used in the
+	// minute before it dies.
+	//
+	// Corresponds with GET /v1/auth/oauth/{provider}/callback (the `CompleteSocialLogin` operationId).
+	CompleteSocialLogin(ctx context.Context, provider CompleteSocialLoginParamsProvider, params *CompleteSocialLoginParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// RequestEmailChangeWithBody Start a move to a new address
 	//
@@ -4990,6 +5232,106 @@ func (c *Client) RevokeOIDCClient(ctx context.Context, accountID AccountID, clie
 // Corresponds with GET /v1/accounts/{account_id}/oidc-clients/{client_id} (the `GetOIDCClient` operationId).
 func (c *Client) GetOIDCClient(ctx context.Context, accountID AccountID, clientID openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetOIDCClientRequest(c.Server, accountID, clientID)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// StartSocialLogin Begin a social sign-in
+//
+// Sends the browser to the named provider's authorization endpoint with a
+// freshly minted `state`, and sets the `__Host-oauth-state` cookie that the
+// callback will compare against.
+//
+// **This operation is a redirect, not a JSON API.** The answer is a 302 with a
+// `Location` and no body — `http.Redirect` is not used, because it writes an
+// HTML anchor with `Content-Type: text/html` for a user agent that cannot
+// follow a redirect, and this service has none. The same is true of every
+// other 302 in this document.
+//
+// **There is no credential on this operation** (`security: []`), and a client
+// integrating it does not send one. A session cookie is read, but only to
+// record an *intention*: if the caller holds a session that resolves, this
+// becomes a **link** rather than a sign-in, and the callback will attach the
+// provider identity to that user instead of signing anybody in. A session
+// that does not resolve — stale, revoked, expired — is "not linking" and
+// never an error, because a button that 401s forever to somebody whose cookie
+// went stale is a support call about a sign-in that was never going to happen.
+//
+// The `redirect_uri` handed to the provider is built from the **configured**
+// public base URL and never from the request's `Host` header: a host an
+// attacker chose must not become part of a redirect URI, or the code is
+// delivered wherever they asked.
+//
+// Corresponds with GET /v1/auth/oauth/{provider} (the `StartSocialLogin` operationId).
+func (c *Client) StartSocialLogin(ctx context.Context, provider StartSocialLoginParamsProvider, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewStartSocialLoginRequest(c.Server, provider)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// CompleteSocialLogin Finish a social sign-in
+//
+// Where the provider sends the browser back to. It resolves the provider,
+// compares `state` against the `__Host-oauth-state` cookie, spends the code
+// and mints a session — or refuses, with a code that says which refusal.
+//
+// **No credential is presented here either** (`security: []`). The state
+// cookie this service set is the whole of what authenticates the round trip,
+// and it is compared **before** the code is spent: a code is single-use at
+// the provider, so spending it on a request whose state was forged would burn
+// a real user's sign-in and teach an attacker that the check is advisory. A
+// missing cookie, a missing `state` parameter, a mismatch, and a state minted
+// for a different provider are all **one** 400, because each is
+// attacker-influenced and a difference between them is an oracle about the
+// cookie.
+//
+// **Three success shapes, and which one you get is not a field you choose.**
+//
+//   - **200 `Session`** — a sign-in, and the `__Host-session` cookie is set
+//     alongside the body exactly as `POST /v1/session` does it.
+//   - **202 `MFAChallenge`** — an account with a confirmed second factor gets a
+//     challenge and **no session at all**, no `token` field and no cookie, and
+//     finishes at `POST /v1/session/mfa`. Same status, same body and same
+//     second step as a password login, deliberately: a client has one code path
+//     for "the login is not finished yet" rather than one per way of starting
+//     it.
+//   - **200 `SocialLinked`** — the **link** path, and no session is minted. The
+//     caller was signed in when they started, and attaching a provider
+//     identity to an account is not signing in. The body names which provider
+//     was linked and carries no token, so a client that reads `token` finds no
+//     field at all, which is the honest signal.
+//
+// Which of the three happened is decided by the **intention recorded when the
+// flow started**, not by the shape of the result — a cross-site GET can make a
+// signed-in browser arrive at this path, so the callback does not decide from
+// the session cookie it happens to find. A flow that started as a link and
+// whose session no longer resolves is a 401 rather than a quiet sign-in.
+//
+// **An address a local account already holds refuses the sign-in (409).** It
+// does not sign into that account. The caller is told to sign in locally
+// instead, which is Jumpstart Pro's behaviour and the anti-account-takeover
+// rule: somebody who controls a provider account with another person's address
+// must not be able to walk into it.
+//
+// Tokens received from the provider are encrypted at rest and expiry is
+// judged with a 30-minute skew, so a provider token is never used in the
+// minute before it dies.
+//
+// Corresponds with GET /v1/auth/oauth/{provider}/callback (the `CompleteSocialLogin` operationId).
+func (c *Client) CompleteSocialLogin(ctx context.Context, provider CompleteSocialLoginParamsProvider, params *CompleteSocialLoginParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCompleteSocialLoginRequest(c.Server, provider, params)
 	if err != nil {
 		return nil, err
 	}
@@ -7293,6 +7635,121 @@ func NewGetOIDCClientRequest(server string, accountID AccountID, clientID openap
 	return req, nil
 }
 
+// NewStartSocialLoginRequest constructs an http.Request for the StartSocialLogin method
+func NewStartSocialLoginRequest(server string, provider StartSocialLoginParamsProvider) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/auth/oauth/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewCompleteSocialLoginRequest constructs an http.Request for the CompleteSocialLogin method
+func NewCompleteSocialLoginRequest(server string, provider CompleteSocialLoginParamsProvider, params *CompleteSocialLoginParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/auth/oauth/%s/callback", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if params.Code != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "code", *params.Code, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "state", params.State, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if params.Error != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "error", *params.Error, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewRequestEmailChangeRequest calls the generic RequestEmailChange builder with application/json body
 func NewRequestEmailChangeRequest(server string, body RequestEmailChangeJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -9038,6 +9495,90 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with GET /v1/accounts/{account_id}/oidc-clients/{client_id} (the `GetOIDCClient` operationId).
 	GetOIDCClientWithResponse(ctx context.Context, accountID AccountID, clientID openapi_types.UUID, reqEditors ...RequestEditorFn) (*GetOIDCClientResponse, error)
+
+	// StartSocialLoginWithResponse Begin a social sign-in
+	//
+	// Sends the browser to the named provider's authorization endpoint with a
+	// freshly minted `state`, and sets the `__Host-oauth-state` cookie that the
+	// callback will compare against.
+	//
+	// **This operation is a redirect, not a JSON API.** The answer is a 302 with a
+	// `Location` and no body — `http.Redirect` is not used, because it writes an
+	// HTML anchor with `Content-Type: text/html` for a user agent that cannot
+	// follow a redirect, and this service has none. The same is true of every
+	// other 302 in this document.
+	//
+	// **There is no credential on this operation** (`security: []`), and a client
+	// integrating it does not send one. A session cookie is read, but only to
+	// record an *intention*: if the caller holds a session that resolves, this
+	// becomes a **link** rather than a sign-in, and the callback will attach the
+	// provider identity to that user instead of signing anybody in. A session
+	// that does not resolve — stale, revoked, expired — is "not linking" and
+	// never an error, because a button that 401s forever to somebody whose cookie
+	// went stale is a support call about a sign-in that was never going to happen.
+	//
+	// The `redirect_uri` handed to the provider is built from the **configured**
+	// public base URL and never from the request's `Host` header: a host an
+	// attacker chose must not become part of a redirect URI, or the code is
+	// delivered wherever they asked.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /v1/auth/oauth/{provider} (the `StartSocialLogin` operationId).
+	StartSocialLoginWithResponse(ctx context.Context, provider StartSocialLoginParamsProvider, reqEditors ...RequestEditorFn) (*StartSocialLoginResponse, error)
+
+	// CompleteSocialLoginWithResponse Finish a social sign-in
+	//
+	// Where the provider sends the browser back to. It resolves the provider,
+	// compares `state` against the `__Host-oauth-state` cookie, spends the code
+	// and mints a session — or refuses, with a code that says which refusal.
+	//
+	// **No credential is presented here either** (`security: []`). The state
+	// cookie this service set is the whole of what authenticates the round trip,
+	// and it is compared **before** the code is spent: a code is single-use at
+	// the provider, so spending it on a request whose state was forged would burn
+	// a real user's sign-in and teach an attacker that the check is advisory. A
+	// missing cookie, a missing `state` parameter, a mismatch, and a state minted
+	// for a different provider are all **one** 400, because each is
+	// attacker-influenced and a difference between them is an oracle about the
+	// cookie.
+	//
+	// **Three success shapes, and which one you get is not a field you choose.**
+	//
+	// * **200 `Session`** — a sign-in, and the `__Host-session` cookie is set
+	//   alongside the body exactly as `POST /v1/session` does it.
+	// * **202 `MFAChallenge`** — an account with a confirmed second factor gets a
+	//   challenge and **no session at all**, no `token` field and no cookie, and
+	//   finishes at `POST /v1/session/mfa`. Same status, same body and same
+	//   second step as a password login, deliberately: a client has one code path
+	//   for "the login is not finished yet" rather than one per way of starting
+	//   it.
+	// * **200 `SocialLinked`** — the **link** path, and no session is minted. The
+	//   caller was signed in when they started, and attaching a provider
+	//   identity to an account is not signing in. The body names which provider
+	//   was linked and carries no token, so a client that reads `token` finds no
+	//   field at all, which is the honest signal.
+	//
+	// Which of the three happened is decided by the **intention recorded when the
+	// flow started**, not by the shape of the result — a cross-site GET can make a
+	// signed-in browser arrive at this path, so the callback does not decide from
+	// the session cookie it happens to find. A flow that started as a link and
+	// whose session no longer resolves is a 401 rather than a quiet sign-in.
+	//
+	// **An address a local account already holds refuses the sign-in (409).** It
+	// does not sign into that account. The caller is told to sign in locally
+	// instead, which is Jumpstart Pro's behaviour and the anti-account-takeover
+	// rule: somebody who controls a provider account with another person's address
+	// must not be able to walk into it.
+	//
+	// Tokens received from the provider are encrypted at rest and expiry is
+	// judged with a 30-minute skew, so a provider token is never used in the
+	// minute before it dies.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /v1/auth/oauth/{provider}/callback (the `CompleteSocialLogin` operationId).
+	CompleteSocialLoginWithResponse(ctx context.Context, provider CompleteSocialLoginParamsProvider, params *CompleteSocialLoginParams, reqEditors ...RequestEditorFn) (*CompleteSocialLoginResponse, error)
 
 	// RequestEmailChangeWithBodyWithResponse Start a move to a new address
 	//
@@ -12449,6 +12990,238 @@ func (r GetOIDCClientResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r GetOIDCClientResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// StartSocialLoginResponse302Headers the declared response headers of an HTTP 302 response for StartSocialLogin
+type StartSocialLoginResponse302Headers struct {
+	Location  *string
+	SetCookie *string
+	XTraceID  string
+}
+
+// StartSocialLoginResponse400Headers the declared response headers of an HTTP 400 response for StartSocialLogin
+type StartSocialLoginResponse400Headers struct {
+	XTraceID string
+}
+
+// StartSocialLoginResponse404Headers the declared response headers of an HTTP 404 response for StartSocialLogin
+type StartSocialLoginResponse404Headers struct {
+	XTraceID string
+}
+
+// StartSocialLoginResponse500Headers the declared response headers of an HTTP 500 response for StartSocialLogin
+type StartSocialLoginResponse500Headers struct {
+	XTraceID string
+}
+
+type StartSocialLoginResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *MalformedBody
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *NotFound
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// Headers302 the parsed response headers for an HTTP 302 response
+	Headers302 *StartSocialLoginResponse302Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *StartSocialLoginResponse400Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *StartSocialLoginResponse404Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *StartSocialLoginResponse500Headers
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r StartSocialLoginResponse) GetApplicationProblemJSON400() *MalformedBody {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r StartSocialLoginResponse) GetApplicationProblemJSON404() *NotFound {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r StartSocialLoginResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r StartSocialLoginResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r StartSocialLoginResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r StartSocialLoginResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r StartSocialLoginResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// CompleteSocialLoginResponse200Headers the declared response headers of an HTTP 200 response for CompleteSocialLogin
+type CompleteSocialLoginResponse200Headers struct {
+	SetCookie *string
+	XTraceID  string
+}
+
+// CompleteSocialLoginResponse202Headers the declared response headers of an HTTP 202 response for CompleteSocialLogin
+type CompleteSocialLoginResponse202Headers struct {
+	XTraceID string
+}
+
+// CompleteSocialLoginResponse400Headers the declared response headers of an HTTP 400 response for CompleteSocialLogin
+type CompleteSocialLoginResponse400Headers struct {
+	XTraceID string
+}
+
+// CompleteSocialLoginResponse401Headers the declared response headers of an HTTP 401 response for CompleteSocialLogin
+type CompleteSocialLoginResponse401Headers struct {
+	XTraceID string
+}
+
+// CompleteSocialLoginResponse404Headers the declared response headers of an HTTP 404 response for CompleteSocialLogin
+type CompleteSocialLoginResponse404Headers struct {
+	XTraceID string
+}
+
+// CompleteSocialLoginResponse409Headers the declared response headers of an HTTP 409 response for CompleteSocialLogin
+type CompleteSocialLoginResponse409Headers struct {
+	XTraceID string
+}
+
+// CompleteSocialLoginResponse500Headers the declared response headers of an HTTP 500 response for CompleteSocialLogin
+type CompleteSocialLoginResponse500Headers struct {
+	XTraceID string
+}
+
+// CompleteSocialLoginResponse502Headers the declared response headers of an HTTP 502 response for CompleteSocialLogin
+type CompleteSocialLoginResponse502Headers struct {
+	XTraceID string
+}
+
+type CompleteSocialLoginResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *CompleteSocialLogin200JSONResponseBody
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *MFAChallenge
+	// ApplicationProblemJSON400 the response for an HTTP 400 `application/problem+json` response
+	ApplicationProblemJSON400 *Problem
+	// ApplicationProblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationProblemJSON401 *Problem
+	// ApplicationProblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationProblemJSON404 *Problem
+	// ApplicationProblemJSON409 the response for an HTTP 409 `application/problem+json` response
+	ApplicationProblemJSON409 *Problem
+	// ApplicationProblemJSON500 the response for an HTTP 500 `application/problem+json` response
+	ApplicationProblemJSON500 *InternalError
+	// ApplicationProblemJSON502 the response for an HTTP 502 `application/problem+json` response
+	ApplicationProblemJSON502 *Problem
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *CompleteSocialLoginResponse200Headers
+	// Headers202 the parsed response headers for an HTTP 202 response
+	Headers202 *CompleteSocialLoginResponse202Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *CompleteSocialLoginResponse400Headers
+	// Headers401 the parsed response headers for an HTTP 401 response
+	Headers401 *CompleteSocialLoginResponse401Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *CompleteSocialLoginResponse404Headers
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *CompleteSocialLoginResponse409Headers
+	// Headers500 the parsed response headers for an HTTP 500 response
+	Headers500 *CompleteSocialLoginResponse500Headers
+	// Headers502 the parsed response headers for an HTTP 502 response
+	Headers502 *CompleteSocialLoginResponse502Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r CompleteSocialLoginResponse) GetJSON200() *CompleteSocialLogin200JSONResponseBody {
+	return r.JSON200
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r CompleteSocialLoginResponse) GetJSON202() *MFAChallenge {
+	return r.JSON202
+}
+
+// GetApplicationProblemJSON400 returns the response for an HTTP 400 `application/problem+json` response
+func (r CompleteSocialLoginResponse) GetApplicationProblemJSON400() *Problem {
+	return r.ApplicationProblemJSON400
+}
+
+// GetApplicationProblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r CompleteSocialLoginResponse) GetApplicationProblemJSON401() *Problem {
+	return r.ApplicationProblemJSON401
+}
+
+// GetApplicationProblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r CompleteSocialLoginResponse) GetApplicationProblemJSON404() *Problem {
+	return r.ApplicationProblemJSON404
+}
+
+// GetApplicationProblemJSON409 returns the response for an HTTP 409 `application/problem+json` response
+func (r CompleteSocialLoginResponse) GetApplicationProblemJSON409() *Problem {
+	return r.ApplicationProblemJSON409
+}
+
+// GetApplicationProblemJSON500 returns the response for an HTTP 500 `application/problem+json` response
+func (r CompleteSocialLoginResponse) GetApplicationProblemJSON500() *InternalError {
+	return r.ApplicationProblemJSON500
+}
+
+// GetApplicationProblemJSON502 returns the response for an HTTP 502 `application/problem+json` response
+func (r CompleteSocialLoginResponse) GetApplicationProblemJSON502() *Problem {
+	return r.ApplicationProblemJSON502
+}
+
+// GetBody returns the raw response body bytes
+func (r CompleteSocialLoginResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r CompleteSocialLoginResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r CompleteSocialLoginResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r CompleteSocialLoginResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -16003,6 +16776,102 @@ func (c *ClientWithResponses) GetOIDCClientWithResponse(ctx context.Context, acc
 		return nil, err
 	}
 	return ParseGetOIDCClientResponse(rsp)
+}
+
+// StartSocialLoginWithResponse Begin a social sign-in
+//
+// Sends the browser to the named provider's authorization endpoint with a
+// freshly minted `state`, and sets the `__Host-oauth-state` cookie that the
+// callback will compare against.
+//
+// **This operation is a redirect, not a JSON API.** The answer is a 302 with a
+// `Location` and no body — `http.Redirect` is not used, because it writes an
+// HTML anchor with `Content-Type: text/html` for a user agent that cannot
+// follow a redirect, and this service has none. The same is true of every
+// other 302 in this document.
+//
+// **There is no credential on this operation** (`security: []`), and a client
+// integrating it does not send one. A session cookie is read, but only to
+// record an *intention*: if the caller holds a session that resolves, this
+// becomes a **link** rather than a sign-in, and the callback will attach the
+// provider identity to that user instead of signing anybody in. A session
+// that does not resolve — stale, revoked, expired — is "not linking" and
+// never an error, because a button that 401s forever to somebody whose cookie
+// went stale is a support call about a sign-in that was never going to happen.
+//
+// The `redirect_uri` handed to the provider is built from the **configured**
+// public base URL and never from the request's `Host` header: a host an
+// attacker chose must not become part of a redirect URI, or the code is
+// delivered wherever they asked.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /v1/auth/oauth/{provider} (the `StartSocialLogin` operationId).
+func (c *ClientWithResponses) StartSocialLoginWithResponse(ctx context.Context, provider StartSocialLoginParamsProvider, reqEditors ...RequestEditorFn) (*StartSocialLoginResponse, error) {
+	rsp, err := c.StartSocialLogin(ctx, provider, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseStartSocialLoginResponse(rsp)
+}
+
+// CompleteSocialLoginWithResponse Finish a social sign-in
+//
+// Where the provider sends the browser back to. It resolves the provider,
+// compares `state` against the `__Host-oauth-state` cookie, spends the code
+// and mints a session — or refuses, with a code that says which refusal.
+//
+// **No credential is presented here either** (`security: []`). The state
+// cookie this service set is the whole of what authenticates the round trip,
+// and it is compared **before** the code is spent: a code is single-use at
+// the provider, so spending it on a request whose state was forged would burn
+// a real user's sign-in and teach an attacker that the check is advisory. A
+// missing cookie, a missing `state` parameter, a mismatch, and a state minted
+// for a different provider are all **one** 400, because each is
+// attacker-influenced and a difference between them is an oracle about the
+// cookie.
+//
+// **Three success shapes, and which one you get is not a field you choose.**
+//
+//   - **200 `Session`** — a sign-in, and the `__Host-session` cookie is set
+//     alongside the body exactly as `POST /v1/session` does it.
+//   - **202 `MFAChallenge`** — an account with a confirmed second factor gets a
+//     challenge and **no session at all**, no `token` field and no cookie, and
+//     finishes at `POST /v1/session/mfa`. Same status, same body and same
+//     second step as a password login, deliberately: a client has one code path
+//     for "the login is not finished yet" rather than one per way of starting
+//     it.
+//   - **200 `SocialLinked`** — the **link** path, and no session is minted. The
+//     caller was signed in when they started, and attaching a provider
+//     identity to an account is not signing in. The body names which provider
+//     was linked and carries no token, so a client that reads `token` finds no
+//     field at all, which is the honest signal.
+//
+// Which of the three happened is decided by the **intention recorded when the
+// flow started**, not by the shape of the result — a cross-site GET can make a
+// signed-in browser arrive at this path, so the callback does not decide from
+// the session cookie it happens to find. A flow that started as a link and
+// whose session no longer resolves is a 401 rather than a quiet sign-in.
+//
+// **An address a local account already holds refuses the sign-in (409).** It
+// does not sign into that account. The caller is told to sign in locally
+// instead, which is Jumpstart Pro's behaviour and the anti-account-takeover
+// rule: somebody who controls a provider account with another person's address
+// must not be able to walk into it.
+//
+// Tokens received from the provider are encrypted at rest and expiry is
+// judged with a 30-minute skew, so a provider token is never used in the
+// minute before it dies.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /v1/auth/oauth/{provider}/callback (the `CompleteSocialLogin` operationId).
+func (c *ClientWithResponses) CompleteSocialLoginWithResponse(ctx context.Context, provider CompleteSocialLoginParamsProvider, params *CompleteSocialLoginParams, reqEditors ...RequestEditorFn) (*CompleteSocialLoginResponse, error) {
+	rsp, err := c.CompleteSocialLogin(ctx, provider, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCompleteSocialLoginResponse(rsp)
 }
 
 // RequestEmailChangeWithBodyWithResponse Start a move to a new address
@@ -19748,6 +20617,271 @@ func ParseGetOIDCClientResponse(rsp *http.Response) (*GetOIDCClientResponse, err
 			headers.XTraceID = value
 		}
 		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseStartSocialLoginResponse parses an HTTP response from a StartSocialLoginWithResponse call
+func ParseStartSocialLoginResponse(rsp *http.Response) (*StartSocialLoginResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &StartSocialLoginResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 302:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest MalformedBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 302:
+		var headers StartSocialLoginResponse302Headers
+		if values := rsp.Header.Values("Location"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Location", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: "uri"}); err != nil {
+				return nil, err
+			}
+			headers.Location = &value
+		}
+		if values := rsp.Header.Values("Set-Cookie"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Set-Cookie", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.SetCookie = &value
+		}
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers302 = &headers
+	case rsp.StatusCode == 400:
+		var headers StartSocialLoginResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 404:
+		var headers StartSocialLoginResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 500:
+		var headers StartSocialLoginResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseCompleteSocialLoginResponse parses an HTTP response from a CompleteSocialLoginWithResponse call
+func ParseCompleteSocialLoginResponse(rsp *http.Response) (*CompleteSocialLoginResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CompleteSocialLoginResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest CompleteSocialLogin200JSONResponseBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest MFAChallenge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 502:
+		var dest Problem
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationProblemJSON502 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers CompleteSocialLoginResponse200Headers
+		if values := rsp.Header.Values("Set-Cookie"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Set-Cookie", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.SetCookie = &value
+		}
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 202:
+		var headers CompleteSocialLoginResponse202Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers202 = &headers
+	case rsp.StatusCode == 400:
+		var headers CompleteSocialLoginResponse400Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 401:
+		var headers CompleteSocialLoginResponse401Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers401 = &headers
+	case rsp.StatusCode == 404:
+		var headers CompleteSocialLoginResponse404Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 409:
+		var headers CompleteSocialLoginResponse409Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers409 = &headers
+	case rsp.StatusCode == 500:
+		var headers CompleteSocialLoginResponse500Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers500 = &headers
+	case rsp.StatusCode == 502:
+		var headers CompleteSocialLoginResponse502Headers
+		if values := rsp.Header.Values("X-Trace-Id"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Trace-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XTraceID = value
+		}
+		response.Headers502 = &headers
 	}
 
 	return response, nil

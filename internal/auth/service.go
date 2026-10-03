@@ -452,6 +452,20 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (LoginResult, error)
 		return LoginResult{}, ErrInvalidCredentials
 	}
 
+	return s.startLogin(ctx, user, in, now)
+}
+
+// startLogin is the tail of Login: the second-factor decision, and then whichever
+// of a challenge or a session the account's own state calls for.
+//
+// It is a function rather than the last six lines of Login because a social callback
+// has to ask the SAME question at the same point — internal/auth/social.go calls it
+// after it has resolved which local user a provider identity belongs to — and a
+// caller that had to reimplement it would be reimplementing "does this account have
+// a second factor", which is the one line that must never be optional. Naming it
+// also means there is exactly one place in this package where a session is minted
+// without a password having been verified, and it is this one.
+func (s *Service) startLogin(ctx context.Context, user users.User, in LoginInput, now time.Time) (LoginResult, error) {
 	required, err := s.requiresSecondFactor(ctx, user.ID)
 	if err != nil {
 		return LoginResult{}, err

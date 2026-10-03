@@ -75,6 +75,15 @@ type options struct {
 	// A 404 here would tell a product this service has never heard of password
 	// recovery, and that is the one answer that is both false and useless.
 	recovery Recovery
+	// social is the SOCIAL LOGIN surface: the configured OAuth providers and the
+	// use case that finishes a round trip. It is absent without a provider, and it
+	// is the only surface here whose absence is not a misconfiguration — a
+	// deployment that wants password sign-in only configures no provider and never
+	// sees these routes. That is the same "absent rather than present-and-500" rule
+	// every other optional surface follows, and this one earns it: mounting the
+	// routes with no credentials would send people to a provider this process
+	// cannot exchange a code with.
+	social Social
 
 	// panicOnRoute is a TEST seam: a route pattern that is registered with a
 	// handler which panics, so a test can reach the recovery path and the 500 it

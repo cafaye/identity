@@ -271,6 +271,13 @@ func servedRoutes(t *testing.T) map[operationKey]string {
 		// set it would report the documents as agreeing about a service that is
 		// smaller than the one that runs.
 		recovery: newFakeRecovery(),
+		// social is the third instance, and the one that cost a packet. Left out of
+		// this literal, this walk could not see the two social-login routes at all —
+		// so TestEveryServedRouteIsDocumentedOrNamed reported the documents and the
+		// router in agreement while they were not, and the social-login tripwire
+		// whose failure message was the work order for mounting this surface was
+		// GREEN on the day it appeared. See oauth_fake_test.go's header.
+		social: newFakeSocial(),
 	}
 
 	served := map[operationKey]string{}

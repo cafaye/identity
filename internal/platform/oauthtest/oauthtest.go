@@ -69,6 +69,16 @@ type Server struct {
 	// what a GitHub account with a private address looks like.
 	OmitEmail bool
 
+	// UnverifiedEmail makes Google's userinfo carry `"email_verified": false`,
+	// and makes GitHub's /user/emails carry the address with `verified: false`.
+	//
+	// It exists because the client REFUSES an unverified address, on both
+	// providers, and a fake that could only ever report a verified one would make
+	// that refusal untestable in either direction: a test asserting the refusal
+	// would have nothing to assert against, and a client that had stopped checking
+	// would keep passing every happy path.
+	UnverifiedEmail bool
+
 	// tokenStatus, userInfoStatus and emailsStatus are the status codes those
 	// endpoints return. Zero means 200.
 	tokenStatus    int
@@ -129,6 +139,17 @@ func (s *Server) WithEmails(emails ...Email) *Server {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Emails = emails
+	return s
+}
+
+// WithoutVerifiedEmail makes the provider report the address as NOT verified. It is
+// the case the client must refuse, and it is a distinct knob from WithoutEmail: one
+// is "the provider said nothing usable", the other is "the provider said something
+// and it is not good enough".
+func (s *Server) WithoutVerifiedEmail() *Server {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.UnverifiedEmail = true
 	return s
 }
 
@@ -346,6 +367,11 @@ func (s *Server) serveUserInfo(w http.ResponseWriter, r *http.Request) {
 	if _, err := strconv.ParseInt(s.ProviderUID, 10, 64); err == nil {
 		body["id"] = json.Number(s.ProviderUID)
 	}
+	// Google's document carries `email_verified` and the client reads it, so the
+	// fake has to serve it — a fake that omitted the claim would make an
+	// implementation that checks it fail against the fake and one that ignores it
+	// pass, which is the opposite of what a fake is for.
+	body["email_verified"] = !s.UnverifiedEmail
 
 	writeJSON(w, http.StatusOK, body)
 }
@@ -360,9 +386,12 @@ func (s *Server) serveEmails(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0, len(s.Emails))
 	for _, e := range s.Emails {
 		out = append(out, map[string]any{
-			"email":    e.Address,
+			"email": e.Address,
+			// The entry's own flag AND the server-wide knob, so a caller can test
+			// either "this particular address is unverified" or "nothing this
+			// account has is verified" without two different mechanisms.
 			"primary":  e.Primary,
-			"verified": e.Verified,
+			"verified": e.Verified && !s.UnverifiedEmail,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

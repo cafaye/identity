@@ -65,6 +65,11 @@ func walkOptions() options {
 		introspector: newFakeIntrospector(),
 		admin:        newFakeAdmin(),
 		recovery:     newFakeRecovery(),
+		// social is set for the reason every other field here is, and it was the one
+		// that was missing when the social-login routes landed: with this field out,
+		// the walk these tests configure could not see the two routes and
+		// TestTheClaimWalkSeesEveryConditionalSurface had no row asserting it could.
+		social: newFakeSocial(),
 	}
 }
 
@@ -115,6 +120,11 @@ func TestTheClaimWalkSeesEveryConditionalSurface(t *testing.T) {
 		{"introspector", operationKey{Method: "POST", Path: "/v1/introspections"}},
 		{"admin", operationKey{Method: "GET", Path: "/v1/accounts/{}/admin/audit-log"}},
 		{"recovery", operationKey{Method: "POST", Path: "/v1/password-resets"}},
+		// The social-login route is the one that was invisible to BOTH walks when it
+		// landed, which is why this row is worth naming in this file as well as in
+		// router_walk_test.go: this test is the one that would have caught it, had
+		// anybody thought to add the row before mounting the surface.
+		{"social", operationKey{Method: "GET", Path: "/v1/auth/oauth/{}"}},
 	} {
 		if _, ok := found[want.key]; !ok {
 			t.Errorf("the claim walk does not see %s, so it does not see %s. The `options` "+

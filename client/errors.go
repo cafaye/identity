@@ -357,9 +357,58 @@ type MFARequiredError struct {
 }
 
 func (e *MFARequiredError) Error() string {
+	// The sentence names POST /v1/session/mfa because that is where the challenge
+	// goes from EITHER source. Two operations produce this error — a password login
+	// and a completed social callback — and a caller handling it with `errors.As`
+	// finishes the login the same way for both, which is the point of the second
+	// source existing: one code path for "the login is not finished yet" rather
+	// than one per way of starting it.
+	//
+	// "the password was correct" would be a lie on the social path, where no
+	// password was presented at all, so the sentence is about the credential being
+	// accepted rather than about which one it was.
 	return e.redactor.String(e.Operation +
-		": the password was correct and this account has a second factor, so no session " +
+		": the credential was accepted and this account has a second factor, so no session " +
 		"exists. Answer POST /v1/session/mfa with the challenge to get one.")
+}
+
+// MFARequiredFrom builds the 202 error from a body, for the operations that have to
+// read the status themselves.
+//
+// `CreateSession` reads its own status because a 200 and a 202 are both success
+// and both go through the shared `call`, which assumes one JSON shape per success.
+// `completeSocialLogin` is the second operation in that position and would
+// otherwise open-code the same four lines — build the error, set the status, keep
+// the challenge, redact the message — and a second copy of that is a second thing
+// to keep in step.
+//
+// A body that will not decode as a challenge is a `CallError` rather than a
+// challenge with empty fields, because an `*MFARequiredError` whose challenge is
+// the zero value is a caller that will present nothing to `/v1/session/mfa` and be
+// told 404, having been told in the meantime that a second factor is waiting.
+func MFARequiredFrom(operation string, body []byte, redact Redactor) error {
+	var challenge generated.MFAChallenge
+	if err := json.Unmarshal(body, &challenge); err != nil {
+		return &CallError{
+			Operation: operation, Status: http.StatusAccepted, redactor: redact,
+			message: redact.String("a 202 from this operation did not carry a usable " +
+				"challenge, so the login cannot be finished: " + err.Error()),
+		}
+	}
+	if challenge.Challenge == "" {
+		return &CallError{
+			Operation: operation, Status: http.StatusAccepted, redactor: redact,
+			message: "a 202 from this operation carried no challenge. The document promises " +
+				"one, and an error carrying an empty one would send a caller to " +
+				"POST /v1/session/mfa with nothing to present.",
+		}
+	}
+	return &MFARequiredError{
+		CallError: CallError{
+			Operation: operation, Status: http.StatusAccepted, redactor: redact,
+		},
+		Challenge: challenge,
+	}
 }
 
 // ProblemFrom builds the right error for a problem document.

@@ -351,6 +351,41 @@ tags:
       surface here. Mounted — and answering 503 on the paths that need to send —
       when there is no mail delivery path, because a 404 would tell a product this
       service has never heard of password recovery.
+  - name: social-login
+    description: |
+      **Signing in with a provider this service is a CLIENT of**, as opposed to the
+      `oidc-clients` tag, which registers products with this service's OpenID
+      Connect provider. Two operations, one flow, and both are browser round trips
+      rather than API calls.
+
+      **Both take `security: []` and a browser holds no credential to present
+      here.** That is not a gap in the matrix and it is not an oversight: the only
+      thing travelling with the request is the `__Host-oauth-state` cookie this
+      service set on the way out, and the `state` query parameter is compared
+      against it. A caller who cannot produce that cookie cannot finish the flow.
+      A client integrating this does not send an `Authorization` header — it
+      returns a user-agent to a URL, which is the entire point.
+
+      Absent entirely when no provider is configured, like every other optional
+      surface here: a deployment with no OAuth client credentials answers 404 on
+      both paths rather than redirecting a browser to a provider it cannot
+      authenticate with. A provider configured with only half its credentials is a
+      **startup failure**, not a disabled provider — a "Continue with Google" button
+      that 404s because a secret went missing is a support call that should have
+      been a failed deploy.
+
+      **An email collision REFUSES the sign-in.** When a provider returns an
+      address a local account already holds, the callback answers 409 and mints
+      nothing, rather than signing into that account. The user is told to sign in
+      locally. This is Jumpstart Pro's behaviour and it is the anti-account-
+      takeover rule: somebody who controls a provider account with another
+      person's address must not be able to walk into that account.
+
+      **A provider address is only believed when the provider says it is
+      verified.** Anything that resolves a callback to a user by email requires
+      `email_verified`; an unverified address is a suggestion, not a claim about
+      identity, and one that reached a `users.email` lookup would be an account
+      takeover with a login page in front of it.
   - name: probes
     description: Liveness and readiness. Consumed by orchestrators, not by clients.
 
@@ -3348,6 +3383,305 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /v1/auth/oauth/{provider}:
+    get:
+      tags: [social-login]
+      operationId: startSocialLogin
+      summary: Begin a social sign-in
+      description: |
+        Sends the browser to the named provider's authorization endpoint with a
+        freshly minted `state`, and sets the `__Host-oauth-state` cookie that the
+        callback will compare against.
+
+        **This operation is a redirect, not a JSON API.** The answer is a 302 with a
+        `Location` and no body — `http.Redirect` is not used, because it writes an
+        HTML anchor with `Content-Type: text/html` for a user agent that cannot
+        follow a redirect, and this service has none. The same is true of every
+        other 302 in this document.
+
+        **There is no credential on this operation** (`security: []`), and a client
+        integrating it does not send one. A session cookie is read, but only to
+        record an *intention*: if the caller holds a session that resolves, this
+        becomes a **link** rather than a sign-in, and the callback will attach the
+        provider identity to that user instead of signing anybody in. A session
+        that does not resolve — stale, revoked, expired — is "not linking" and
+        never an error, because a button that 401s forever to somebody whose cookie
+        went stale is a support call about a sign-in that was never going to happen.
+
+        The `redirect_uri` handed to the provider is built from the **configured**
+        public base URL and never from the request's `Host` header: a host an
+        attacker chose must not become part of a redirect URI, or the code is
+        delivered wherever they asked.
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          description: |
+            A configured provider: `google` or `github`. A name this deployment
+            has no credentials for and a name that does not exist are **both 404**,
+            because telling them apart is a way to enumerate a deployment's
+            configuration.
+          schema:
+            type: string
+            enum: [google, github]
+      responses:
+        '302':
+          description: |
+            The provider's authorization endpoint. `Location` carries the provider's
+            URL and the `state` this service minted for it.
+          headers:
+            Location:
+              description: The provider's authorization endpoint, with `state` and `redirect_uri`.
+              schema:
+                type: string
+                format: uri
+              example: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=…&state=…&redirect_uri=https%3A%2F%2Fidentity.cafaye.com%2Fv1%2Fauth%2Foauth%2Fgoogle%2Fcallback'
+            Set-Cookie:
+              description: |
+                The `__Host-oauth-state` cookie, `HttpOnly` so no page on any origin
+                can read or produce it, and `Secure`/`Path=/`/no `Domain` per the
+                `__Host-` contract. Valid for ten minutes.
+              schema:
+                type: string
+              example: '__Host-oauth-state=…; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Lax'
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+        '400':
+          $ref: '#/components/responses/MalformedBody'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/auth/oauth/{provider}/callback:
+    get:
+      tags: [social-login]
+      operationId: completeSocialLogin
+      summary: Finish a social sign-in
+      description: |
+        Where the provider sends the browser back to. It resolves the provider,
+        compares `state` against the `__Host-oauth-state` cookie, spends the code
+        and mints a session — or refuses, with a code that says which refusal.
+
+        **No credential is presented here either** (`security: []`). The state
+        cookie this service set is the whole of what authenticates the round trip,
+        and it is compared **before** the code is spent: a code is single-use at
+        the provider, so spending it on a request whose state was forged would burn
+        a real user's sign-in and teach an attacker that the check is advisory. A
+        missing cookie, a missing `state` parameter, a mismatch, and a state minted
+        for a different provider are all **one** 400, because each is
+        attacker-influenced and a difference between them is an oracle about the
+        cookie.
+
+        **Three success shapes, and which one you get is not a field you choose.**
+
+        * **200 `Session`** — a sign-in, and the `__Host-session` cookie is set
+          alongside the body exactly as `POST /v1/session` does it.
+        * **202 `MFAChallenge`** — an account with a confirmed second factor gets a
+          challenge and **no session at all**, no `token` field and no cookie, and
+          finishes at `POST /v1/session/mfa`. Same status, same body and same
+          second step as a password login, deliberately: a client has one code path
+          for "the login is not finished yet" rather than one per way of starting
+          it.
+        * **200 `SocialLinked`** — the **link** path, and no session is minted. The
+          caller was signed in when they started, and attaching a provider
+          identity to an account is not signing in. The body names which provider
+          was linked and carries no token, so a client that reads `token` finds no
+          field at all, which is the honest signal.
+
+        Which of the three happened is decided by the **intention recorded when the
+        flow started**, not by the shape of the result — a cross-site GET can make a
+        signed-in browser arrive at this path, so the callback does not decide from
+        the session cookie it happens to find. A flow that started as a link and
+        whose session no longer resolves is a 401 rather than a quiet sign-in.
+
+        **An address a local account already holds refuses the sign-in (409).** It
+        does not sign into that account. The caller is told to sign in locally
+        instead, which is Jumpstart Pro's behaviour and the anti-account-takeover
+        rule: somebody who controls a provider account with another person's address
+        must not be able to walk into it.
+
+        Tokens received from the provider are encrypted at rest and expiry is
+        judged with a 30-minute skew, so a provider token is never used in the
+        minute before it dies.
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          description: |
+            A configured provider: `google` or `github`. Unresolvable names are
+            **404**, the same answer as a name that does not exist.
+          schema:
+            type: string
+            enum: [google, github]
+        - name: code
+          in: query
+          required: false
+          description: The authorization code. Absent when the provider sent `error`.
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          description: |
+            The value minted on `startSocialLogin`, compared against the
+            `__Host-oauth-state` cookie. A mismatch is a 400 and does not name which
+            of the two disagreed.
+          schema:
+            type: string
+        - name: error
+          in: query
+          required: false
+          description: |
+            Present when the person declined consent at the provider. Answered as a
+            400 **refusal** rather than treated as "no code", so somebody who said
+            no is told that rather than told they presented something invalid.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: |
+            Either a session, or a link. `Session` means a sign-in finished and the
+            `__Host-session` cookie is set; `SocialLinked` means a provider identity
+            was attached to the account the caller was already signed in as, and
+            **no session was minted**.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Set-Cookie:
+              description: |
+                The `__Host-session` cookie, on the sign-in path only. Absent on the
+                link path, and absent for a client that ignores cookies.
+              schema:
+                type: string
+              example: '__Host-session=…; Path=/; Secure; HttpOnly; SameSite=Lax'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Session'
+                  - $ref: '#/components/schemas/SocialLinked'
+              examples:
+                signedIn:
+                  summary: a sign-in that finished
+                  value:
+                    token: 0dN3aQ2vF8kLmXpR7sT1uWzYb4cE6hJ9gK2mP5rS8tV
+                    expires_at: '2026-10-30T12:00:00Z'
+                linked:
+                  summary: a provider identity attached to the signed-in account
+                  value:
+                    linked_provider: google
+        '202':
+          description: |
+            The account has a confirmed second factor, so the login is **not
+            finished** and no session exists. Present the `challenge` at
+            `POST /v1/session/mfa` to finish it.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MFAChallenge'
+              examples:
+                default:
+                  value:
+                    mfa_required: true
+                    challenge: 0dN3aQ2vF8kLmXpR7sT1uWzYb4cE6hJ9gK2mP5rS8tV
+                    expires_at: '2026-10-30T12:10:00Z'
+        '400':
+          description: |
+            The round trip could not be finished: the state did not match the
+            cookie, the person declined at the provider, the provider refused the
+            code, or the provider returned no address this service will accept.
+            One shape for all four, and it does not say which.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                refused:
+                  value:
+                    type: https://cafaye.com/problems/invalid_request
+                    title: Invalid request
+                    status: 400
+                    code: invalid_request
+                    detail: this social sign-in did not start in this browser, so it cannot be finished here
+                    trace_id: 3f1c9a2e-7b4d-4c8e-9a1b-2d5e6f708192
+        '401':
+          description: |
+            The flow started as a **link** and the session it was started from no
+            longer resolves. 401 rather than a sign-in: the person asked to attach
+            an account to the one they were signed in as, and quietly signing them
+            in as somebody else would be the worst available answer.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: |
+            The provider is not one this deployment configured, or does not exist.
+            **Both are this status**, because a difference between them is a way to
+            enumerate a deployment's configuration.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: |
+            The sign-in was **refused**, not completed. Either the provider identity
+            is already linked to a different user, or — the one that matters — the
+            address the provider reported already belongs to an account here. In
+            both cases nothing is minted and nobody is signed in, and the caller is
+            told to sign in with that account instead.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                emailInUse:
+                  value:
+                    type: https://cafaye.com/problems/conflict
+                    title: Conflict
+                    status: 409
+                    code: conflict
+                    detail: >-
+                      an account already exists for the email address that oauth account
+                      reports, so this sign-in was refused rather than linked. Sign in with
+                      that account instead
+                    trace_id: 3f1c9a2e-7b4d-4c8e-9a1b-2d5e6f708192
+        '502':
+          description: |
+            The provider could not be reached or answered unusably. **502 rather than
+            500**, because it is the difference between "we are broken" and
+            "somebody upstream is" — and a caller retrying a 502 is behaving
+            correctly where a caller retrying a 500 is not. The provider's own error
+            body is never rendered: it can carry a client secret, a redirect URI and
+            an account identifier.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /healthz:
     get:
       tags: [probes]
@@ -4316,6 +4650,28 @@ components:
           type: string
           format: date-time
           description: RFC3339 UTC. Judged against the service's clock, not the database's.
+
+    SocialLinked:
+      type: object
+      description: |
+        The 200 from the **link** path of `completeSocialLogin`: a provider
+        identity was attached to the account the caller was already signed in as,
+        and **no session was minted**.
+
+        There is no `token` property here and adding one would be the bug this
+        shape exists to prevent. Linking is not signing in — the caller already
+        holds a session — and a client that reads `token` finds no field at all,
+        which is the honest signal. A body that carried an empty token would make
+        an accidentally-empty session indistinguishable from a successful link.
+      additionalProperties: false
+      required: [linked_provider]
+      properties:
+        linked_provider:
+          type: string
+          description: |
+            Which provider was just linked, so a client can answer "did that work"
+            without a boolean that says the same thing twice.
+          enum: [google, github]
 
     OIDCClient:
       type: object

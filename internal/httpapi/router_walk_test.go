@@ -62,8 +62,15 @@ import (
 // file rather than a hole in two others.
 var conditionalSurfaces = []string{
 	// The service fields, each of which gates a registrar's early return.
+	//
+	// `social` is here because it is the THIRD instance of this bug and the first
+	// one where the check it blinded was the check for the very surface being
+	// mounted. oauth_absent_test.go was the tripwire for social login and it was
+	// GREEN on the day the routes appeared, because neither servedRoutes nor
+	// walkOptions set this field. See oauth_fake_test.go's header for the whole of
+	// it, including why nobody noticed for a whole packet.
 	"auth", "tenancy", "apiKeyCaller", "introspector", "apiKeys", "oidc",
-	"oidcClients", "mfa", "admin", "recovery",
+	"oidcClients", "mfa", "admin", "recovery", "social",
 }
 
 // TestEveryConditionalSurfaceIsVisibleToTheWalk is the check.
@@ -149,6 +156,48 @@ func TestTheDriftWalkSeesTheRecoverySurface(t *testing.T) {
 			t.Errorf("servedRoutes did not report %s as served. TestEveryServedRouteIsDocumentedOrNamed "+
 				"depends on this walk seeing every mounted route, so a route missing from it has its "+
 				"documentation checked in neither direction", want)
+		}
+	}
+}
+
+// TestTheDriftWalkSeesTheSocialLoginSurface is the behavioural instance for the
+// third occurrence, and it is the pair of checks that let the social-login
+// tripwire go green on the day its own subject was mounted.
+//
+// `TestEveryConditionalSurfaceIsVisibleToTheWalk` above is a list membership test:
+// it requires every name in `conditionalSurfaces` to BE a field of options, and
+// `social` was a field nobody listed — so it passed, and the walk stayed blind to
+// both social routes. A list that can omit an entry without failing is a list that
+// cannot enforce its own claim, which is why this file's real work is asserting
+// that the walk FINDS the routes.
+//
+// Both directions of the failure are named, because they were both real here. The
+// drift walk reporting the routes is what makes
+// `TestEveryServedRouteIsDocumentedOrNamed` able to fail on an undocumented social
+// operation. The claim walk reporting them is what makes the README's
+// social-login rows checkable rather than decorative — a README row for a route
+// the walk cannot see would be checked against nothing.
+func TestTheDriftWalkSeesTheSocialLoginSurface(t *testing.T) {
+	t.Parallel()
+
+	want := []operationKey{
+		{Method: "GET", Path: "/v1/auth/oauth/{}"},
+		{Method: "GET", Path: "/v1/auth/oauth/{}/callback"},
+	}
+
+	for _, key := range want {
+		if _, seen := servedRoutes(t)[key]; !seen {
+			t.Errorf("servedRoutes did not report %s. The router mounts it once `options.social` "+
+				"is set, so this walk is reading a smaller service than the one that runs — and "+
+				"every documentation check built on it is currently reporting agreement about a "+
+				"surface it cannot see. That is exactly what happened to the social-login "+
+				"tripwire: it stayed green on the day the routes appeared.", key)
+		}
+		if _, seen := routesIn(t, walkOptions())[key]; !seen {
+			t.Errorf("walkOptions did not report %s. The two options literals describe the same "+
+				"deployed router, and a test suite that walks two different routers reports "+
+				"agreement about a service neither one is. Add the double to servedRoutes AND "+
+				"walkOptions.", key)
 		}
 	}
 }
