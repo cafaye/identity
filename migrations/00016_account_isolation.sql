@@ -87,6 +87,16 @@
 -- — so a re-run converges rather than failing on a duplicate name.
 
 -- +goose Up
+--
+-- RE-SYNCED `cafaye.protect_table` FROM kit's substrate (registry-identity-down-05).
+-- The copy had drifted: kit's version grants USAGE ON SEQUENCES to the login role
+-- (a protected table with a bigserial column was uninsertable without it) and this
+-- file predated that change, which `TestTheOtherSixSubstrateFunctionsAreKitsBytes`
+-- held as a byte comparison and reported by name. identity is pre-release with no
+-- deployed database, so the copy is corrected in place rather than re-copied in a
+-- migration on top; the test reads THIS file's bytes, which is what makes the
+-- in-place correction the honest one.
+
 
 -- THE STATEMENTBEGIN/STATEMENTEND PAIR AROUND THE SUBSTRATE IS LOAD-BEARING, AND IT IS
 -- THE ONE LINE IN THIS MIGRATION THAT IS NOT FROM kit.
@@ -547,6 +557,7 @@ declare
   login_role text := coalesce(p_login_role, current_user || '_app');
   qual text := 'account_id = (select cafaye.current_account_id())';
   base text;
+  seq_name text;
 begin
   -- 0. THE LOGIN ROLE HAS TO EXIST, and saying so by name is the difference
   --    between a diagnosable failure and a confusing one. Postgres reports a
@@ -650,11 +661,87 @@ begin
   --    role cannot resolve `cafaye.begin_account/1` at all, so the first thing a
   --    service does after adopting this is a `permission denied for schema
   --    cafaye` on every request.
+  --
+  --    USAGE ON A SEQUENCE is in the list for the same reason and it is the one
+  --    that is INVISIBLE until a service writes a row. A table's INSERT reads its
+  --    sequence before it writes the row, and a sequence is a separate object with
+  --    its own grants — the table grant above does not carry it. Without this line
+  --    a protected table with a `bigserial` column is UNINSERTABLE by the login
+  --    role:
+  --
+  --        ERROR:  permission denied for sequence notification_preferences_id_seq
+  --
+  --    which is SQLSTATE 42501 — the code the policies themselves raise. An
+  --    assertion that checks the code alone cannot tell a working boundary from a
+  --    table nobody can write to. `templates/database/tenancy/isolation.sql`'s
+  --    `cafaye_observed` returns `sqlstate` and nothing else, so it is exposed to
+  --    exactly that; what has kept it out of reach is that its probe table is
+  --    `id uuid … default gen_random_uuid()`, which is why 39 assertions have been
+  --    green through this defect. `reports/substrate-sequence-grant/` is where the
+  --    message is required, and it is where the two are told apart.
   execute format('grant usage on schema public to %I', login_role);
   if to_regnamespace('cafaye') is not null then
     execute format('grant usage on schema cafaye to %I', login_role);
   end if;
   execute format('grant select, insert, update, delete on table %s to %I', p_table, login_role);
+
+  -- 7. AND USAGE ON EVERY SEQUENCE THIS TABLE'S OWN COLUMNS OWNED, AND NO OTHER.
+  --
+  --    `USAGE` is the whole grant and it is the whole need: it is what `nextval`
+  --    and `currval` check, so it is the minimum that makes an INSERT into a
+  --    serial column work. It is deliberately NOT `select` (which would let the
+  --    login role read `last_value` and reason about how many rows other tables
+  --    hold) and NOT `update` (which would let it `setval` and forge ids). A
+  --    blanket `grant all on all sequences in schema public` also makes the
+  --    insert work, and hands the same role control of every sequence in the
+  --    database — including the ones behind tables it must not touch. The
+  --    narrowing is the point of the loop.
+  --
+  --    FOUND IN THE CATALOG, NOT BY NAME. `<column>_id_seq` is this migration's
+  --    convention and is not the next service's; a table with two serial columns
+  --    has two sequences and neither is the table's; `serial4`, `bigserial`,
+  --    `identity` and a hand-written `DEFAULT nextval(…)` differ in spelling and
+  --    in nothing else. `pg_depend` is the edge Postgres itself records for all of
+  --    them — `deptype` `a` for `serial` and `i` for `identity` — so reading it
+  --    covers every spelling rather than the one this migration happened to use.
+  --    The loop deliberately does NOT filter on `deptype`.
+  --
+  --    MEASURED, because it was the premise this line was written under and the
+  --    measurement says otherwise: on PostgreSQL 17.11 and 18.6 a protected table
+  --    whose id is `generated always as identity` IS insertable by a role holding
+  --    no privilege on the sequence at all, while that same role's explicit
+  --    `nextval()` on the sequence is refused — the identity value is fetched on a
+  --    path with no ACL check. So the `bigserial` case was the lockout and this one
+  --    was not, and the grant is here anyway for two reasons that do not depend on
+  --    that: it is `USAGE` on the table's OWN sequence and nothing wider, and a
+  --    substrate whose correctness rests on an undocumented executor detail is one
+  --    minor version from the same lockout. Do not read this loop as a claim that
+  --    `identity` was broken; read it as a claim that this file does not have to
+  --    be re-derived per spelling.
+  --
+  --    `FOR … IN SELECT` rather than `SELECT … INTO`, so an empty result set is a
+  --    loop that does not run rather than a `no rows` exception. Most tables in
+  --    any service have no serial column at all, and `protect_table` already
+  --    refuses a table it cannot scope by name — a sequence loop that RAISED on
+  --    the tables that need no loop would be a quieter bug than the one it fixes.
+  --
+  --    Schema-qualified, because a bare relation name in a `GRANT` is resolved
+  --    through the CALLER's `search_path` — and the caller of a migration is a
+  --    role whose `search_path` this function does not control.
+  for seq_name in
+    select format('%I.%I', n.nspname, s.relname)
+      from pg_class s
+      join pg_namespace n on n.oid = s.relnamespace
+      join pg_depend d on d.classid = 'pg_class'::regclass
+                       and d.refclassid = 'pg_class'::regclass
+                       and d.objid = s.oid
+                       and d.refobjid = p_table::regclass
+      join pg_attribute a on a.attrelid = d.refobjid
+                         and a.attnum = d.refobjsubid
+     where s.relkind = 'S'
+  loop
+    execute format('grant usage on sequence %s to %I', seq_name, login_role);
+  end loop;
 end
 $caf$;
 
@@ -978,8 +1065,48 @@ drop index if exists api_keys_cafaye_account_id_idx;
 drop index if exists api_keys_cafaye_token_digest_idx;
 drop index if exists account_audit_log_cafaye_account_id_idx;
 
--- `cascade` because the functions live in the schema and the schema is what is being
--- removed; naming them first and dropping the schema second would be two ways to fail
--- for the same result. Nothing outside this schema references any of them — the
--- functions are reached by name from a service that has not called them yet.
-drop schema if exists cafaye cascade;
+-- THE FUNCTIONS, NAMED, AND THEN THE SCHEMA WITHOUT `cascade`.
+--
+-- This section used to end in a single `drop schema if exists cafaye cascade`, justified by
+-- the claim that naming the functions first would be "two ways to fail for the same result".
+-- It is the opposite: `cascade` is what made the twenty `drop policy` statements above
+-- unverifiable. That is the finding registry-identity-down-05's rollback check produced, and
+-- it was not visible any other way.
+--
+-- A RLS policy is a DEPENDENT object, not a member: each of the twenty policies created above
+-- names `cafaye.current_account_id()` in its expression, so `pg_depend` records a dependency
+-- on that function, and `drop schema ... cascade` takes the policies with it. That is why the
+-- line above it enumerated twenty `drop policy` statements that `cascade` was going to sweep
+-- anyway — and why a mistake in them was invisible.
+--
+-- MEASURED, not reasoned. Delete ONE of those twenty drops — the
+-- `account_audit_log_cafaye_delete` line — and re-apply this Down: with `cascade` the policy
+-- is gone anyway and the database ends up correct. Delete the `cascade` from THIS line and
+-- leave that drop out, and Postgres refuses:
+--
+--     ERROR: cannot drop schema cafaye because other objects depend on it
+--     DETAIL:  policy account_audit_log_cafaye_delete on table account_audit_log depends on schema cafaye
+--
+-- which is the outcome this line wants. The cascade was converting a forgotten statement into
+-- a silent success, and `bin/rollback` — which compares the object census before and after
+-- each Down — cannot see a mistake that Postgres fixes on its own.
+--
+-- So the schema goes LAST and WITHOUT `cascade`. The order of the seven drops is not
+-- cosmetic: six of them call the two `current_*` readers, so the schema cannot go first even
+-- with the policies and indexes already gone — Postgres says so itself --
+--
+--     ERROR:  cannot drop schema cafaye because other objects depend on it
+--     DETAIL:  function cafaye.current_account_id() depends on schema cafaye
+--
+-- Dropping the callers first and the readers last leaves `drop schema` with only members
+-- inside it, and members do not block their own schema's removal. Anything this Down forgot
+-- to enumerate is now an error naming itself, which is what a rollback should be.
+drop function if exists cafaye.unprotected_tables();
+drop function if exists cafaye.protect_credential_table(regclass, text, text);
+drop function if exists cafaye.protect_table(regclass, text);
+drop function if exists cafaye.begin_account(uuid);
+drop function if exists cafaye.begin_credential(text);
+drop function if exists cafaye.credential_tables();
+drop function if exists cafaye.current_credential_digest();
+drop function if exists cafaye.current_account_id();
+drop schema if exists cafaye;
