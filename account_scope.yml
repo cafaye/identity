@@ -1,0 +1,734 @@
+# account_scope.yml — every entry point identity mounts, and which of them can
+# reach another account's data.
+#
+# Checked by cafaye/core's contract harness:
+#
+#     /Users/kaka/Code/any/moon/cafaye/core/harness/bin/account-scope-check .
+#
+# THE SIBLING FILE IS tenancy.yml, AND THE TWO ANSWER DIFFERENT QUESTIONS.
+# `tenancy.yml` declares the STATEMENTS that constrain on `account_id` and the
+# tests that prove another account is refused. This file declares the ENTRY POINTS
+# a caller arrives through and the line at which each resolves the caller's
+# account. Neither is derivable from the other, and this one is the only place
+# that can say "GET /v1/accounts reaches no account, and here is why".
+#
+# ---------------------------------------------------------------------------
+# THE THREE THINGS IN THIS FILE THAT ARE A DECISION, NOT A READING
+# ---------------------------------------------------------------------------
+#
+# 1. `surface.minimum: 41` IS THE COUNT, AND IT IS A DECREASE-DETECTOR.
+#    41 is what core's checker finds in the nine files named below, today. It is
+#    NOT the number of routes identity mounts: that is 54, and the thirteen that
+#    are not counted are named one by one in the block at the end of this file.
+#    They are registered with a Go PATH CONSTANT rather than a string literal —
+#    `r.Get(oidc.PathAuthorize, …)` and `r.Get(socialLoginPrefix+"/{provider}", …)`
+#    — and core's chi recogniser requires a `"` after the `(`. A floor set to 54
+#    would make every future run red for a reason that has nothing to do with a
+#    defect, which is the one thing a ratchet must never do. A floor set to 41
+#    still notices a route being deleted.
+#
+# 2. `reason: none` IS USED FOR EVERY ROW THAT RESOLVES NO ACCOUNT.
+#    The closed vocabulary in core's schema has no member for "authenticated, and
+#    the subject is derived from the caller's own credential rather than from an
+#    account the caller names" — which is the shape of 21 of the 36 `false` rows
+#    here, and the shape a service whose own subjects ARE accounts has on most of
+#    its surface. `none` is the only member that does not OVER-CLAIM: taken
+#    literally ("reaches no data at all") it understates 21 routes that do read
+#    and write rows, and the alternative (`platform-admin`, meaning "the operator's
+#    own account") would assert an operator boundary that does not exist on a
+#    customer session — which is the direction that gets a row trusted and skipped.
+#    Every row using it carries a comment saying what it really is. The gap is a
+#    finding for core and is written up in the report, not worked around here.
+#
+# 3. THE REASON VOCABULARY, USED AS FOLLOWS.
+#    `public` — no bearer credential is looked up: no session, no api key. The
+#      body may carry the secret that authorises the request (a password, a
+#      challenge answer, an address), because that is the request being
+#      authenticated rather than a stored credential this service resolved.
+#    `unauthenticated-callback` — the authority is a one-time token or state this
+#      service issued and verifies, with no session at all. This is the shape
+#      core's own docs give courier's `/unsubscribe/:token`: a token-authorised
+#      route that holds a customer's row and still resolves no account.
+#    `none` — resolves no account; the subject is the caller's own user, session,
+#      second-factor secret or address.
+#    `platform-admin` and `system` are used by NO row in this file, and the report
+#      says why that is itself worth knowing.
+#
+# 4. TWELVE OF THE FIFTY-FOUR ENTRY POINTS ARE NOT IN `entryPoints`, AND THE
+#    REASON IS NAMED IN THIS FILE RATHER THAN LEFT TO BE INFERRED. They are real
+#    routes this process serves; core's checker cannot see their registrations
+#    and answers `account-scope.stale` for each when it is declared honestly.
+#    Declaring them anyway would put twelve findings whose text — "registeredAt
+#    points at a line that does not register it" — is FALSE on twelve lines that
+#    do register them into the first adopter's file, and a guard that cries wolf
+#    on correct code is the failure mode core's own docs name as the reason
+#    guards get switched off. Omitting them silently would be the same defect
+#    this file exists to stop. They are enumerated at the end of this file.
+version: 1
+service: identity
+
+surface:
+  kind: http
+  # NINE FILES, NOT A DIRECTORY, and the reason is `minimum` rather than taste: a
+  # directory would drag in `_test.go` files, and a route added to a test helper
+  # would move a floor that is supposed to mean something about production.
+  #
+  # `internal/httpapi/oauth.go` IS NAMED AND CONTRIBUTES ZERO. It holds two real
+  # registrations written as `socialLoginPrefix+"/{provider}"`, and the recogniser
+  # cannot see either. It is named anyway, which is the whole point of naming a
+  # file: the day somebody writes a third route there as a string literal, this
+  # checker goes red naming it, rather than the file staying invisible the way a
+  # file nobody named always is.
+  sources:
+    - internal/httpapi/httpapi.go
+    - internal/httpapi/accounts.go
+    - internal/httpapi/auth.go
+    - internal/httpapi/admin.go
+    - internal/httpapi/apikeys.go
+    - internal/httpapi/mfa.go
+    - internal/httpapi/oauth.go
+    - internal/httpapi/oidc.go
+    - internal/httpapi/recovery.go
+  # 41 registrations in those nine files. See §1 above for why this is 41 and not
+  # 54; the thirteen that are not counted are named by hand in the report.
+  minimum: 41
+  # What identity writes, in `requireAccountRole` and in `oidc_clients`. It is
+  # also tenancy.yml's `scope.key`, and it is declared here rather than left to
+  # that file so this one is self-contained: a checker told to look at a
+  # declaration should not have to find a second declaration to read it.
+  accountKey: account_id
+
+# ---------------------------------------------------------------------------
+# THE ACCOUNT-RESOLVING LINE, STATED ONCE
+# ---------------------------------------------------------------------------
+# Eighteen routes below are `accountScoped: true` and every one of them resolves
+# the caller's account at ONE line:
+#
+#     internal/httpapi/accounts.go:286   accountID, ok := accountIDFrom(r)
+#
+# inside `requireAccountRole`, which is the authorization gate on every
+# account-scoped route in this service (its own comment says so, and
+# `internal/httpapi/authz_matrix_test.go` holds it). The account comes from the
+# path, the caller's role comes from `account_users` on the same request, and a
+# caller who is not a member gets 404 rather than 403 — a 403 would confirm the
+# account exists, which is a free tenant-enumeration oracle on the ids that are
+# the only thing between two customers.
+#
+# So the `accountFrom` block on those eighteen rows is identical, and that is not
+# a copy-paste: it is the claim that this service has exactly one account
+# boundary on its HTTP surface. The day a second `via` appears, the claim is
+# false and the report's falsification section shows what the checker does.
+entryPoints:
+  # -------------------------------------------------------------------------
+  # internal/httpapi/httpapi.go — the two probes. Mounted on every process,
+  # before any surface is, including a process with no database.
+  # -------------------------------------------------------------------------
+  - id: healthz
+    kind: http
+    method: GET
+    path: /healthz
+    accountScoped: false
+    reason: public
+    registeredAt:
+      file: internal/httpapi/httpapi.go
+      line: 245
+
+  - id: readyz
+    kind: http
+    method: GET
+    path: /readyz
+    accountScoped: false
+    # It pings the pool, so it touches a dependency — but `Ping` reads no row, and
+    # probe failures are logged with the error rather than returned, so the
+    # response cannot be used to learn a database host or a rejected password.
+    reason: public
+    registeredAt:
+      file: internal/httpapi/httpapi.go
+      line: 246
+
+  # -------------------------------------------------------------------------
+  # internal/httpapi/accounts.go — the account surface.
+  # -------------------------------------------------------------------------
+  # The three collection routes are SESSION-ONLY and resolve NO account. They
+  # answer a question about the caller's whole set of accounts rather than about
+  # one, which is exactly why `sessionCredentialOnly` refuses an api key here: a
+  # credential minted for one of the caller's accounts would otherwise be a
+  # complete inventory of every other tenant its owner belongs to.
+
+  - id: create-account
+    kind: http
+    method: POST
+    path: /v1/accounts
+    accountScoped: false
+    # It creates an account and the owner is the authenticated user, never
+    # anything in the body — so there is no version of this request that reaches
+    # an account the caller is not already the sole member of.
+    reason: none
+    registeredAt:
+      file: internal/httpapi/accounts.go
+      line: 586
+
+  - id: list-accounts
+    kind: http
+    method: GET
+    path: /v1/accounts
+    accountScoped: false
+    # `tenancy.ListMine(ctx, user.ID)`: the account set is DERIVED FROM THE
+    # CALLER, so there is no account in this request for a caller to point at
+    # somebody else's. It does read `accounts` and `account_users` rows — the
+    # caller's own — which is why the comment above this row and the report's
+    # §2 vocabulary finding are both about this shape and not about `/healthz`.
+    reason: none
+    registeredAt:
+      file: internal/httpapi/accounts.go
+      line: 587
+
+  - id: accept-invitation
+    kind: http
+    method: POST
+    path: /v1/invitations/accept
+    accountScoped: false
+    # The account comes from an invitation token, not from the request: the body
+    # carries `{token}` and `tenancy.Accept` looks the invitation up by
+    # `token_digest`. This is core's own `/unsubscribe/:token` shape — a
+    # token-authorised route that writes one `account_users` row for the
+    # caller's own user and reaches no existing row of another tenant.
+    reason: unauthenticated-callback
+    registeredAt:
+      file: internal/httpapi/accounts.go
+      line: 588
+
+  - id: get-account
+    kind: http
+    method: GET
+    path: /v1/accounts/{accountID}
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/accounts.go
+      line: 590
+
+  - id: rename-account
+    kind: http
+    method: PATCH
+    path: /v1/accounts/{accountID}
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/accounts.go
+      line: 591
+
+  - id: delete-account
+    kind: http
+    method: DELETE
+    path: /v1/accounts/{accountID}
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/accounts.go
+      line: 592
+
+  - id: list-members
+    kind: http
+    method: GET
+    path: /v1/accounts/{accountID}/members
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/accounts.go
+      line: 594
+
+  - id: invite-member
+    kind: http
+    method: POST
+    path: /v1/accounts/{accountID}/invitations
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/accounts.go
+      line: 595
+
+  - id: change-member-role
+    kind: http
+    method: PATCH
+    path: /v1/accounts/{accountID}/members/{userID}
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/accounts.go
+      line: 596
+
+  - id: remove-member
+    kind: http
+    method: DELETE
+    path: /v1/accounts/{accountID}/members/{userID}
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/accounts.go
+      line: 597
+
+  # -------------------------------------------------------------------------
+  # internal/httpapi/auth.go — the credential surface. `auth.Service` is where a
+  # session is minted and where a password is checked; none of these five
+  # resolves an account.
+  # -------------------------------------------------------------------------
+  - id: register-user
+    kind: http
+    method: POST
+    path: /v1/users
+    accountScoped: false
+    # No bearer credential. It reads `users` by the address presented (409 when
+    # it is taken, DECISIONS.md D9) and writes one new `users` row. No account
+    # is resolved on either side.
+    reason: public
+    registeredAt:
+      file: internal/httpapi/auth.go
+      line: 129
+
+  - id: login
+    kind: http
+    method: POST
+    path: /v1/session
+    accountScoped: false
+    # No bearer credential is looked up; the address and the password in the body
+    # are the request being authenticated rather than a stored credential. It
+    # resolves a USER and writes a `sessions` row.
+    reason: public
+    registeredAt:
+      file: internal/httpapi/auth.go
+      line: 130
+
+  - id: logout
+    kind: http
+    method: DELETE
+    path: /v1/session
+    accountScoped: false
+    # The caller's own session, resolved from the session token presented. There
+    # is no scope for this surface at all: a token cannot mint, read or revoke a
+    # browser session, which is why `sessionCredentialOnly` is here.
+    reason: none
+    registeredAt:
+      file: internal/httpapi/auth.go
+      line: 139
+
+  - id: me
+    kind: http
+    method: GET
+    path: /v1/me
+    accountScoped: false
+    # The caller's own `users` row, and nothing else: `userResponse` is `{id,
+    # email}`. There is no account in the path and none in the answer.
+    reason: none
+    registeredAt:
+      file: internal/httpapi/auth.go
+      line: 140
+
+  - id: complete-second-factor
+    kind: http
+    method: POST
+    path: /v1/session/mfa
+    accountScoped: false
+    # The authority is a challenge this service minted for this attempt plus its
+    # answer, both in the body; nothing stored is looked up. It is mounted
+    # WITHOUT the MFA key check on purpose — a deployment with no
+    # MFA_ENCRYPTION_KEY still has users who enrolled elsewhere, and a 404 here
+    # would be free permission to treat "no challenge" as "no MFA required".
+    reason: public
+    registeredAt:
+      file: internal/httpapi/auth.go
+      line: 155
+
+  # -------------------------------------------------------------------------
+  # internal/httpapi/admin.go — three routes, one privilege boundary. Each is
+  # wrapped `requireAdminToken(requireAccountRole(...))`: a user session is
+  # refused outright and a token is the point, because an audit record names the
+  # api key's row id and a session cannot be named.
+  #
+  # THE DECLARED PATHS CARRY `{}` FOR THE `adminPrefix` IDENTIFIER, and that is
+  # core's documented convention rather than a fudge: `"/v1/accounts/{id}/"+
+  # adminPrefix+"/audit-log"` has no path in the source at all, and the
+  # concatenation resolves each non-literal term to `{}`. The literal a caller
+  # uses is `/v1/accounts/{accountID}/admin/audit-log`, and `adminPrefix` is
+  # `"admin"` at admin.go:73.
+  # -------------------------------------------------------------------------
+  - id: list-audit-log
+    kind: http
+    method: GET
+    path: /v1/accounts/{accountID}/{}/audit-log
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/admin.go
+      line: 122
+
+  - id: revoke-invitation
+    kind: http
+    method: DELETE
+    path: /v1/accounts/{accountID}/{}/invitations/{invitationID}
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/admin.go
+      line: 125
+
+  - id: revoke-invitations
+    kind: http
+    method: POST
+    path: /v1/accounts/{accountID}/{}/invitation-revocations
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/admin.go
+      line: 128
+
+  # -------------------------------------------------------------------------
+  # internal/httpapi/apikeys.go — the machine-credential surface.
+  # -------------------------------------------------------------------------
+  - id: mint-api-key
+    kind: http
+    method: POST
+    path: /v1/accounts/{accountID}/api-keys
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/apikeys.go
+      line: 76
+
+  - id: list-api-keys
+    kind: http
+    method: GET
+    path: /v1/accounts/{accountID}/api-keys
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/apikeys.go
+      line: 77
+
+  - id: revoke-api-key
+    kind: http
+    method: DELETE
+    path: /v1/accounts/{accountID}/api-keys/{keyID}
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/apikeys.go
+      line: 78
+
+  - id: introspect-token
+    kind: http
+    method: POST
+    path: /v1/introspections
+    accountScoped: false
+    # THE ONE ROW IN THIS FILE WHERE THE BOUNDARY IS INSIDE THE HANDLER, and it
+    # is declared `false` because the boundary HOLDS: `mayIntrospect`
+    # (apikeys.go:500) resolves the presented token's account at line 503 and
+    # then demands owner in it at line 511, answering 404 to a caller who is not
+    # a member. A caller outside the account cannot get at it, which is the whole
+    # of what `accountScoped` asks.
+    #
+    # It is worth naming because this route is why `accountFrom.via` cannot be
+    # the only way to say it: the account is resolved one stack frame below the
+    # registration, so there is no symbol on `r.Post("/v1/introspections", …)` for
+    # the contract to name. See the report's §5.
+    reason: none
+    registeredAt:
+      file: internal/httpapi/apikeys.go
+      line: 419
+
+  # -------------------------------------------------------------------------
+  # internal/httpapi/mfa.go — the second-factor management surface. Five routes,
+  # all resolving the caller's own `users` row and its TOTP secret.
+  # -------------------------------------------------------------------------
+  - id: mfa-status
+    kind: http
+    method: GET
+    path: /v1/mfa
+    accountScoped: false
+    reason: none
+    registeredAt:
+      file: internal/httpapi/mfa.go
+      line: 130
+
+  - id: start-mfa-enrollment
+    kind: http
+    method: POST
+    path: /v1/mfa/enrollments
+    accountScoped: false
+    reason: none
+    registeredAt:
+      file: internal/httpapi/mfa.go
+      line: 131
+
+  - id: confirm-mfa-enrollment
+    kind: http
+    method: POST
+    path: /v1/mfa/enrollments/{enrollmentID}/confirm
+    accountScoped: false
+    # `{enrollmentID}` is the caller's OWN pending enrollment, resolved from the
+    # session before the id is read.
+    reason: none
+    registeredAt:
+      file: internal/httpapi/mfa.go
+      line: 132
+
+  - id: regenerate-recovery-codes
+    kind: http
+    method: POST
+    path: /v1/mfa/recovery-codes
+    accountScoped: false
+    reason: none
+    registeredAt:
+      file: internal/httpapi/mfa.go
+      line: 133
+
+  - id: disable-mfa
+    kind: http
+    method: DELETE
+    path: /v1/mfa
+    accountScoped: false
+    # A machine credential that could disable a second factor is a credential
+    # whose theft is a DOWNGRADE rather than a break-in, which is the whole of
+    # why this surface is `sessionCredentialOnly`.
+    reason: none
+    registeredAt:
+      file: internal/httpapi/mfa.go
+      line: 134
+
+  # -------------------------------------------------------------------------
+  # internal/httpapi/oauth.go — the social-login surface. ONE of its TWO routes is
+  # declared here and one is not, and the asymmetry is the instrument's, not a
+  # decision about importance.
+  #
+  # Both registrations are written as `socialLoginPrefix+"/{provider}"` — a Go
+  # constant, `"/v1/auth/oauth"` at oauth.go:90 — so core's chi recogniser, which
+  # requires a `"` after the `(`, sees NEITHER. What separates them is the
+  # fallback in core's `registeredAt` check, which accepts a line whose text
+  # contains the LAST SEGMENT of the declared path: `/callback` is literally on
+  # line 162, and `{provider}` — a parameter, whose name never appears in the
+  # source — is not. See the block at the end of this file for the twelve.
+  # -------------------------------------------------------------------------
+  - id: social-login-callback
+    kind: http
+    method: GET
+    path: /v1/auth/oauth/{provider}/callback
+    accountScoped: false
+    # The provider calls back over a `state` this service minted and verifies
+    # (`oauth.VerifyState`), with no session. It resolves a USER from the
+    # provider's verified identity and links or signs in that user; no account is
+    # resolved on either path.
+    reason: unauthenticated-callback
+    registeredAt:
+      file: internal/httpapi/oauth.go
+      line: 162
+
+  # -------------------------------------------------------------------------
+  # internal/httpapi/oidc.go — the client-registration surface, on the account.
+  # -------------------------------------------------------------------------
+  - id: register-oidc-client
+    kind: http
+    method: POST
+    path: /v1/accounts/{accountID}/oidc-clients
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/oidc.go
+      line: 1267
+
+  - id: list-oidc-clients
+    kind: http
+    method: GET
+    path: /v1/accounts/{accountID}/oidc-clients
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/oidc.go
+      line: 1268
+
+  - id: get-oidc-client
+    kind: http
+    method: GET
+    path: /v1/accounts/{accountID}/oidc-clients/{clientID}
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/oidc.go
+      line: 1269
+
+  - id: revoke-oidc-client
+    kind: http
+    method: DELETE
+    path: /v1/accounts/{accountID}/oidc-clients/{clientID}
+    accountScoped: true
+    accountFrom: { via: requireAccountRole, file: internal/httpapi/accounts.go, line: 286 }
+    registeredAt:
+      file: internal/httpapi/oidc.go
+      line: 1271
+
+  # -------------------------------------------------------------------------
+  # internal/httpapi/oidc.go — the PROTOCOL surface is NOT in this list. Its
+  # eleven registrations are written as `oidc.PathX` — a constant from
+  # internal/oidc/provider.go:39-68 — so the recogniser sees none of them, and
+  # the eleven are enumerated with their scope answers in the block at the end of
+  # this file. Nothing about the OIDC protocol surface is left unstated; what is
+  # left undeclared is what this format can check.
+  # -------------------------------------------------------------------------
+
+  # -------------------------------------------------------------------------
+  # internal/httpapi/recovery.go — password reset, address verification and email
+  # change. Every one is `sessionCredentialOnly`: a machine credential must not be
+  # able to trigger a password reset or answer a second factor, because either
+  # would let a CI job lock a human out.
+  # -------------------------------------------------------------------------
+  - id: request-password-reset
+    kind: http
+    method: POST
+    path: /v1/password-resets
+    accountScoped: false
+    # No bearer credential. The address in the body names a `users` row and the
+    # answer is a CONSTANT 202 whether or not that address exists, which is the
+    # whole of this route's account-enumeration defence.
+    reason: public
+    registeredAt:
+      file: internal/httpapi/recovery.go
+      line: 94
+
+  - id: redeem-password-reset
+    kind: http
+    method: POST
+    path: /v1/password-resets/confirm
+    accountScoped: false
+    # The token in the body is the authority, mailed by this service and verified
+    # here, with no session — courier's `/unsubscribe/:token` shape.
+    reason: unauthenticated-callback
+    registeredAt:
+      file: internal/httpapi/recovery.go
+      line: 95
+
+  - id: request-email-verification
+    kind: http
+    method: POST
+    path: /v1/email-verifications
+    accountScoped: false
+    reason: public
+    registeredAt:
+      file: internal/httpapi/recovery.go
+      line: 96
+
+  - id: redeem-email-verification
+    kind: http
+    method: POST
+    path: /v1/email-verifications/confirm
+    accountScoped: false
+    reason: unauthenticated-callback
+    registeredAt:
+      file: internal/httpapi/recovery.go
+      line: 97
+
+  - id: email-verification-status
+    kind: http
+    method: GET
+    path: /v1/email-verification
+    accountScoped: false
+    # `VerificationStatus(ctx, userID)` for the caller's own user. This route
+    # EXISTS because of the enumeration rule: a stranger must not be able to ask
+    # whether an address is verified, so the question is only answerable by the
+    # address's owner.
+    reason: none
+    registeredAt:
+      file: internal/httpapi/recovery.go
+      line: 98
+
+  - id: request-email-change
+    kind: http
+    method: POST
+    path: /v1/email-changes
+    accountScoped: false
+    reason: none
+    registeredAt:
+      file: internal/httpapi/recovery.go
+      line: 99
+
+  - id: confirm-email-change-current
+    kind: http
+    method: POST
+    path: /v1/email-changes/current-address
+    accountScoped: false
+    reason: unauthenticated-callback
+    registeredAt:
+      file: internal/httpapi/recovery.go
+      line: 100
+
+  - id: confirm-email-change-new
+    kind: http
+    method: POST
+    path: /v1/email-changes/new-address
+    accountScoped: false
+    reason: unauthenticated-callback
+    registeredAt:
+      file: internal/httpapi/recovery.go
+      line: 101
+
+# ===========================================================================
+# THE TWELVE THIS DECLARATION CANNOT CONTAIN, ENUMERATED
+# ===========================================================================
+#
+# `entryPoints` above holds 42 of the 54 routes this process mounts. The twelve
+# below are the other twelve, and they are written down here — in the file, not
+# only in the report — because an entry point nobody declared is the unknown
+# this file exists to surface, and an unknown that is only written down in a
+# report nobody reads is the same unknown.
+#
+# WHY THEY ARE NOT ROWS. Each is registered with a Go PATH CONSTANT where a
+# string literal would go, and core's chi recogniser requires `("`:
+#
+#     r.Get(oidc.PathAuthorize, o.handleOIDCAuthorize)          <- not seen
+#     r.Get("/healthz", handleHealthz)                           <- seen
+#
+# Declared honestly at their real registration lines, all twelve answer
+# `account-scope.stale` with the text "registeredAt points at a line that does
+# not register it" — which is FALSE on all twelve lines, each of which does
+# register the route. Declared anywhere else — at the constant's definition, or
+# as `kind: internal` with the constant's name — the checker goes quiet, and the
+# declaration stops describing the tree. Twelve findings a reader has to learn to
+# ignore is worse than a named gap, so this is a named gap.
+#
+# WHAT EACH ONE IS. The scope column is the honest answer, decided by reading the
+# handler; it is here so the twelve can be promoted into `entryPoints` by one
+# commit the day core can read a path constant, and so a reader today can audit
+# them rather than assume.
+#
+#   method  path                                        file:line                    scope    reason
+#   GET     /v1/auth/oauth/{provider}                    oauth.go:161                 false    public
+#   GET     /oidc/authorize                             oidc.go:134                  false    public
+#   POST    /oidc/authorize                             oidc.go:135                  false    public
+#   GET     /oidc/authorize/callback                    oidc.go:137                  false    none
+#   POST    /oidc/token                                 oidc.go:138                  false    none
+#   GET     /oidc/userinfo                              oidc.go:139                  false    none
+#   POST    /oidc/userinfo                              oidc.go:140                  false    none
+#   GET     /oidc/login/{requestID}                     oidc.go:142                  false    none
+#   POST    /oidc/login/{requestID}                     oidc.go:143                  false    none
+#   GET     /.well-known/openid-configuration           oidc.go:156                  false    public
+#   GET     /.well-known/oauth-authorization-server     oidc.go:157                  false    public
+#   GET     /.well-known/jwks.json                      oidc.go:158                  false    public
+#
+#   (`oauth.go` and `oidc.go` are `internal/httpapi/`.)
+#
+# WHY NONE OF THE ELEVEN OIDC ROUTES IS ACCOUNT-SCOPED, which is the one thing a
+# reader will want to check and the answer is not obvious: the token this
+# provider mints carries an `accounts` ARRAY rather than one `account_id`.
+# `oidc.claimAccount` at internal/oidc/profiles.go:166-194 is the projection, and
+# its own comment gives the reason — "a user of a cafaye product is a member of
+# a personal account and usually of several team accounts, so there is no single
+# account_id to put in a token". So the account a caller receives on any of these
+# eleven is derived from the USER identity this service authenticated, and no
+# caller can point any of them at an account they are not in. The client
+# registration named by `client_id` IS an account-owned row (`oidc_clients` has
+# an `account_id` column, and tenancy.yml's own §6 names its secret-addressed
+# lookup), and the client authenticates itself with its own secret to use it —
+# which is what a credential is, and the same argument
+# `/v1/invitations/accept` gets from an invitation token.
+#
+# `GET /v1/auth/oauth/{provider}` reads the caller's session ONLY to record an
+# intention, and a session that does not resolve is "not linking" rather than an
+# error, so it is reachable with no bearer credential and writes no row.
