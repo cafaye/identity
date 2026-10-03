@@ -459,13 +459,27 @@ func TestTheReadmeDeclaredAbsencesAreStillAbsent(t *testing.T) {
 // nothing but the test mounts. Each is named for the check it exercises, because a
 // single shared injection would be wrong for one of them: the README comparison
 // looks for a route with no row beside it, so its injection has to be somewhere the
-// README is silent, and the social-login check looks for a route UNDER a prefix, so
-// its injection has to be under that prefix. Using one path for both would leave
-// one check comparing a set that does not contain what it looks for — green, and
-// green for the wrong reason.
+// README is silent, and the social-login check looks for a route UNDER the social
+// prefix, so its injection has to be under that prefix. Using one path for both
+// would leave one check comparing a set that does not contain what it looks for —
+// green, and green for the wrong reason.
+//
+// The second one is a FICTIONAL path and that is the whole of the change from the
+// version this replaces. It used to be the real callback,
+// `socialLoginPrefix + "/google/callback"`, because the check it drove asserted
+// that NO social-login route existed; the natural injection was then a real one.
+// The check is inverted now, so the injection has to be a route no provider serves
+// and the README does not describe: `/disconnect` under the social prefix is an
+// obvious thing for a later packet to mount, which is exactly the regression this
+// case exists to catch.
 const (
 	injectedUndocumentedRoute = "/v1/claims-fault-injection"
-	injectedSocialLoginRoute  = socialLoginPrefix + "/google/callback"
+
+	// Built from socialLoginPrefix rather than spelled out, so a rename of the
+	// production constant moves the injection with it. A literal would let the two
+	// drift and the case would then be asserting about a path the router could never
+	// be mounted on.
+	injectedUndocumentedSocialLoginRoute = socialLoginPrefix + "/{provider}/disconnect"
 )
 
 // TestEveryClaimCheckFailsOnAnInjectedRoute is the falsifiability test for this
@@ -497,9 +511,9 @@ func TestEveryClaimCheckFailsOnAnInjectedRoute(t *testing.T) {
 			inject: injectedUndocumentedRoute,
 			check:  readmeUndocumentedRoutes,
 		},
-		"a mounted social-login route": {
-			inject: injectedSocialLoginRoute,
-			check:  socialLoginRoutesMounted,
+		"a social-login route with no README row": {
+			inject: injectedUndocumentedSocialLoginRoute,
+			check:  undocumentedSocialLoginRoutes,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -550,19 +564,59 @@ func readmeUndocumentedRoutes(t *testing.T, served map[operationKey]string) stri
 	return "served but in no README row: " + strings.Join(reported, ", ")
 }
 
-// socialLoginRoutesMounted is the social-login absence, as a function.
-func socialLoginRoutesMounted(_ *testing.T, served map[operationKey]string) string {
+// undocumentedSocialLoginRoutes is readmeUndocumentedRoutes narrowed to the social
+// prefix, and it used to be the exact opposite of this.
+//
+// ## The inversion, and what it cost
+//
+// It was `socialLoginRoutesMounted`, which reported the presence of any route under
+// `socialLoginPrefix` as a defect. That was correct while the surface was unmounted
+// and it was the whole of `oauth_absent_test.go`'s assertion, but as the surface
+// mounted it became a check whose passing state is a router without a feature — so
+// it had to be inverted rather than deleted, exactly as the tripwire's own rule
+// demanded ("mounting social login without deleting this file is not finishing the
+// work; deleting it is a review-visible act").
+//
+// What it now means: **a social-login route with no documentation beside it.** The
+// narrowing to the prefix is what keeps it worth having next to the general check
+// above. A route under `/v1/auth/oauth` is the one case where a missing README row
+// is a repeat of a specific historical lie rather than ordinary drift, so it gets a
+// failure message that says which surface it is about, and it keeps a falsifiability
+// case of its own — `TestEveryClaimCheckFailsOnAnInjectedRoute` — so a future edit
+// that widens this to the whole router is a visible change rather than a silent one.
+//
+// ## What was actually given up, stated plainly
+//
+// Mechanically, this case is now SUBSUMED by `readmeUndocumentedRoutes`: a served
+// route with no README row is the same finding whether or not it is under the social
+// prefix, so the general check would have fired on the injection without this one.
+// What is preserved is not an independent signal — it is the narrowing, the
+// surface-specific message, and the anchor to `socialLoginPrefix`. The other option
+// for this case was deleting it, and that would have left the social surface with no
+// check of its own at all, which is the regression the tripwire was watching for:
+// social routes remounted without documentation, silently, because nothing in the
+// package had that prefix in it. Given that the tripwire was deleted for exactly
+// this surface, keeping the narrower check is the smaller loss.
+func undocumentedSocialLoginRoutes(t *testing.T, served map[operationKey]string) string {
+	t.Helper()
+
+	claims, _ := readmeClaims(t)
+
 	var reported []string
 	for key := range served {
-		if key.Path == socialLoginPrefix || strings.HasPrefix(key.Path, socialLoginPrefix+"/") {
-			reported = append(reported, key.String())
+		if key.Path != socialLoginPrefix && !strings.HasPrefix(key.Path, socialLoginPrefix+"/") {
+			continue
 		}
+		if _, documented := claims[key]; documented {
+			continue
+		}
+		reported = append(reported, key.String())
 	}
 	if len(reported) == 0 {
 		return ""
 	}
 	sort.Strings(reported)
-	return "social-login routes mounted: " + strings.Join(reported, ", ")
+	return "served under " + socialLoginPrefix + " with no README row: " + strings.Join(reported, ", ")
 }
 
 // --- the manifest --------------------------------------------------------------
