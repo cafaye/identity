@@ -10,17 +10,30 @@ package httpapi
 // ## What it found, and why the document check could not have found it
 //
 // The README's endpoint tables were **honest**. Not one of them ever claimed an
-// OAuth social-login route, because there is not one. The lie was one layer up, in
+// OAuth social-login route, because there was not one. The lie was one layer up, in
 // three places a route table cannot see:
 //
 //   - the Roadmap, where `- [x] OAuth (social login) via goth` said the capability
-//     ships, and it does not — no route, no handler, no use case, and goth is not
+//     ships, and it did not — no route, no handler, no use case, and goth was not
 //     even a dependency of this module;
 //   - the opening paragraph, which listed "OAuth" among the things this service
 //     owns;
 //   - `cafaye.yml`'s `description`, which is the manifest customers are handed
 //     and which listed "OAuth" beside "the OIDC provider" as though they were two
 //     capabilities rather than one.
+//
+// All three have moved, and the surface those claims described now exists — so the
+// honest record is that **the fix for a README claiming a route that does not exist
+// was to add the route**, and the tripwire whose failure message demanded exactly
+// that is deleted. The tables were honest then and they are honest now, for the
+// same reason both times: a table is checked, and prose is not.
+//
+// One thing this file learned late and should not have had to: those three claims
+// stayed invisible while they were FALSE **and** while they were TRUE, because
+// `social` was a conditional surface neither router walk set. Every check in here
+// was reporting agreement about a service without the two social routes in it. A
+// check that can be green by not checking is not a check, and it took a third
+// instance of router_walk_test.go's bug to see it.
 //
 // A check that reads `paths:` blocks sees none of that, because none of it is in
 // a `paths:` block. That is the general shape of this file: **the drift check
@@ -641,14 +654,25 @@ var manifestCapabilityEvidence = map[string][]string{
 	"MFA":                  {"/v1/mfa"},
 	"accounts and tenancy": {"/v1/accounts", "/v1/invitations/accept"},
 	"scoped API tokens":    {"/v1/accounts/{}/api-keys", "/v1/introspections"},
-	"the OIDC provider":    {"/oidc/authorize", "/oidc/token"},
+	// The CLIENT of somebody else's provider, which is a different capability from
+	// the entry below and was the exact conflation that made "OAuth" an unsafe word
+	// in this description: a bare "OAuth" beside "the OIDC provider" reads as two
+	// halves of one role, and this service fills only one of them as a provider —
+	// the other as a relying party, against Google and GitHub.
+	"social login":      {"/v1/auth/oauth/{}", "/v1/auth/oauth/{}/callback"},
+	"the OIDC provider": {"/oidc/authorize", "/oidc/token"},
 }
 
 // manifestCapabilityCount pins the declared table, in the same direction as
 // knownDrift: it cannot grow, and it cannot shrink. Growth is a new claim added
 // without anybody deciding it; shrinking is a capability deleted from the table
 // rather than from the manifest.
-const manifestCapabilityCount = 6
+//
+// Seven, because "social login" is a mounted capability now with two routes behind
+// it. The sixth was the OIDC provider; the seventh is the CLIENT of somebody else's
+// provider, which is a different thing and was the exact confusion that made
+// "OAuth" an unsafe word to put in this file's description in the first place.
+const manifestCapabilityCount = 7
 
 // manifestDescription reads the `description:` value out of cafaye.yml.
 func manifestDescription(t *testing.T) string {
@@ -760,8 +784,13 @@ func manifestCapabilities(description string) []string {
 //
 // The manifest is the one file here a customer is handed rather than reads, and
 // the claim this found was in it: "OAuth" sat in the list beside "the OIDC
-// provider", as two capabilities, when this service is the second and not the
-// first. `/v1/auth/oauth` is not mounted. It never was.
+// provider", as two capabilities, when this service was the second and not the
+// first. `/v1/auth/oauth` was not mounted. It never was, until the surface shipped
+// — at which point the honest entry stopped being "OAuth", which reads as the
+// provider role this service does not have, and became the thing that is actually
+// true: that it is a **client** of somebody else's provider. Two different
+// capabilities, and conflating them is how the original claim survived as long as
+// it did.
 func TestTheManifestDescribesOnlyCapabilitiesThisServiceHas(t *testing.T) {
 	items := manifestCapabilities(manifestDescription(t))
 	served := servedRoutes(t)
@@ -849,6 +878,7 @@ var roadmapSurface = map[string][]string{
 	"oidc provider":         {"/oidc/authorize", "/oidc/token"},
 	"mfa: totp":             {"/v1/mfa"},
 	"scoped api tokens":     {"/v1/accounts/{}/api-keys", "/v1/introspections"},
+	"social login":          {"/v1/auth/oauth/{}", "/v1/auth/oauth/{}/callback"},
 }
 
 // roadmapNotSurface is the pinned set of checked roadmap items that are genuinely
@@ -1006,9 +1036,12 @@ func TestEveryCheckedRoadmapItemIsBackedByTheRouter(t *testing.T) {
 	if len(unbacked) > 0 {
 		t.Errorf("README.md's roadmap checks off %d item(s) that no route backs:\n\n  %s\n\n"+
 			"This is the check the OAuth lie was for. `- [x] OAuth (social login) via goth` "+
-			"asserted a capability this service does not have: there is no route, no handler and "+
-			"no use case, and goth is not a dependency of this module at all. A checkbox is what "+
-			"somebody reads to decide whether to integrate, so do one of the two things:\n"+
+			"asserted a capability this service did not have: there was no route, no handler "+
+			"and no use case, and goth was not a dependency of this module at all. It is on the "+
+			"roadmap now with no `goth`, because the routes are mounted — so the finding this "+
+			"message describes is history, and the box it caught is the current one. A checkbox "+
+			"is what somebody reads to decide whether to integrate, so do one of the two "+
+			"things:\n"+
 			"  1. the capability is shipping — mount it, document it, and add it to roadmapSurface "+
 			"with the routes that prove it.\n"+
 			"  2. it is not — uncheck the box, and record the absence in the README's "+
