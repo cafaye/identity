@@ -30,10 +30,10 @@
 # 2. `reason: none` IS USED FOR EVERY ROW THAT RESOLVES NO ACCOUNT.
 #    The closed vocabulary in core's schema has no member for "authenticated, and
 #    the subject is derived from the caller's own credential rather than from an
-#    account the caller names" — which is the shape of 21 of the 36 `false` rows
-#    here, and the shape a service whose own subjects ARE accounts has on most of
+#    account the caller names" — which is the shape of 12 of the 25 `false` rows
+#    below, and the shape a service whose own subjects ARE accounts has on most of
 #    its surface. `none` is the only member that does not OVER-CLAIM: taken
-#    literally ("reaches no data at all") it understates 21 routes that do read
+#    literally ("reaches no data at all") it understates 12 routes that do read
 #    and write rows, and the alternative (`platform-admin`, meaning "the operator's
 #    own account") would assert an operator boundary that does not exist on a
 #    customer session — which is the direction that gets a row trusted and skipped.
