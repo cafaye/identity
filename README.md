@@ -189,6 +189,8 @@ service quietly listening on the wrong port.
 | `POST /v1/session` | `200 {"token","expires_at"}` | Log in. Sets the `__Host-session` cookie to the same token. `401 unauthorized` for any unusable credential, `423 account_locked` with `Retry-After` while locked. |
 | `POST /v1/session/mfa` | `200 {"token","expires_at"}` | Answer a second factor and **only then** get the session. `{challenge?, code}` — the challenge from a `202`, and a TOTP code or a recovery code. | |
 | `DELETE /v1/session` | `204` | Revoke the current session and clear the cookie. `401` if no credential was presented. |
+| `GET /v1/auth/oauth/:provider` | `302` | **Start a social sign-in.** Redirects the browser to the provider with a fresh `state` and sets `__Host-oauth-state`. **No credential, and none can be presented** — a browser holds nothing here but the cookie this route just set. `404` for a provider this deployment has no credentials for *and* for a name that does not exist, because telling them apart enumerates the configuration. A session cookie is read only to record an **intention**: if one resolves, the callback will *link* rather than sign in. Absent entirely when no provider is configured. |
+| `GET /v1/auth/oauth/:provider/callback` | `200 {token, expires_at}` | **Finish it.** **No credential here either** — the state cookie is the whole of what authenticates the round trip, and it is compared *before* the code is spent. Three shapes: `200 {token,…}` a sign-in; `202 {mfa_required,…}` an account with a second factor, so no session is minted and you finish at `POST /v1/session/mfa`; `200 {linked_provider}` the link path, which mints **nothing**. `400` for a state mismatch, a declined consent or a refused code; `409` when the provider's address already belongs to an account here — **it refuses the sign-in rather than signing into that account**; `502` when the provider is unreachable. |
 | `GET /v1/me` | `200 {"id","email"}` | The authenticated user. `401` with no usable credential. |
 | `POST /v1/accounts/:id/oidc-clients` | `201 {id, client_id, client_secret, …}` | Register a relying party. **Owner only.** `client_secret` is returned here and never again. |
 | `GET /v1/accounts/:id/oidc-clients` | `200 [{id, client_id, name, …}]` | The account's registrations, newest first. `[]` and not `null`. **Owner only.** |
@@ -222,6 +224,55 @@ account's recovery path, and a credential that could mint a password reset is a
 takeover with a delay rather than a break-in — so there is no scope in the machine
 vocabulary for any of it, and there is not going to be one. The four redemption
 routes are anonymous, because the token in the body **is** the credential.
+
+### Social login: two routes, and neither of them takes a credential
+
+`GET /v1/auth/oauth/{provider}` and `GET /v1/auth/oauth/{provider}/callback` are in
+the table above and they are a browser round trip, not an API integration. **Both
+are reachable with no credential at all** — `security: []` in
+[`openapi/v1.yaml`](openapi/v1.yaml), and a caller integrating them sends no
+`Authorization` header because there is nothing to send. What travels with the
+request is the `__Host-oauth-state` cookie this service set on the way out, and
+the `state` query parameter is compared against it **before** the code is spent.
+A caller who cannot produce that cookie cannot finish the flow.
+
+Getting this wrong is the security bug rather than the documentation bug. A reader
+who assumed these two rows are session-gated would invent a middleware that is not
+there; a reader who assumed they are unrestricted would be describing a service
+that does not exist.
+
+Four properties a client integrating this has to know, and each is a decision
+rather than an omission:
+
+- **An address a local account already holds refuses the sign-in.** The callback
+  answers `409 conflict` and mints nothing, and the caller is told to sign in
+  locally instead. It does **not** silently sign into that account. This is
+  Jumpstart Pro's behaviour (`elsif User.exists?(email: auth.info.email)` →
+  `flash.alert` → redirect to login) and it is the anti-account-takeover rule:
+  somebody who controls a provider account carrying another person's address must
+  not be able to walk into it.
+- **A provider address is only believed when the provider says it is verified.**
+  Any path that resolves a callback to a user by email requires `email_verified`
+  from the provider. Google's claim was not read while the surface was unmounted
+  and it is read now; an unverified address is a suggestion, not a claim about
+  identity, and one that reached a `users.email` lookup would be an account
+  takeover with a login page in front of it.
+- **The link path mints no session.** If the caller held a resolving session when
+  they started, the callback attaches the provider identity to *that* user and
+  answers `200 {linked_provider}` with no `token` field at all. Which of the three
+  success shapes happened is decided by the intention recorded when the flow
+  **started**, not by the session cookie the callback happens to find — a
+  cross-site GET can make a signed-in browser arrive at that path.
+- **Tokens from the provider are encrypted at rest** (`internal/oauth`'s
+  `SocialSealer`) and expiry is judged with a 30-minute skew, so a provider token
+  is never used in the minute before it dies.
+
+Absent entirely when no provider is configured — a deployment with no OAuth client
+credentials answers `404` on both paths rather than redirecting a browser to a
+provider it cannot authenticate with. A provider configured with **only half** its
+credentials is a **startup failure**, not a disabled provider: a "Continue with
+Google" button that 404s because a secret went missing is a support call that
+should have been a failed deploy.
 
 ### Recovery: one token machine, three flows
 
