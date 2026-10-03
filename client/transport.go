@@ -99,6 +99,19 @@ type Transport interface {
 	ListAccountAuditLog(ctx context.Context, accountId openapiTypes.UUID, params *generated.ListAccountAuditLogParams, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	RevokeAccountInvitation(ctx context.Context, accountId openapiTypes.UUID, invitationId openapiTypes.UUID, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 	RevokeAccountInvitations(ctx context.Context, accountId openapiTypes.UUID, body generated.BulkInvitationRevocation, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	// The social-login round trip is here for completeness of the METHOD SET, which
+	// is all this interface promises, and neither of these two is a call a machine
+	// client should make.
+	//
+	// `StartSocialLogin` answers 302 with a Location and no body, and
+	// `CompleteSocialLogin` is the far side of that redirect — the browser is
+	// supposed to arrive, holding nothing but the `__Host-oauth-state` cookie this
+	// service set. A caller presenting an `Authorization` header to either is
+	// sending a credential to a route that ignores it, because the surface is
+	// `security: []` in the document. The wrapper in client.go says the same thing
+	// where somebody will actually read it.
+	StartSocialLogin(ctx context.Context, provider generated.StartSocialLoginParamsProvider, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
+	CompleteSocialLogin(ctx context.Context, provider generated.CompleteSocialLoginParamsProvider, params *generated.CompleteSocialLoginParams, reqEditors ...generated.RequestEditorFn) (*http.Response, error)
 }
 
 // The proof that the generated client still satisfies the interface above.
@@ -123,7 +136,34 @@ var _ Transport = (*generated.Client)(nil)
 // do not take one from the caller: the wrapper is the only thing that constructs one
 // of these, so there is no path to a client that sends unauthenticated requests.
 func newTransport(baseURL, token string) (Transport, error) {
-	options := []generated.ClientOption{}
+	// THE REDIRECT POLICY IS NOT A DETAIL, and this is the one place it belongs.
+	//
+	// `net/http`'s default follows up to ten 3xx hops. That is right for a browser
+	// and wrong here twice over: `StartSocialLogin`'s 302 carries a third party's
+	// authorization endpoint, which is an instruction to a BROWSER and not a hop
+	// this client should make — following it turns a method that returns a URL into
+	// one that makes an authenticated request to Google — and every other operation
+	// in this document has no 3xx at all, so there is nothing else here to follow.
+	//
+	// `http.ErrUseLastResponse` rather than an error of our own, and the reason is
+	// that it is the one return value `net/http` documents as "give me the
+	// response": the 302 comes back with its `Location` intact and its body
+	// unread, and `StartSocialLogin` reads the header. Returning an error instead
+	// would discard the very thing the caller came for, and the wrapper would have
+	// no status to inspect — which is the shape of a transport that refuses to
+	// redirect rather than declining to follow one.
+	//
+	// What it costs, stated plainly: this is a policy change for the WHOLE client,
+	// not a per-call option, because `Transport`'s methods take no per-call
+	// `http.Client`. In practice it changes nothing else, because no other
+	// operation in this document answers 3xx — and if one starts to, refusing to
+	// follow it is the safe direction: a server choosing where this client goes
+	// next is not something a machine credential should be replayed across.
+	httpClient := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	options := []generated.ClientOption{generated.WithHTTPClient(httpClient)}
 	if token != "" {
 		options = append(options, generated.WithRequestEditorFn(
 			func(ctx context.Context, req *http.Request) error {

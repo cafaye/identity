@@ -1041,6 +1041,162 @@ func (c *Client) RevokeAccountInvitations(ctx context.Context, accountId openapi
 	return &out, err
 }
 
+// StartSocialLogin returns the URL a browser must be sent to.
+// Corresponds to `GET /v1/auth/oauth/{provider}`.
+//
+// **THIS IS NOT A CALL A MACHINE CLIENT MAKES, and the wrapper says so rather than
+// leaving it to be discovered.** The route answers a 302 with a `Location` and no
+// body, and the round trip it starts is finished by a *browser* arriving at
+// `CompleteSocialLogin` holding nothing but the `__Host-oauth-state` cookie this
+// service just set. What comes back here is the provider's address and that
+// cookie's name — which is useful for rendering a "Continue with Google" link and
+// for nothing else.
+//
+// The credential this client attaches to every request goes out with it, because
+// `newTransport` attaches it in one place rather than per call site. The route is
+// `security: []` and ignores it; a caller who wants the request not to carry an
+// `Authorization` header at all needs a transport of its own, and that is a
+// deliberate gap rather than an oversight — this surface is a browser's.
+//
+// An unresolvable provider name is a 404, and it is the SAME 404 as a name this
+// deployment has no credentials for, so nothing here distinguishes them and nothing
+// in this method's error does either.
+func (c *Client) StartSocialLogin(ctx context.Context, provider generated.StartSocialLoginParamsProvider) (string, error) {
+	res, err := c.transport.StartSocialLogin(ctx, provider)
+	if err != nil {
+		return "", c.transportError("startSocialLogin", err)
+	}
+	defer closeBody(res)
+
+	// THE 3xx IS HANDLED BEFORE ANY ERROR PATH, and the ordering is the whole of
+	// this method. A 302 is this operation's success, so it has to be recognised
+	// before the shared non-2xx branch below sees it — `ProblemFrom` would
+	// otherwise read a redirect as a malformed answer and report a proxy or a
+	// gateway, because a 302 carries no problem document. Same reason
+	// `CreateSession` reads its own status: `call` assumes one JSON shape per
+	// success and this operation's success is a header.
+	if res.StatusCode >= 300 && res.StatusCode < 400 {
+		location := res.Header.Get("Location")
+		if location == "" {
+			return "", &CallError{
+				Operation: "startSocialLogin", Status: res.StatusCode, redactor: c.redactor,
+				message: "the response carried no Location header, so there is nowhere to send " +
+					"the browser. The document promises a 302 with a Location and this answer is " +
+					"not one.",
+			}
+		}
+		return location, nil
+	}
+
+	body, readErr := io.ReadAll(io.LimitReader(res.Body, maxResponseBytes+1))
+	if readErr != nil {
+		return "", &CallError{
+			Operation: "startSocialLogin", Status: res.StatusCode, redactor: c.redactor,
+			message: c.redactor.String("the response body could not be read: " + readErr.Error()),
+		}
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return "", ProblemFrom("startSocialLogin", res.StatusCode, res.Header.Get("Content-Type"),
+			res.Header.Get(RetryAfterHeader), body, c.redactor)
+	}
+
+	// A 2xx from an operation whose success is a redirect is not a success this
+	// build knows how to read, and saying so beats handing back an empty string a
+	// caller would render as a sign-in button pointing at itself.
+	return "", &CallError{
+		Operation: "startSocialLogin", Status: res.StatusCode, redactor: c.redactor,
+		message: "this operation answers a redirect, and the document promises no 2xx for " +
+			"it. A 2xx here means something between this client and identity is not " +
+			"identity, so there is no Location to report.",
+	}
+}
+
+// CompleteSocialLogin finishes a social sign-in.
+// Corresponds to `GET /v1/auth/oauth/{provider}/callback`.
+//
+// **Three success shapes and this method returns the two that are not the same
+// thing**, which is why the signature is a pair rather than a generated struct:
+//
+//   - 200 with a `token` is a sign-in, and the caller now holds a session;
+//   - 202 is an account with a second factor — no session exists, and the challenge
+//     has to go to `POST /v1/session/mfa`. That is returned as an
+//     `*MFARequiredError` carrying the challenge, so the caller handling it does so
+//     with `errors.As` exactly as it does for `CreateSession`;
+//   - 200 with a `linked_provider` and NO token is the **link** path: a provider
+//     identity was attached to an account the caller was already signed in as, and
+//     nothing was minted. `Linked` is true and `Session` is nil, which is the only
+//     unambiguous reading available — the body has no `token` field at all, so a
+//     client that looked for an empty one would be inventing a state the service
+//     does not have.
+//
+// The refusal worth reading: **409 means the sign-in was refused, not completed.**
+// Either the provider identity belongs to another user, or — the one that matters —
+// the address the provider reported already belongs to an account here, in which
+// case this service refuses to sign into it and the caller must sign in locally.
+// That is the anti-account-takeover rule and this method does nothing clever with
+// it: it returns the problem document like any other.
+func (c *Client) CompleteSocialLogin(
+	ctx context.Context,
+	provider generated.CompleteSocialLoginParamsProvider,
+	params *generated.CompleteSocialLoginParams,
+) (*generated.Session, bool, error) {
+	res, err := c.transport.CompleteSocialLogin(ctx, provider, params)
+	if err != nil {
+		return nil, false, c.transportError("completeSocialLogin", err)
+	}
+	defer closeBody(res)
+
+	body, readErr := io.ReadAll(io.LimitReader(res.Body, maxResponseBytes+1))
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, false, ProblemFrom("completeSocialLogin", res.StatusCode,
+			res.Header.Get("Content-Type"), res.Header.Get(RetryAfterHeader), body, c.redactor)
+	}
+	if readErr != nil {
+		return nil, false, &CallError{
+			Operation: "completeSocialLogin", Status: res.StatusCode, redactor: c.redactor,
+			message: c.redactor.String("the response body could not be read: " + readErr.Error()),
+		}
+	}
+	if res.StatusCode == http.StatusAccepted {
+		return nil, false, MFARequiredFrom("completeSocialLogin", body, c.redactor)
+	}
+
+	// `linked_provider` is absent from the sign-in body and `token` is absent from
+	// the link body, so this is a check on which key the document promised and not a
+	// heuristic. Anything carrying both is a response this build does not recognise,
+	// and returning a session for it would be a guess.
+	var probe struct {
+		Token          *json.RawMessage `json:"token"`
+		LinkedProvider *string          `json:"linked_provider"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return nil, false, &CallError{
+			Operation: "completeSocialLogin", Status: res.StatusCode, redactor: c.redactor,
+			message: c.redactor.String("the response body is not JSON: " + err.Error()),
+		}
+	}
+	if probe.LinkedProvider != nil && probe.Token == nil {
+		return nil, true, nil
+	}
+
+	var session generated.Session
+	if err := json.Unmarshal(body, &session); err != nil {
+		return nil, false, &CallError{
+			Operation: "completeSocialLogin", Status: res.StatusCode, redactor: c.redactor,
+			message: c.redactor.String("the response body is not a session: " + err.Error()),
+		}
+	}
+	if session.Token == "" {
+		return nil, false, &CallError{
+			Operation: "completeSocialLogin", Status: res.StatusCode, redactor: c.redactor,
+			message: "a 200 from this operation carried neither a token nor a linked_provider. " +
+				"The document promises one of exactly two shapes, and a client that guessed " +
+				"which one it got would be reporting a completed sign-in that did not happen.",
+		}
+	}
+	return &session, false, nil
+}
+
 // itoa avoids importing strconv for one call in a message string.
 func itoa(n int) string {
 	if n == 0 {
