@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+#
+# Print the DOWN section of one migration, on stdout, for psql to run.
+#
+# THE MIRROR OF `bin/migration-up-section`, and it exists because the rollback
+# was never exercised: `tests/rollback.sh` applies every migration's Down
+# section in isolation and compares the schema against what the migration found
+# when it arrived. That comparison needs the Down sections as SQL, and the same
+# rule as the Up side applies — the annotations are COMMENTS, so a plain
+# `psql --file` runs BOTH halves (identity-31), and extraction is the only safe
+# delivery.
+#
+# WHERE IT DIFFERS FROM THE UP SIDE, and it is one line: extraction STARTS at
+# the Down marker and runs to the END of the file, because a Down section is
+# always last — the Up side stops AT the marker, this side starts AT it. The
+# same tolerance for spacing drift applies, for the same reason: the annotations
+# are hand-written across seventeen files and the spacing in them is exactly the
+# kind of thing that drifts.
+#
+# WHAT ARRIVES WHEN THERE IS NO DOWN SECTION: nothing, and an empty stream is a
+# fact the caller can act on. `tests/rollback.sh` treats it as a finding — a
+# migration with no Down is a deploy nobody can undo — and says so rather than
+# quietly counting the migration as rolled back. The Up side made the opposite
+# choice deliberately (a missing Down must not stop a forward apply); the two
+# choices are different because the questions are different.
+#
+# WHY IT IS A SEPARATE FILE: the same reason the Up side is — it is tested by
+# `TestTheDownSectionExtractorHandsPsqlTheUndoAndNotTheForwardApply` without a
+# database, and a test that needs a database to check an awk program is a test
+# that skips in exactly the environment where the bug ships.
+#
+# NO `set -e`: one job, awk is it, the caller reports failures with the
+# filename.
+
+set -uo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: bin/migration-down-section <migration.sql>" >&2
+  exit 2
+fi
+
+migration="$1"
+if [ ! -r "$migration" ]; then
+  echo "bin/migration-down-section: $migration is not readable" >&2
+  exit 2
+fi
+
+awk '/^--[[:space:]]*\+goose[[:space:]]+Down/ { down = 1; next } /^--[[:space:]]*\+goose[[:space:]]+Statement/ { if (down) next } down { print }' "$migration"

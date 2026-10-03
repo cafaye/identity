@@ -6,6 +6,107 @@ All notable changes to identity are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed (packet registry-identity-down-05: `goose up` could not succeed on CI, and seventeen Down sections had never been run)
+
+**Two findings, and the first one is why the second one was possible.**
+
+**1. CI could not apply this service's migrations at all.** Since packet
+identity-account-scope-01 (`e323247`), `migrations/00016_account_isolation.sql`
+ends its Up with `select cafaye.protect_table('account_users')`.
+`protect_table` defaults its login role to `current_user || '_app'` and refuses
+to write a policy for a role that cannot log in — so the migration asks the
+cluster for a role named `identity_app`.
+
+`docker compose up` has always provided it: kit's cluster init reads
+`KIT_POSTGRES_DATABASES: identity` and provisions `<service>_app` beside each
+`<service>`. **`.github/workflows/ci.yml` did not.** This repository's CI runs a
+bare `postgres:17-alpine` *service container*, which has no init script and no
+`KIT_POSTGRES_DATABASES`, so the only role on that cluster is the one
+`POSTGRES_USER` made. Measured, not predicted — applying these migrations to a
+cluster built exactly the way this job builds one:
+
+```
+ERROR:  cafaye.protect_table(account_users, identity_app):
+        identity_app is not a LOGIN role on this cluster.
+```
+
+The gap was invisible locally and fatal in CI, which is the worst shape a gap
+can have: every laptop run took the production path, so nothing looked wrong,
+and the job that could not build the service was the job nobody runs by hand.
+
+The role is provisioned now, in a step of its own **before** `goose up`, and
+`TestTheLoginRoleTheMigrationsProtectTablesForIsProvisionedBeforeTheyAreApplied`
+derives the name from the service container's `POSTGRES_USER` rather than
+repeating it — so renaming the database in `docker-compose.yml` cannot quietly
+un-provision it, and the assertion is on the ORDER, because a role created after
+the migrations run cannot be one they used.
+
+**The role stays out of the migrations, deliberately.**
+`TestNoMigrationCreatesAClusterRole` fails on any migration that says `create
+role`. A migration that provisioned its own roles would need `CREATEROLE`, would
+recreate a role an operator had dropped on purpose, and would leave a role no
+`goose down` could remove. Roles are the environment's; four homes provision
+them (`docker-compose.yml`, kit's cluster init, this workflow, `bin/rollback`)
+and the check is what says a fifth is not allowed.
+
+**2. `bin/rollback` — a gate tier that undoes every migration, one at a time.**
+
+```sh
+for N in 00001..00017:
+    apply Up N      -> census the schema as A_N
+    apply Down N    -> census it as C_N
+    assert C_N == A_{N-1}
+    apply Up N      -> a rollback an operator cannot redeploy over is not a rollback
+```
+
+The property is per-migration, so one pass and one database carry it: after each
+assertion the database is in the state the next migration's Up expects. Compared
+across **tables, views, materialized views, sequences, types, functions (by full
+signature, so overloads stay distinct), triggers, policies, indexes and
+columns**, in every schema but the system's.
+
+The first run was green — identity's seventeen Down sections are correct — and
+getting there meant fixing three defects in the harness itself, each of which
+had been reporting a clean tree:
+
+- **The census looked only at schema `cafaye`.** `00016` is the only file that
+  says `create schema`, and it says it for its eight functions. The eighteen
+  tables, their indexes and their twenty policies are created by unqualified
+  `CREATE TABLE`, which lands them in `public`. The first draft counted eight
+  functions and nothing else. Deleting one `drop policy` from `00016`'s Down —
+  the exact defect this packet exists to catch — left it green.
+
+- **`00016`'s Down ended in `drop schema cafaye cascade`, which was hiding the
+  gap.** A policy is a *dependent* object, not a member: each of the twenty
+  policies names `cafaye.current_account_id()` in its expression, so `cascade`
+  swept every policy whose own `drop` was missing. The cascade is gone, the
+  eight functions are named and dropped in dependency order, and the schema goes
+  last and bare — so a forgotten statement is now Postgres refusing to drop a
+  schema something still depends on, which is an error naming itself.
+
+- **The census tracked no columns.** A Down that drops a column a *different*
+  migration added is invisible: `alter table sessions drop column user_agent;`
+  in `00017`'s Down, `user_agent` belonging to `00003`, left the before and after
+  censuses byte-identical and the harness called all seventeen clean.
+
+It runs in CI after `goose up`, with `IDENTITY_ROLLBACK_REQUIRED=1` so the step
+can never exit zero by standing down; with no server it prints a counted `skip:`
+and exits 0, because a gate that also migrates is a gate whose result depends on
+the state of a database.
+
+**Sixteen mutations, each reverted, each caught by a named failure.** Ten against
+the Go checks in `internal/platform/ci` (delete the provisioning step; move it
+after `goose up`; build the role name from the service container's environment,
+which the job does not have; drop `IDENTITY_ROLLBACK_REQUIRED`; delete the
+rollback step; delete a migration's Down marker; put `create role` in a
+migration; hardcode the role name in the script; drop the `rolcanlogin` half of
+its role probe) and six against `bin/rollback` itself. Three **survived**, and
+those three are the ones that earned the fixes above: restoring `cascade` hides a
+forgotten policy drop; narrowing the census to `cafaye` hides a forgotten index
+drop; and the re-apply step could not be made to go red on this tree at all —
+every defect the census sees is caught before it — which is recorded rather than
+papered over.
+
 ### Changed (packet polyglot-numeric: three numeric enums become counts, and the generated Go types with them)
 
 **`caf contract lint` refuses numeric enums, and three fields in this document

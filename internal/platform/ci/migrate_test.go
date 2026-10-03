@@ -238,3 +238,73 @@ func readAll(t *testing.T, path string) string {
 	}
 	return string(b)
 }
+
+// TestTheDownSectionExtractorHandsPsqlTheUndoAndNotTheForwardApply is the Down
+// twin of the test above, written on the day `tests/rollback.sh` needed the
+// Down sections as SQL and the Up extractor could not be bent to produce them
+// without becoming two programs in one file.
+//
+// The fixture is a scratch migration in a temp dir rather than a real file from
+// migrations/, on purpose: the extractor's contract is about MARKERS, and the
+// day the contract changes is the day a hand-written annotation drifts — which
+// no real file predicts, because the real files are exactly the input whose
+// drift the tolerance exists for. The fixture carries the drift deliberately:
+// no space after `--`, two before `+goose`, and a Down marker that appears
+// inside a comment body, which the anchored cut must not mistake for the cut.
+func TestTheDownSectionExtractorHandsPsqlTheUndoAndNotTheForwardApply(t *testing.T) {
+	root := repoRoot(t)
+	dir := t.TempDir()
+	migration := filepath.Join(dir, "00099_scratch.sql")
+	body := "-- +goose Up\n" +
+		"-- +goose StatementBegin\n" +
+		"CREATE TABLE scratch (id int);\n" +
+		"-- +goose StatementEnd\n" +
+		"-- a comment that MENTIONS +goose Down in prose, and must survive\n" +
+		"--+goose   Down\n" +
+		"-- +goose StatementBegin\n" +
+		"DROP TABLE scratch;\n" +
+		"-- +goose StatementEnd\n"
+	if err := os.WriteFile(migration, []byte(body), 0o644); err != nil {
+		t.Fatalf("writing the scratch migration: %v", err)
+	}
+
+	out, err := exec.Command(filepath.Join(root, "bin", "migration-down-section"), migration).Output()
+	if err != nil {
+		t.Fatalf("bin/migration-down-section: %v", err)
+	}
+	got := string(out)
+
+	for _, want := range []string{"DROP TABLE scratch;"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the Down section is missing %q; the extractor produced:\n%s", want, got)
+		}
+	}
+	for _, absent := range []string{
+		"CREATE TABLE scratch", // the Up half must not come along
+		"MENTIONS",             // and neither must the Up half's comments
+	} {
+		if strings.Contains(got, absent) {
+			t.Errorf("the extractor produced %q, which belongs to the Up half:\n%s", absent, got)
+		}
+	}
+	if !strings.Contains(got, "DROP TABLE") || strings.Contains(got, "+goose Statement") {
+		t.Errorf("the goose Statement markers are SQL noise psql would have to skip; "+
+			"the extractor strips them on the Up side and must here too:\n%s", got)
+	}
+
+	// And the empty case, because the caller treats it as a FINDING: a
+	// migration with no Down section must produce no bytes rather than the
+	// whole file, which is what a start-marker-less awk would print.
+	noDown := filepath.Join(dir, "00098_scratch_nodown.sql")
+	if err := os.WriteFile(noDown, []byte("-- +goose Up\nCREATE TABLE scratch2 (id int);\n"), 0o644); err != nil {
+		t.Fatalf("writing the Down-less migration: %v", err)
+	}
+	out, err = exec.Command(filepath.Join(root, "bin", "migration-down-section"), noDown).Output()
+	if err != nil {
+		t.Fatalf("bin/migration-down-section on a Down-less file: %v", err)
+	}
+	if len(strings.TrimSpace(string(out))) != 0 {
+		t.Errorf("a migration with no Down section produced output:\n%s\n"+
+			"an empty stream is the fact the rollback check acts on", out)
+	}
+}

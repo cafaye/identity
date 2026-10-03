@@ -298,7 +298,29 @@ jobs:
       # `go test -json -count=1 ./...` against a real postgres:17-alpine with
       # migrations applied, counting per-package PASS events rather than reading
       # a summary line — the same partition the check below computes.
-      SUITE_FLOOR: '2020'
+      # 1989 PASS lines, then 2020. The next measurement — registry-identity-down-05,
+      # 2026-10-04, same command, same database tier, from a complete log — is
+      # 2292 on this branch's BASE and 2301 with the packet applied, and the
+      # difference between those two numbers is not all this packet's:
+      #
+      #   +7  the tests it added — `TestTheDownSectionExtractorHandsPsqlTheUndoAndNotTheForwardApply`
+      #       in migrate_test.go, and the six in rollback_test.go
+      #   +2  environment, not code. `TestCouriersTypesAgreeWithCouriersDocument`
+      #       reads `../../courier/openapi.yaml` beside the checkout and reports
+      #       rather than skips when it is not there, so the base was measured from
+      #       a bare worktree with no sibling courier repository and that test was
+      #       red — which costs the log one PASS line and its subtests two more.
+      #       Measured both ways rather than assumed: the in-tree count is 2301 on
+      #       two consecutive runs, byte-identical per package.
+      #
+      # The floor is 2299 — the base plus this packet's seven — and NOT 2301, on
+      # purpose. 2301 is what this machine sees with courier's sibling checkout
+      # present; the runner may not have it. A floor set from a measurement the
+      # runner cannot reproduce installs a red that fires on a green tree, which
+      # is the one failure this file is built to avoid, so the two lines of
+      # headroom stay and what they buy is named here rather than left as a
+      # mystery margin.
+      SUITE_FLOOR: '2299'
       DATABASE_TIER_FLOOR: '1732'
       MODULE: github.com/cafaye/identity
       # # THE ONE PERMITTED SKIP, AND WHY IT IS A LIST AND NOT A RULE
@@ -388,6 +410,48 @@ jobs:
           go install github.com/pressly/goose/v3/cmd/goose@v3.28.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
+      # ---------------------------------------------------------------------
+      # THE ROLE THE MIGRATIONS POLICY AGAINST, PROVISIONED BEFORE THEY RUN.
+      # ---------------------------------------------------------------------
+      - name: provision the role the migrations protect tables for
+        # THIS STEP WAS MISSING, AND ITS ABSENCE IS WHY `apply the migrations`
+        # BELOW FAILED ON THIS WORKFLOW. `migrations/00016_account_isolation.sql`
+        # ends its Up with `select cafaye.protect_table('account_users')`, and
+        # `protect_table` defaults its login role to `current_user || '_app'`
+        # and REFUSES to create a policy for a role that cannot log in. So the
+        # migration asks for a role named `identity_app`.
+        #
+        # `docker compose up` has always created it — kit's cluster init reads
+        # `KIT_POSTGRES_DATABASES` and provisions `<service>_app` beside each
+        # `<service>` — which is why nobody noticed: on a laptop the migration
+        # takes the path it takes in production. THIS JOB RUNS A PLAIN
+        # `postgres:17-alpine` SERVICE CONTAINER, WHICH HAS NO INIT SCRIPT AND NO
+        # `KIT_POSTGRES_DATABASES`, so the only role on the cluster is the one
+        # `POSTGRES_USER` made. Measured, not predicted: applying these
+        # migrations to a cluster built exactly like this one fails at 00016 with
+        #
+        #     ERROR: cafaye.protect_table(account_users, identity_app):
+        #            identity_app is not a LOGIN role on this cluster.
+        #
+        # The role is ENVIRONMENT, NOT SCHEMA, so it is provisioned here, in
+        # docker-compose.yml, by kit's cluster init and in bin/rollback — never
+        # by a migration. A migration that created its own roles would need
+        # CREATEROLE, would quietly recreate a role an operator had dropped on
+        # purpose, and would leave a role no `goose down` could remove.
+        #
+        # `TestTheLoginRoleTheMigrationsProtectTablesForIsProvisionedBeforeTheyAreApplied`
+        # derives the name from the service container's `POSTGRES_USER` rather
+        # than repeating it, so this block and the migrations cannot drift apart
+        # unnoticed. The name is written out here because a service container's
+        # environment is NOT this job's environment — `$POSTGRES_USER` inside a
+        # `run:` block is the empty string, and the first draft of this step used
+        # it, which would have created a role called `_app`.
+        run: |
+          set -euo pipefail
+          psql "$DATABASE_URL" -X -q --set ON_ERROR_STOP=1 --no-psqlrc \
+            -c "create role identity_app login password 'identity'"
+          echo "provisioned identity_app: the role 00016's policies are written for"
+
       - name: apply the migrations
         # The step whose position in this file is the point. Without it the suite
         # dies on `relation "public.users" does not exist` — loud, but a red that
@@ -399,6 +463,20 @@ jobs:
           goose -dir migrations postgres "$DATABASE_URL" up
           echo
           goose -dir migrations postgres "$DATABASE_URL" status
+
+      - name: roll each migration back, and forward again
+        # SEVENTEEN DOWN SECTIONS, NONE OF WHICH ANYTHING EVER RAN. A Down is
+        # code that sits beside an Up every CI run exercises, and reads as though
+        # it were exercised too. `bin/rollback` builds a throwaway database on
+        # this same server, applies each migration, undoes it, asserts the schema
+        # afterwards is the schema its Up found, and applies it again — so a Down
+        # that forgets an object, or reaches into a migration that is still
+        # applied, is a red that names the migration. `IDENTITY_ROLLBACK_REQUIRED=1`
+        # is redundant on a job that has just handed this step a URL, and
+        # deliberate: it means this step can never exit 0 by standing down.
+        run: |
+          set -euo pipefail
+          IDENTITY_ROLLBACK_URL="$DATABASE_URL" IDENTITY_ROLLBACK_REQUIRED=1 ./bin/rollback
 
       # ---------------------------------------------------------------------
       # THE GATE. The command a developer runs, unmodified.

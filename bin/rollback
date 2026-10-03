@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+#
+# bin/rollback — CAN THIS SCHEMA BE UNDONE, ONE MIGRATION AT A TIME?
+#
+# ============================================================================
+# THE PROPERTY, AND WHY IT HAS NEVER BEEN CHECKED HERE
+# ============================================================================
+#
+# Every one of this repository's seventeen migrations carries a `-- +goose Down`
+# section, and before registry-identity-down-05 **nothing in the repository or
+# in CI ever applied one**. A Down section is code that has never run until
+# something runs it: it sits beside an Up that every CI run exercises, it reads
+# like it was exercised too, and it is a paragraph of guessed `drop` statements.
+# pantry's registry-migdown-04 found the defect that follows — a policy whose
+# drop was forgotten arrested a whole rollback mid-way — and this file is the
+# transplant of that check, adapted to identity's shapes and strengthened.
+#
+# THE PROPERTY IS PER-MIGRATION:
+#
+#     for N in 00001..00017:
+#         apply Up N            -> record the schema's objects as A_N
+#         apply Down N          -> record the schema's objects as C_N
+#         assert C_N == A_{N-1}   (A_0 is "empty")
+#
+# One pass, one database: after the assertion holds, the state IS the base the
+# next migration's Up expects, so the loop carries itself forward. A Down that
+# forgets an object shows up as C_N containing something A_{N-1} does not, and
+# the migration is NAMED. A Down that errors stops the run loudly. And a Down
+# that reaches BEYOND its own migration — identity has one: 00016's Down ends in
+# `drop schema if exists cafaye cascade`, which would take the tables of
+# 00002..00015 with it in the middle of a `goose down` — is caught by the same
+# comparison, because C_16 would be MISSING A_15's objects. The cascade is not a
+# stylistic quibble: goose rolls back exactly one migration, and a Down that
+# destroys migrations still recorded as applied leaves a database whose
+# bookkeeping says one thing and whose contents say another.
+#
+# WHAT IS COMPARED: tables, views, materialized views, sequences, types (the
+# non-array kinds), functions (by full signature, so overloads are distinct),
+# triggers, policies and indexes — the union pantry's J1 checks, extended with
+# the two kinds identity's migrations actually create. A kind nobody enumerated
+# still shows up if it is in the union, which is why the union is written wide.
+#
+# ============================================================================
+# WHY THIS IS A CI STEP AND NOT PART OF ./bin/prime
+# ============================================================================
+#
+# `bin/migrate`'s header rules it: a gate that also migrates is a gate whose
+# result depends on the state of a database, and a developer's second run is not
+# comparable to their first. pantry reaches a different answer because pantry's
+# gate owns a scratch cluster; identity's gate deliberately does not touch a
+# database at all, and this file does not overrule that decision — it runs in CI
+# after `goose up`, where a PostgreSQL already exists, and locally on demand
+# against any server the caller names. On a machine with no server it prints a
+# counted skip and exits 0, unless IDENTITY_ROLLBACK_REQUIRED=1 turns the skip
+# into a red — the same pair of contracts pantry's data path keeps, because a
+# check that stands down silently is a check nobody can tell from one that ran.
+#
+# RUN IT:
+#   IDENTITY_ROLLBACK_URL=postgres://user:pass@host:5432/postgres bin/rollback
+#
+set -uo pipefail
+
+URL="${IDENTITY_ROLLBACK_URL:-}"
+REQUIRED="${IDENTITY_ROLLBACK_REQUIRED:-0}"
+
+if [ -z "$URL" ]; then
+  echo "skip: IDENTITY_ROLLBACK_URL is not set, so the rollback was not exercised" >&2
+  echo "      (set it to any PostgreSQL server this user may create databases on;" >&2
+  echo "       IDENTITY_ROLLBACK_REQUIRED=1 turns this skip into a red)" >&2
+  if [ "$REQUIRED" = "1" ]; then
+    echo "bin/rollback: IDENTITY_ROLLBACK_REQUIRED=1 and there is no server to check against" >&2
+    exit 3
+  fi
+  exit 0
+fi
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+MIGRATIONS=("$ROOT"/migrations/[0-9]*.sql)
+COUNT="${#MIGRATIONS[@]}"
+
+DB="identity_rollback_check"
+
+# THE CALLER'S OWN NAME, read out of the URL. This is load-bearing rather than
+# bookkeeping: 00016's Up calls `cafaye.protect_table('account_users')` with no
+# second argument, and `protect_table`'s default is `current_user || '_app'` —
+# so the role the migration needs is named after WHOEVER IS CONNECTED.
+CALLER="${URL#*://}"
+CALLER="${CALLER%%@*}"
+APP_ROLE="${CALLER}_app"
+
+SCRATCH="${URL%/*}/$DB"
+DB_URL="$SCRATCH"
+
+# THE ROLE IS A FIXTURE, AND THIS IS WHERE THE FIRST DRAFT LEARNED IT.
+#
+# Without this, the first draft ran against a scratch cluster as `postgres` and
+# 00016 failed at `protect_table` with
+#
+#     ERROR: cafaye.protect_table(account_users, postgres_app):
+#            postgres_app is not a LOGIN role on this cluster.
+#
+# That is not a rollback finding. It is the harness wearing a cluster's clothes:
+# the role belongs to the ENVIRONMENT, which is why no migration creates it —
+# `KIT_POSTGRES_DATABASES: identity` provisions it, docker-compose.yml gets it
+# from that, and .github/workflows/ci.yml now provisions it in one step of its
+# own. So this file provisions it too, and does NOT pretend to own the service
+# role: the first draft created `identity` fresh as a superuser, which meant
+# that on the very cluster where `identity` already existed and owned the
+# service database, the drop in the pre-clean failed (a role cannot be dropped
+# while it owns anything), the create then failed, and the harness refused to
+# run. Connecting AS the caller and creating only `<caller>_app` is the same
+# topology CI has — superuser `identity`, login `identity_app`, owner
+# `identity` — and it cannot collide with a role that is already there.
+#
+# IF THE ROLE ALREADY EXISTS it is left alone and NOT dropped on the way out.
+# On CI it was created by the step above and something else may be using it; a
+# schema check that deleted a cluster role would be the harness damaging the
+# environment it was pointed at.
+created_app_role=0
+
+provision() {
+  local out
+  # `-t -A` AND NOT the admin helper above, which is aligned and headed: this
+  # output is COMPARED, and psql's own column name would arrive in front of the
+  # `1`. Measured — the first draft ran this through scratch_sql, whose output is
+  # `?column? / 1 / (1 row)`, so the comparison never matched and the script
+  # tried to create a role that was already there and died on it.
+  out="$(psql "$URL" -X -q -t -A --no-psqlrc --set ON_ERROR_STOP=1 \
+          -c "select 1 from pg_roles where rolname = '$APP_ROLE' and rolcanlogin" 2>&1)" || {
+    echo "bin/rollback: could not ask the cluster about the $APP_ROLE role: $out" >&2
+    exit 3
+  }
+  if [ "$(printf '%s' "$out" | tr -d '[:space:]')" = "1" ]; then
+    echo "rollback: reusing the cluster's existing $APP_ROLE login role"
+    return 0
+  fi
+  out="$(scratch_sql "create role \"$APP_ROLE\" login password '$FIXTURE_PASSWORD'" 2>&1)" \
+    || { echo "bin/rollback: could not create the $APP_ROLE role: $out" >&2
+         echo "              (the caller needs CREATEROLE — a fleet cluster's service role has it," >&2
+         echo "               or docker compose's cluster already provides it)" >&2
+         exit 3; }
+  created_app_role=1
+}
+
+# A password, because PostgreSQL will not authenticate a role with no password
+# over TCP. It is written down here and it belongs to a role that owns nothing
+# in a schema this file builds and destroys inside this run.
+FIXTURE_PASSWORD="rollback_check"
+
+# EVERY psql AGAINST THE SCRATCH DATABASE GOES THROUGH HERE, with the caller's
+# own credentials — read out of the URL by psql itself, so no password is ever
+# parsed out of, or spliced into, an address in this file.
+scratch() { psql "$SCRATCH" "$@"; }
+
+# THE SERVER IS REACHED FIRST, with a statement rather than a connection probe,
+# because "cannot connect" and "connected but cannot create a database" are
+# different sentences and the caller needs the right one.
+if ! psql "$URL" -X -q --no-psqlrc -c "select 1" >/dev/null 2>&1; then
+  echo "bin/rollback: cannot reach the server at $URL" >&2
+  exit 3
+fi
+
+# THROUGH psql, AND NOT THROUGH dropdb/createdb: those tools do not read a
+# libpq URL — they take a database NAME and read PGHOST/PGPORT/PGUSER — so the
+# first draft of this file created the scratch database on whatever server the
+# machine's defaults pointed at, and the census then failed with "database does
+# not exist" against the server that was actually named. psql parses the URL
+# itself, and one tool parsing the address is one answer to where the scratch
+# database lives.
+scratch_sql() { psql "$URL" -X -q --no-psqlrc --set ON_ERROR_STOP=1 -c "$1"; }
+
+# A previous run's leftovers, if it died before its trap. Only the scratch
+# DATABASE: a cluster role is cluster-wide, and a previous run's `<caller>_app`
+# is indistinguishable from the one a real cluster shipped — `provision` below
+# reuses it rather than replacing it, which is the same decision as not
+# dropping it.
+scratch_sql "drop database if exists \"$DB\"" || {
+  echo "bin/rollback: could not drop a previous scratch database" >&2
+  exit 3
+}
+scratch_sql "create database \"$DB\"" || {
+  echo "bin/rollback: could not create the scratch database (does this user hold CREATEDB?)" >&2
+  exit 3
+}
+
+# PROVISION BEFORE THE FIRST APPLY, and arm the trap immediately afterwards so a
+# run that dies at 00016 does not leave a login role behind on a cluster.
+provision
+cleanup() {
+  psql "$URL" -X -q --no-psqlrc -c "drop database if exists \"$DB\"" >/dev/null 2>&1 || true
+  # ONLY THE ROLE THIS RUN MADE, and only after the database it might own is
+  # gone. On a fleet cluster `<service>_app` was already there and is
+  # load-bearing for a running identity; dropping it because somebody ran a
+  # schema check would be the harness damaging the environment it was pointed at.
+  if [ "$created_app_role" = "1" ]; then
+    psql "$URL" -X -q --no-psqlrc -c "drop role if exists \"$APP_ROLE\"" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+# THE OBJECT CENSUS. One row per object, `kind name`, sorted — a set, printed
+# identically every time, diffable line by line.
+#
+# EVERY SCHEMA BUT THE SYSTEM'S, and this is the second time this file was wrong
+# in the same place. The first draft filtered on `nspname = 'cafaye'`, because
+# that is the schema this repository's substrate lives in and it read like the
+# answer. It is not: `migrations/00016_account_isolation.sql` is the ONLY file
+# that says `create schema`, and it does so for its seven functions — the
+# eighteen tables, their indexes, triggers and policies are created by
+# unqualified `CREATE TABLE account_users`, which lands them in `public`. The
+# census therefore saw eight functions and NOTHING ELSE, and reported all
+# seventeen migrations clean — a verdict about the one eighth of the schema that
+# 00016 happened to put in its own schema.
+#
+# MEASURED, not reasoned: the first draft's census returned 8 rows against a
+# fully migrated database that holds 18 tables, 6 substrate indexes and 20
+# policies. Deleting one `drop policy` from 00016's Down — the exact defect the
+# pantry packet was written to catch — left the harness green.
+#
+# So: everything except `pg_catalog`, `information_schema`, `pg_toast` and the
+# per-session `pg_temp_*`. Not `public and cafaye` either, because the next
+# migration to create a schema would then be invisible for the same reason.
+#
+# COLUMNS ARE IN THE UNION, and they are in it because a Down that drops a column
+# somebody else's migration created is otherwise a silent success. Measured: add
+# `alter table sessions drop column user_agent;` — `user_agent` belongs to
+# 00003, and the statement belongs to 00017's Down — and the census-before and
+# census-after are byte-identical, because a column is not a pg_class row. The
+# harness reported all seventeen migrations clean while 00017 quietly destroyed
+# a column of 00003's table, which is precisely the class of defect this file
+# exists to find and precisely the one a Down is likeliest to contain: a Down
+# that names a column it has forgotten who added.
+#
+# `attnum > 0 and not attisdropped` so a dropped column is absent rather than
+# present-and-empty — the two are different histories and a rollback that only
+# emptied a column should not read as one that removed it.
+census() {
+  scratch -X -t -A --no-psqlrc -c "
+    with live as (
+      select n.nspname
+        from pg_namespace n
+       where n.nspname not in ('pg_catalog','information_schema','pg_toast')
+         and n.nspname not like 'pg_temp_%'
+         and n.nspname not like 'pg_toast_temp_%'
+    )
+    select what || ' ' || name from (
+      select 'table'    as what, c.relname as name from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+        join live l on l.nspname = n.nspname
+       where c.relkind = 'r'
+      union all
+      select 'view', c.relname from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+        join live l on l.nspname = n.nspname
+       where c.relkind in ('v','m')
+      union all
+      select 'sequence', s.relname from pg_class s
+        join pg_namespace n on n.oid = s.relnamespace
+        join live l on l.nspname = n.nspname
+       where s.relkind = 'S'
+      union all
+      select 'type', t.typname from pg_type t
+        join pg_namespace n on n.oid = t.typnamespace
+        join live l on l.nspname = n.nspname
+       where t.typtype in ('e','c','d','r','m')
+      union all
+      select 'function', p.oid::regprocedure::text from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+        join live l on l.nspname = n.nspname
+      union all
+      select 'trigger', t.tgname from pg_trigger t
+        join pg_class c on c.oid = t.tgrelid
+        join pg_namespace n on n.oid = c.relnamespace
+        join live l on l.nspname = n.nspname
+       where not t.tgisinternal
+      union all
+      select 'policy', pol.polname from pg_policy pol
+        join pg_class c on c.oid = pol.polrelid
+        join pg_namespace n on n.oid = c.relnamespace
+        join live l on l.nspname = n.nspname
+      union all
+      select 'index', i.relname from pg_class i
+        join pg_index x on x.indexrelid = i.oid
+        join pg_class c on c.oid = x.indrelid
+        join pg_namespace n on n.oid = c.relnamespace
+        join live l on l.nspname = n.nspname
+      union all
+      select 'column', a.attname from pg_attribute a
+        join pg_class c on c.oid = a.attrelid
+        join pg_namespace n on n.oid = c.relnamespace
+        join live l on l.nspname = n.nspname
+       where a.attnum > 0 and not a.attisdropped
+    ) s order by 1;"
+}
+
+apply() { # apply <up|down> <file> — one section on stdin, ON_ERROR_STOP set
+  local half="$1" file="$2"
+  if [ "$half" = up ]; then
+    "$ROOT/bin/migration-up-section" "$file"
+  else
+    "$ROOT/bin/migration-down-section" "$file"
+  fi | scratch -X -q --set ON_ERROR_STOP=1 --no-psqlrc
+}
+
+echo "rollback: $COUNT migrations, one Down at a time, against ${URL%%\?*}"
+
+A_PREV="$(census)"   # A_0: empty (no migrations applied yet)
+failures=0
+applied=0
+
+# THE LOOP CARRIES THE FULL STACK FORWARD, and the first draft did not. A
+# migration's Up is written against the state its predecessors left — 00003's
+# Up references 00002's `users` — so measuring N's rollback and then running
+# N+1's Up on the ROLLED-BACK state measures nothing: N+1 fails on a missing
+# table and the finding is an artifact of the harness. So each iteration:
+# apply Up N (stack grows), census, apply Down N, census, compare, and — the
+# step that makes the next iteration honest — apply Up N AGAIN, which is also
+# the "rollback of N, then redeploy N" property an operator actually asks
+# about. Cost: three applies per migration instead of one; each is a single
+# psql round trip and the whole run is a few seconds.
+for migration in "${MIGRATIONS[@]}"; do
+  name="$(basename "$migration")"
+
+  if ! apply up "$migration"; then
+    echo "FAIL  $name: the UP section does not apply" >&2
+    failures=$((failures + 1))
+    break
+  fi
+  applied=$((applied + 1))
+  A_THIS="$(census)"
+
+  # THE MARKER IS THE FINDING, NOT AN EMPTY BODY. 00001 is a marker migration
+  # whose Up creates nothing, so its Down is legitimately empty — a no-op's
+  # undo is a no-op, and the census comparison below verifies exactly that.
+  # What the check refuses is a file with NO Down marker at all: the extractor
+  # would print nothing for it, the rollback would silently skip its undo, and
+  # nothing downstream could tell that from a no-op. The first draft tested
+  # the wrong thing and went red on 00001 — measured, not assumed.
+  if ! grep -qE '^--[[:space:]]*\+goose[[:space:]]+Down' "$migration"; then
+    echo "FAIL  $name: has NO -- +goose Down marker — a deploy nobody can undo" >&2
+    failures=$((failures + 1))
+    break
+  fi
+  down_body="$("$ROOT/bin/migration-down-section" "$migration")"
+  if ! out="$(printf '%s\n' "$down_body" | scratch -X -q --set ON_ERROR_STOP=1 --no-psqlrc 2>&1)"; then
+    echo "FAIL  $name: the DOWN section errors" >&2
+    printf '%s\n' "$out" | grep -E 'ERROR' | head -3 | sed 's/^/        /'
+    failures=$((failures + 1))
+    break
+  fi
+  C_THIS="$(census)"
+
+  if [ "$C_THIS" != "$A_PREV" ]; then
+    echo "FAIL  $name: the schema after its Down is not the schema its Up found" >&2
+    diff <(printf '%s\n' "$A_PREV") <(printf '%s\n' "$C_THIS") \
+      | grep -E '^[<>]' | head -12 | sed 's/^/        /'
+    failures=$((failures + 1))
+    # The loop cannot continue honestly on a drifted base: the next Up would be
+    # applied to a state that is not the one it was written against.
+    break
+  fi
+
+  if ! apply up "$migration"; then
+    echo "FAIL  $name: does not re-apply after its own rollback — the rollback-then-redeploy path is broken" >&2
+    failures=$((failures + 1))
+    break
+  fi
+
+  A_PREV="$A_THIS"
+done
+
+if [ "$failures" -eq 0 ]; then
+  echo "rollback: $applied migrations, each rolled back and re-applied with zero leftovers"
+else
+  echo "rollback: $failures failure(s) — see the named migrations above"
+fi
+
+if [ "$failures" -eq 0 ]; then exit 0; else exit 1; fi
