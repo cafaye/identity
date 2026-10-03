@@ -403,7 +403,67 @@ One member that describes *"reachable only with the caller's own credential,
 which resolves no account"* closes this, and would let `none` mean what the schema
 says it means.
 
-### 6.6 `account-scope.stale`'s message blames the author for the checker's reach
+### 6.7 A Hono route with an inline handler cannot be declared either way — measured on `guard`
+
+Found by doing the follow-on work §11 describes, not by reading the checker.
+`guard`'s `GET /v1/me` is `app.get("/v1/me", (c) => c.json(c.get("principal")))`.
+It resolves an account — `requireJwt` verifies the bearer token and
+`principalOf` reads `payload.account_id` at `src/middleware/jwt.ts:346` — and it
+returns that account to the caller. **Both available declarations are FAILURES:**
+
+```
+accountScoped: true, accountFrom: { via: requireJwt, file: src/middleware/jwt.ts, line: 346 }
+FAIL account-scope.scoping-bypassed: me: registered at src/index.ts:187,
+     which does not go through requireJwt
+
+accountScoped: false, reason: public
+FAIL account-scope.declaration-contradicts-code: me (GET /v1/me) is declared
+     accountScoped: false with reason 'public', and the registration line itself
+     resolves an account, in an inline handler — the framework puts the whole
+     handler here: `app.get("/v1/me", (c) => c.json(c.get("principal")));`
+```
+
+The first is **false**, and the file's own comment at `src/index.ts:157` is why:
+the JWT gate is `app.use("/v1/*", …)` at line 160, twenty-seven lines above the
+route, and *"Hono matches handlers in registration order and a route registered
+before a `use` answers first and never calls `next`"*. A route registered **after**
+a `use` is behind it, so the registration line says nothing about scoping.
+
+That is exactly the reasoning behind `Recogniser.carries_handler = False` for
+Phoenix and axum — *"for those two the route's own line says nothing about
+scoping, and reporting it would report courier's real router as unscoped — a rule
+that cries wolf on correct code is the same defect as one that stays quiet on
+broken code."* **A Hono route whose handler is an inline arrow function is the
+third member of that set and is not in it.**
+
+The proposed fix is one field, and it is decidable from the line rather than
+guessed: a registration line whose handler position is an inline function literal
+carries no middleware, so `carries_handler` should be decided for **that
+registration**, the way `handler_is_readable` already is — which is the mechanism
+this same file already got right for a different question.
+
+`guard`'s declaration therefore ships with `GET /v1/me` named and omitted, and
+answers `account-scope.undeclared` — a finding whose text is **true**. That is the
+better of the three available outcomes: a false `scoping-bypassed` in a second
+repository would be the exact thing core's docs say gets guards switched off.
+
+### 6.8 §6.3 is not a Go problem — it is 8 of 31 across the two adopters
+
+Measured on `guard` as well: **6 of its 6** `false` rows warn
+`contradiction-unreadable`, for the same two causes as identity's 2 —
+
+* `GET /healthz` is `app.get("/healthz", (c) => c.json({ status: "ok" }))`. The
+  handler is an inline arrow, and `_last_symbol` walks the line **backwards** and
+  returns `ok`; a bare symbol then hits the `tail != symbol` guard in
+  `_file_defining` and is never searched for.
+* `GET /auth/me` is `bff.me` — property dispatch, which core's own docs already
+  record as *"four false negatives on one repository"*.
+
+**8 of the 31 `accountScoped: false` rows across the two adopters are
+unverifiable**, and in both repositories the remediation text tells the author to
+change a correct file.
+
+### 6.9 `account-scope.stale`'s message blames the author for the checker's reach
 
 > `registeredAt points at a line that does not register it: internal/httpapi/oidc.go:138`
 
@@ -668,10 +728,93 @@ git status: 0 changed file(s)
 * Did not touch `billing`, `darkroom`, `muse`, any `wt-m39-pantry-*` worktree, or
   any `worker/pantry-*` branch.
 
-**The three honest empty surfaces — `guard`, `site`, `parlor` — were not started.**
-Per the packet they are three one-file packets in three repos, on their own
-branches, after this one lands. `kit/reports/tenant-adapter-ts-01/subject-audit.sh`
-has already measured that those three hold no database, so the empty declaration
-is a fact to check rather than a claim — but it is not this branch, and bundling
-it here would have made three repositories' worth of change indistinguishable
-from one file.
+## 11. The three empty surfaces, done afterwards and on their own branches
+
+The packet sanctions these "after the above is committed and verified, in separate
+branches" and says "do not bundle them here". Identity was committed and green
+first (§0, §8), so they were done next, each in its own repository and its own
+worktree. **They were not three identical packets**, which is the finding.
+
+| repo | branch | declaration | checker |
+|---|---|---|---|
+| `site` | `worker/site-account-scope-01` | 6 rows, all `false`, `kind: http` | **OK, exit 0**, 1 warning |
+| `parlor` | `worker/parlor-account-scope-01` | 6 rows, all `false`, `kind: http` | **OK, exit 0**, 1 warning |
+| `guard` | `worker/guard-account-scope-01` | 6 rows + 1 named omission | **`account-scope.undeclared`, exit 1** |
+
+**`site` and `parlor` are the honest zeros the packet described.** Each is a
+Next.js app whose four `/v1/*` routes are an allow-listed **forwarder** — `ROUTES`
+at `src/lib/upstream.ts:204` names every path and the service that owns it, and an
+unlisted path is refused before a socket opens. `reason: none` is *literally* true
+of all four: the route reads no data at all, it forwards bytes and returns the
+upstream's answer. Neither holds a database, which
+`kit/reports/tenant-adapter-ts-01/subject-audit.sh` measures rather than asserts
+(it sweeps every TypeScript service for a driver import, a driver declaration and
+a `.sql` file, and finds none in any of them).
+
+Two decisions worth naming, because both are the packet's own warnings applied:
+
+* **`kind: http`, not `kind: none`.** `none` means *"there is no request entry
+  here"* — core's doc says so and names `kit` as the live case — and both services
+  mount six. Declaring `none` would have been a false claim about a field, in a
+  file whose purpose is not publishing false claims. This is D18's defect one
+  field further in.
+* **`account-scope.nothing-scoped` fires on both, and that is correct.** It says
+  *"check the routes that read a customer row and are declared `false`"*. The
+  check was done — that is what the forwarder paragraphs in each file are — and
+  core's own `public_surface` fixture documents this exact warning as the negative
+  control that must stay a warning.
+
+**`guard` is not a one-file packet, and that is the finding.** Its
+`GET /v1/me` resolves an account and both ways of saying so are FAILURES — §6.7,
+measured in both directions. `guard`'s declaration therefore ships with that route
+**named and omitted**, and answers `account-scope.undeclared`, whose text is true.
+Committing the alternative — declaring it `true` — would have put a false
+`account-scope.scoping-bypassed` into a second repository on the day
+`core`'s first adopter was being reviewed.
+
+**Commits, one per repository, none pushed:**
+
+| repo | branch | commit |
+|---|---|---|
+| `site` | `worker/site-account-scope-01` | `30ee29b` |
+| `parlor` | `worker/parlor-account-scope-01` | `1faa86a` |
+| `guard` | `worker/guard-account-scope-01` | `30b68b5` |
+
+Each is a single file. No gate, floor, tier count, or test in any of the three was
+touched, and `core` was not modified by any of them.
+
+**Floors moved in none of the three, measured against `master` in every case:**
+
+| repo | floor | worktree | `master` control |
+|---|---|---|---|
+| `guard` | `gate.yml` `proof[].minimum: 462` | **517 pass**, 0 fail, `bin/prime` **exit 0** | 517 pass, 0 fail, exit 0 — identical |
+| `site` | `proof[].minimum` 367 / 48 / 47 | **61 passed, 1 failed**, exit 1 | 61 passed, 1 failed, exit 1 — and the PASS/FAIL sets diff **identical** |
+| `parlor` | `proof[].minimum` 710 / 41 / 42 | **46 passed, 0 failed**, exit 1 | 46 passed, 0 failed, exit 1 — identical |
+
+Adding one YAML file at a repository root cannot add a `Test` or a `describe`, and
+each of these gates derives its counts from its own test sources. The numbers were
+taken anyway rather than argued.
+
+**Two of the three gates are red on `master`, before this packet, and neither red
+is mine. Neither was adjusted.**
+
+* **`site`** — `FAIL bin/prime builds the app, so the local gate is not a subset of
+  CI`. The check at `tests/validate-ci.sh:675` requires a line matching
+  `^npm run build$` **after comment stripping**, and `bin/prime:85` has exactly
+  that — but it is nested inside an environment-prefixed block
+  (`PANTRY_API_KEY=… npm run build`), so `code_lines` strips the `npm run build`
+  line along with its prefix and the anchor finds nothing. **A check that fails on
+  a correct file because its subject is indented under an `export`**, with a
+  remediation ("bin/prime does not run npm run build") that is false. The file's
+  own comment at line 673 warns about exactly this class of mistake — *"a check
+  reading its subject out of a sentence about its subject"* — and the check fell
+  into the neighbouring trap instead. This is a finding for `site`.
+* **`parlor`** — `self_test: the pristine copy does not pass; the breakages below
+  prove nothing`. Its 46 checks all pass; the self-test refuses to proceed because
+  it cannot establish a passing baseline to mutate. That is the check being
+  honest about its own precondition, which is the behaviour core's rules want, and
+  the underlying cause is `site`'s, since both repos vendor and validate the same
+  CI script.
+
+Both are on `master` with a clean tree, reproduced above, and are reported rather
+than worked around.
